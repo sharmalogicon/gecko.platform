@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Tenant context + RLS session scoping (usp_set_tenant_context), audit stamps, soft delete. Written once, used by every module. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Gecko.SharedKernel\Gecko.SharedKernel.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
+    <PackageReference Include="QuestPDF" />
+  </ItemGroup>
+
+  <!-- Noto Sans Thai (SIL Open Font Licence): Thai names on EIRs and receipts, on any host. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Fonts\*.ttf" />
+  </ItemGroup>
+
+</Project>

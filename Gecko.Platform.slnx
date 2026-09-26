@@ -1,0 +1,56 @@
+<Solution>
+  <!--
+    ONE deployable (Gecko.Api) hosting its modules — ADR-006 / ADR-007.
+
+    Solution folders are VIRTUAL: they group projects in Solution Explorer
+    without dictating disk layout. On disk every project sits flat beside
+    this .slnx, as Visual Studio's New Project produces.
+
+    Each module = 2 projects:
+      Gecko.<Module>            everything: Domain / Application / Infrastructure / Endpoints as folders
+      Gecko.<Module>.Contracts  the ONLY thing another module may reference (integration events, DTOs)
+
+    Boundaries are enforced by Gecko.Architecture.Tests, not by convention.
+    Multi-tenancy lives in BuildingBlocks (tenant context + RLS session scoping), written once for all modules.
+  -->
+  <Folder Name="/Solution Items/">
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="global.json" />
+  </Folder>
+  <Folder Name="/Host/">
+    <Project Path="Gecko.Api/Gecko.Api.csproj" />
+  </Folder>
+  <Folder Name="/BuildingBlocks/">
+    <Project Path="Gecko.SharedKernel/Gecko.SharedKernel.csproj" />
+    <Project Path="Gecko.Data/Gecko.Data.csproj" />
+  </Folder>
+  <Folder Name="/Modules/" />
+  <Folder Name="/Modules/Identity/">
+    <Project Path="Gecko.Identity/Gecko.Identity.csproj" />
+    <Project Path="Gecko.Identity.Contracts/Gecko.Identity.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Modules/MasterData/">
+    <Project Path="Gecko.MasterData/Gecko.MasterData.csproj" />
+    <Project Path="Gecko.MasterData.Contracts/Gecko.MasterData.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Modules/Revenue/">
+    <Project Path="Gecko.Revenue/Gecko.Revenue.csproj" />
+    <Project Path="Gecko.Revenue.Contracts/Gecko.Revenue.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Modules/Tos/">
+    <Project Path="Gecko.Tos/Gecko.Tos.csproj" />
+    <Project Path="Gecko.Tos.Contracts/Gecko.Tos.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Modules/Notification/">
+    <Project Path="Gecko.Notification/Gecko.Notification.csproj" />
+    <Project Path="Gecko.Notification.Contracts/Gecko.Notification.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Gecko.Architecture.Tests/Gecko.Architecture.Tests.csproj" />
+    <Project Path="Gecko.Identity.Tests/Gecko.Identity.Tests.csproj" />
+    <Project Path="Gecko.MasterData.Tests/Gecko.MasterData.Tests.csproj" />
+    <Project Path="Gecko.Revenue.Tests/Gecko.Revenue.Tests.csproj" />
+    <Project Path="Gecko.Tos.Tests/Gecko.Tos.Tests.csproj" />
+  </Folder>
+</Solution>

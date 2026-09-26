@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Public surface of the module. May reference SharedKernel only — never another module. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Gecko.SharedKernel\Gecko.SharedKernel.csproj" />
+  </ItemGroup>
+
+</Project>

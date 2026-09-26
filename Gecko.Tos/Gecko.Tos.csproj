@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Other modules: reference their .Contracts project only. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Gecko.SharedKernel\Gecko.SharedKernel.csproj" />
+    <ProjectReference Include="..\Gecko.Data\Gecko.Data.csproj" />
+    <ProjectReference Include="..\Gecko.Tos.Contracts\Gecko.Tos.Contracts.csproj" />
+    <ProjectReference Include="..\Gecko.MasterData.Contracts\Gecko.MasterData.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
+    <PackageReference Include="ClosedXML" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Gecko.Tos.Tests" />
+  </ItemGroup>
+
+</Project>

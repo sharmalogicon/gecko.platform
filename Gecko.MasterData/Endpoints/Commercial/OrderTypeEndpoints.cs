@@ -1,0 +1,410 @@
+using System.ComponentModel.DataAnnotations;
+using System.Linq.Expressions;
+using Gecko.Data;
+using Gecko.MasterData.Infrastructure.Persistence;
+using Gecko.MasterData.Infrastructure.Persistence.Entities;
+using Gecko.SharedKernel;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.EntityFrameworkCore;
+
+namespace Gecko.MasterData.Endpoints.Commercial;
+
+public sealed record OrderTypeResponse(
+    Guid OrderTypeId, string OrderTypeCode, string DescriptionEn, string? DescriptionLocal,
+    string DirectionCode, Guid? ServiceTypeId, string? ServiceCode, string CargoClassCode,
+    string? BookingTypeCode, bool IsActive, string RowVersion);
+
+public sealed record OrderTypeDetailResponse(
+    OrderTypeResponse OrderType,
+    IReadOnlyList<OrderTypeMovementResponse> Movements,
+    IReadOnlyList<OrderTypeChargeResponse> Charges);
+
+/// <summary>
+/// One step of an order type, and the gate rules that step enforces. These five
+/// flags are the whole reason this table exists rather than a movement list.
+/// </summary>
+public sealed record OrderTypeMovementResponse(
+    Guid OrderTypeMovementId, Guid MovementId, string MovementCode, string MovementDescription,
+    short SequenceNo, bool IsRequired, bool IsBillable,
+    bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, bool AllowDamagedRelease, bool SkipEdi,
+    string? PudoMode);
+
+public sealed record OrderTypeChargeResponse(
+    Guid OrderTypeChargeId, Guid ChargeCodeId, string ChargeCode, string ChargeDescription,
+    Guid? MovementId, string? MovementCode, string PaymentTo, string? PaymentTermCode,
+    bool IsDefault, bool IsOptional, bool IsCargoCharge, bool IsValueAddedService, bool RaiseAtGateIn,
+    decimal? DefaultQty);
+
+public sealed record SaveOrderTypeRequest(
+    // Real order type codes are human phrases: Vector's are 'EXP CY/CY',
+    // 'IMP LOLO CR', 'EXP CY-IN (NON-NOMINATING)'. An identifier-shaped regex here
+    // would reject every code the customer already has painted on their paperwork.
+    [property: Required, RegularExpression("^[A-Z0-9][A-Z0-9 /()._-]{0,49}$", ErrorMessage = "Upper-case letters, digits, spaces and / ( ) . _ - , up to 50 chars — e.g. EXP CY/CY.")] string OrderTypeCode,
+    [property: Required, MaxLength(255)] string DescriptionEn,
+    [property: Required, MaxLength(20)] string DirectionCode,
+    [property: Required, MaxLength(20)] string CargoClassCode,
+    [property: MaxLength(255)] string? DescriptionLocal = null,
+    [property: MaxLength(15)] string? ServiceCode = null,
+    [property: MaxLength(20)] string? BookingTypeCode = null,
+    bool IsActive = true,
+    string? RowVersion = null);
+
+public sealed record OrderTypeMovementItem(
+    [property: Required, MaxLength(20)] string MovementCode,
+    [property: Required, Range(1, 99)] short SequenceNo,
+    bool IsRequired = true,
+    bool IsBillable = true,
+    bool CheckSealNo = false,
+    bool CheckGrossWeight = false,
+    bool RequireVesselVoyage = false,
+    bool AllowDamagedRelease = false,
+    bool SkipEdi = false,
+    [property: MaxLength(20)] string? PudoMode = null);
+
+public sealed record ReplaceOrderTypeMovementsRequest(
+    [property: Required, MinLength(1)] IReadOnlyList<OrderTypeMovementItem> Movements);
+
+public sealed record OrderTypeChargeItem(
+    [property: Required, MaxLength(15)] string ChargeCode,
+    [property: Required, MaxLength(20)] string PaymentTo,   // soft ref -> lookup.bill_to_role
+    [property: MaxLength(20)] string? MovementCode = null,
+    [property: MaxLength(20)] string? PaymentTermCode = null,
+    bool IsDefault = true,
+    bool IsOptional = false,
+    bool IsCargoCharge = false,
+    bool IsValueAddedService = false,
+    bool RaiseAtGateIn = false,
+    [property: Range(0.001, 99999)] decimal? DefaultQty = null);
+
+public sealed record ReplaceOrderTypeChargesRequest(IReadOnlyList<OrderTypeChargeItem> Charges);
+
+/// <summary>
+/// An order type is what the depot is being asked to do — "export CY to CY",
+/// "import empty return". It expands into an ordered list of MOVEMENTS, and each
+/// movement carries the rules the gate enforces when that step happens.
+///
+/// THE FIVE GATE RULES (Vector: IsCheckSealNo, IsCheckGrossWgt,
+/// IsVslVoyMandatory, IsReleaseDamageContainer, IsSkipEDI) are configuration, not
+/// code. The 2026-09-15 gap report found them missing from the first cut of this
+/// schema; they are the difference between a gate that enforces a customer's
+/// actual policy and one that hard-codes ours.
+///
+/// Vector's real data shows why they must be PER STEP and not per order type:
+/// 'EXP CY/CY' checks the gross weight on the empty-out and the laden-in but NOT
+/// on the laden-out, and 'IMP CY/CY' allows a damaged container to be released on
+/// every step while 'EXP CY/CY' allows it on none.
+/// </summary>
+internal static class OrderTypeEndpoints
+{
+    public static RouteGroupBuilder MapOrderTypeEndpoints(this RouteGroupBuilder master)
+    {
+        var orderTypes = master.MapGroup("/order-types").WithTags("Master data — order types");
+
+        orderTypes.MapGet("/", ListAsync).RequirePermission(MasterDataPermissions.CommercialView).WithSummary("List order types");
+        orderTypes.MapGet("/{orderTypeCode}", GetAsync).RequirePermission(MasterDataPermissions.CommercialView).WithName("GetOrderType").WithSummary("Get one order type with its movements, gate rules and charges");
+        orderTypes.MapPost("/", CreateAsync).RequirePermission(MasterDataPermissions.CommercialManage).Validate<SaveOrderTypeRequest>().WithSummary("Create an order type");
+        orderTypes.MapPut("/{orderTypeCode}", UpdateAsync).RequirePermission(MasterDataPermissions.CommercialManage).Validate<SaveOrderTypeRequest>().WithSummary("Update an order type");
+        orderTypes.MapPut("/{orderTypeCode}/movements", ReplaceMovementsAsync).RequirePermission(MasterDataPermissions.CommercialManage).Validate<ReplaceOrderTypeMovementsRequest>().WithSummary("Replace the movement sequence and its gate rules");
+        orderTypes.MapPut("/{orderTypeCode}/charges", ReplaceChargesAsync).RequirePermission(MasterDataPermissions.CommercialManage).Validate<ReplaceOrderTypeChargesRequest>().WithSummary("Replace the charges an order type raises");
+        orderTypes.MapDelete("/{orderTypeCode}", DeleteAsync).RequirePermission(MasterDataPermissions.CommercialManage).WithSummary("Soft-delete an order type");
+
+        return master;
+    }
+
+    private static async Task<Ok<PagedResult<OrderTypeResponse>>> ListAsync(
+        [AsParameters] ListQuery query, MasterDataDbContext db, CancellationToken ct,
+        string? directionCode = null, string? cargoClassCode = null, bool includeInactive = false)
+    {
+        var orderTypes = db.OrderTypes.AsNoTracking();
+        if (!includeInactive) orderTypes = orderTypes.Where(o => o.IsActive);
+        if (!string.IsNullOrWhiteSpace(directionCode)) orderTypes = orderTypes.Where(o => o.DirectionCode == directionCode.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(cargoClassCode)) orderTypes = orderTypes.Where(o => o.CargoClassCode == cargoClassCode.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(query.Search))
+            orderTypes = orderTypes.Where(o => o.OrderTypeCode.Contains(query.Search) || o.DescriptionEn.Contains(query.Search));
+
+        return TypedResults.Ok(await Project(db, orderTypes.OrderBy(o => o.OrderTypeCode))
+            .ToPagedAsync(query.Page, query.PageSize, ct));
+    }
+
+    private static async Task<Results<Ok<OrderTypeDetailResponse>, NotFound>> GetAsync(
+        string orderTypeCode, MasterDataDbContext db, CancellationToken ct)
+    {
+        var code = orderTypeCode.FromRouteCode();
+        var orderType = await Project(db, db.OrderTypes.AsNoTracking().Where(o => o.OrderTypeCode == code)).SingleOrDefaultAsync(ct);
+        if (orderType is null) return TypedResults.NotFound();
+
+        return TypedResults.Ok(new OrderTypeDetailResponse(
+            orderType,
+            await MovementsOfAsync(db, orderType.OrderTypeId, ct),
+            await ChargesOfAsync(db, orderType.OrderTypeId, ct)));
+    }
+
+    private static async Task<Results<CreatedAtRoute<OrderTypeDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
+        SaveOrderTypeRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
+    {
+        var code = request.OrderTypeCode.ToUpperInvariant();
+        if (await ValidateAsync(db, request, ct) is { } problem) return problem;
+        if (await db.OrderTypes.AnyAsync(o => o.OrderTypeCode == code, ct))
+            return MasterDataSupport.Conflict($"Order type '{code}' already exists.");
+
+        var orderType = new OrderType { TenantId = caller.TenantId(), OrderTypeCode = code };
+        await ApplyAsync(db, orderType, request, ct);
+        db.OrderTypes.Add(orderType);
+        await db.SaveChangesAsync(ct);
+
+        var response = await Project(db, db.OrderTypes.AsNoTracking().Where(o => o.OrderTypeId == orderType.OrderTypeId)).SingleAsync(ct);
+        return TypedResults.CreatedAtRoute(
+            new OrderTypeDetailResponse(response, [], []), "GetOrderType", new { orderTypeCode = code });
+    }
+
+    private static async Task<Results<Ok<OrderTypeResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
+        string orderTypeCode, SaveOrderTypeRequest request, MasterDataDbContext db, CancellationToken ct)
+    {
+        var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
+        if (orderType is null) return TypedResults.NotFound();
+        if (!db.TrySetExpectedVersion(orderType, request.RowVersion))
+            return MasterDataSupport.InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
+        if (await ValidateAsync(db, request, ct) is { } problem) return problem;
+
+        await ApplyAsync(db, orderType, request, ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+
+        return TypedResults.Ok(await Project(db, db.OrderTypes.AsNoTracking().Where(o => o.OrderTypeId == orderType.OrderTypeId)).SingleAsync(ct));
+    }
+
+    /// <summary>
+    /// The movement sequence and its gate rules, replaced as a set. Two unique
+    /// indexes make partial edits hazardous — uq_otm__movement (one row per
+    /// movement) and uq_otm__sequence (one row per position) — and a sequence with
+    /// a gap or a repeat is a gate that does not know what happens next.
+    /// </summary>
+    private static async Task<Results<Ok<IReadOnlyList<OrderTypeMovementResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceMovementsAsync(
+        string orderTypeCode, ReplaceOrderTypeMovementsRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
+    {
+        var orderType = await db.OrderTypes.AsNoTracking()
+            .Where(o => o.OrderTypeCode == orderTypeCode.FromRouteCode())
+            .Select(o => new { o.OrderTypeId }).SingleOrDefaultAsync(ct);
+        if (orderType is null) return TypedResults.NotFound();
+
+        var wanted = request.Movements
+            .Select(m => m with { MovementCode = m.MovementCode.ToUpperInvariant(), PudoMode = m.PudoMode?.ToUpperInvariant() })
+            .OrderBy(m => m.SequenceNo).ToList();
+
+        if (wanted.Select(m => m.MovementCode).Distinct().Count() != wanted.Count)
+            return MasterDataSupport.InvalidReference("movements", "The same movement appears twice. Each movement may appear once per order type.");
+        if (wanted.Select(m => m.SequenceNo).Distinct().Count() != wanted.Count)
+            return MasterDataSupport.InvalidReference("movements", "Two steps share a sequence number.");
+
+        // 1, 2, 3 with no gaps: the gate walks the sequence, and a hole in it means
+        // a step that silently never runs.
+        for (var i = 0; i < wanted.Count; i++)
+            if (wanted[i].SequenceNo != i + 1)
+                return MasterDataSupport.InvalidReference("movements",
+                    $"Sequence numbers must run 1..{wanted.Count} with no gaps; found {string.Join(", ", wanted.Select(m => m.SequenceNo))}.");
+
+        var movements = await db.Movements.AsNoTracking()
+            .Select(m => new { m.MovementId, m.MovementCode }).ToListAsync(ct);
+        var unknown = wanted.Select(m => m.MovementCode).Except(movements.Select(m => m.MovementCode)).ToList();
+        if (unknown.Count > 0)
+            return MasterDataSupport.InvalidReference("movements", $"Unknown movement(s): {string.Join(", ", unknown)}.");
+
+        foreach (var mode in wanted.Select(m => m.PudoMode).Where(m => m is not null).Distinct())
+            if (!await db.VwCodeLists.AnyAsync(v => v.CategoryCode == "PICKUP_DROPOFF_MODE" && v.Code == mode && v.IsActive == true, ct))
+                return MasterDataSupport.InvalidReference("movements", $"'{mode}' is not a PICKUP_DROPOFF_MODE.");
+
+        var existing = await db.OrderTypeMovements.Where(m => m.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct);
+        foreach (var gone in existing) db.OrderTypeMovements.Remove(gone);
+        if (existing.Count > 0) await db.SaveChangesAsync(ct);   // flush past the filtered unique indexes
+
+        foreach (var m in wanted)
+        {
+            db.OrderTypeMovements.Add(new OrderTypeMovement
+            {
+                TenantId = caller.TenantId(),
+                OrderTypeId = orderType.OrderTypeId,
+                MovementId = movements.Single(x => x.MovementCode == m.MovementCode).MovementId,
+                SequenceNo = m.SequenceNo,
+                IsRequired = m.IsRequired,
+                IsBillable = m.IsBillable,
+                CheckSealNo = m.CheckSealNo,
+                CheckGrossWeight = m.CheckGrossWeight,
+                RequireVesselVoyage = m.RequireVesselVoyage,
+                AllowDamagedRelease = m.AllowDamagedRelease,
+                SkipEdi = m.SkipEdi,
+                PudoMode = m.PudoMode,
+            });
+        }
+
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        return TypedResults.Ok(await MovementsOfAsync(db, orderType.OrderTypeId, ct));
+    }
+
+    private static async Task<Results<Ok<IReadOnlyList<OrderTypeChargeResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceChargesAsync(
+        string orderTypeCode, ReplaceOrderTypeChargesRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
+    {
+        var orderType = await db.OrderTypes.AsNoTracking()
+            .Where(o => o.OrderTypeCode == orderTypeCode.FromRouteCode())
+            .Select(o => new { o.OrderTypeId }).SingleOrDefaultAsync(ct);
+        if (orderType is null) return TypedResults.NotFound();
+
+        var wanted = request.Charges
+            .Select(c => c with
+            {
+                ChargeCode = c.ChargeCode.ToUpperInvariant(),
+                MovementCode = c.MovementCode?.ToUpperInvariant(),
+                PaymentTo = c.PaymentTo.ToUpperInvariant(),
+                PaymentTermCode = c.PaymentTermCode?.ToUpperInvariant(),
+            })
+            .ToList();
+
+        if (await db.UnknownBillToAsync(wanted.Select(c => c.PaymentTo), ct) is { Count: > 0 } unknownPayers)
+            return MasterDataSupport.InvalidReference("charges", $"Unknown bill-to role(s): {string.Join(", ", unknownPayers)}.");
+
+        // payment_term_code is a soft ref too, and was not checked here before.
+        foreach (var term in wanted.Select(c => c.PaymentTermCode).OfType<string>().Distinct())
+            if (!await db.PaymentTerms.AnyAsync(p => p.Code == term && p.IsActive, ct))
+                return MasterDataSupport.InvalidReference("charges", $"Unknown payment term '{term}'.");
+
+        // Mirrors ck_otc__default_optional: a charge cannot be both raised by
+        // default and offered as an option.
+        if (wanted.FirstOrDefault(c => c is { IsDefault: true, IsOptional: true }) is { } contradictory)
+            return MasterDataSupport.InvalidReference("charges",
+                $"'{contradictory.ChargeCode}' is both default and optional. Pick one.");
+
+        var charges = await db.ChargeCodes.AsNoTracking().Select(c => new { c.ChargeCodeId, c.ChargeCode1 }).ToListAsync(ct);
+        var unknownCharges = wanted.Select(c => c.ChargeCode).Distinct().Except(charges.Select(c => c.ChargeCode1)).ToList();
+        if (unknownCharges.Count > 0)
+            return MasterDataSupport.InvalidReference("charges", $"Unknown charge code(s): {string.Join(", ", unknownCharges)}.");
+
+        var movements = await db.Movements.AsNoTracking().Select(m => new { m.MovementId, m.MovementCode }).ToListAsync(ct);
+        var unknownMovements = wanted.Select(c => c.MovementCode).Where(m => m is not null).Distinct()
+            .Except(movements.Select(m => m.MovementCode)).ToList();
+        if (unknownMovements.Count > 0)
+            return MasterDataSupport.InvalidReference("charges", $"Unknown movement(s): {string.Join(", ", unknownMovements)}.");
+
+        var existing = await db.OrderTypeCharges.Where(c => c.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct);
+        foreach (var gone in existing) db.OrderTypeCharges.Remove(gone);
+        if (existing.Count > 0) await db.SaveChangesAsync(ct);
+
+        foreach (var c in wanted)
+        {
+            db.OrderTypeCharges.Add(new OrderTypeCharge
+            {
+                TenantId = caller.TenantId(),
+                OrderTypeId = orderType.OrderTypeId,
+                ChargeCodeId = charges.Single(x => x.ChargeCode1 == c.ChargeCode).ChargeCodeId,
+                MovementId = c.MovementCode is null ? null : movements.Single(x => x.MovementCode == c.MovementCode).MovementId,
+                PaymentTo = c.PaymentTo,
+                PaymentTermCode = c.PaymentTermCode?.ToUpperInvariant(),
+                IsDefault = c.IsDefault,
+                IsOptional = c.IsOptional,
+                IsCargoCharge = c.IsCargoCharge,
+                IsValueAddedService = c.IsValueAddedService,
+                RaiseAtGateIn = c.RaiseAtGateIn,
+                DefaultQty = c.DefaultQty,
+            });
+        }
+
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        return TypedResults.Ok(await ChargesOfAsync(db, orderType.OrderTypeId, ct));
+    }
+
+    private static async Task<Results<NoContent, NotFound>> DeleteAsync(
+        string orderTypeCode, MasterDataDbContext db, CancellationToken ct)
+    {
+        var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
+        if (orderType is null) return TypedResults.NotFound();
+
+        foreach (var m in await db.OrderTypeMovements.Where(m => m.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
+            db.OrderTypeMovements.Remove(m);
+        foreach (var c in await db.OrderTypeCharges.Where(c => c.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
+            db.OrderTypeCharges.Remove(c);
+        db.OrderTypes.Remove(orderType);
+        await db.SaveChangesAsync(ct);
+
+        return TypedResults.NoContent();
+    }
+
+    private static async Task ApplyAsync(MasterDataDbContext db, OrderType orderType, SaveOrderTypeRequest request, CancellationToken ct)
+    {
+        orderType.DescriptionEn = request.DescriptionEn;
+        orderType.DescriptionLocal = request.DescriptionLocal;
+        orderType.DirectionCode = request.DirectionCode.ToUpperInvariant();
+        orderType.CargoClassCode = request.CargoClassCode.ToUpperInvariant();
+        orderType.BookingTypeCode = request.BookingTypeCode?.ToUpperInvariant();
+        orderType.IsActive = request.IsActive;
+        orderType.ServiceTypeId = request.ServiceCode is null
+            ? null
+            : await db.ServiceTypes.Where(s => s.ServiceCode == request.ServiceCode.ToUpperInvariant())
+                .Select(s => (Guid?)s.ServiceTypeId).SingleOrDefaultAsync(ct);
+    }
+
+    private static async Task<ValidationProblem?> ValidateAsync(
+        MasterDataDbContext db, SaveOrderTypeRequest request, CancellationToken ct)
+    {
+        var direction = request.DirectionCode.ToUpperInvariant();
+        if (!await db.DirectionTypes.AnyAsync(d => d.Code == direction && d.IsActive, ct))
+            return MasterDataSupport.InvalidReference("directionCode", $"Unknown direction '{direction}'.");
+
+        var cargoClass = request.CargoClassCode.ToUpperInvariant();
+        if (!await db.CargoClasses.AnyAsync(c => c.Code == cargoClass && c.IsActive, ct))
+            return MasterDataSupport.InvalidReference("cargoClassCode", $"Unknown cargo class '{cargoClass}'.");
+
+        if (request.ServiceCode is not null)
+        {
+            var service = request.ServiceCode.ToUpperInvariant();
+            if (!await db.ServiceTypes.AnyAsync(s => s.ServiceCode == service, ct))
+                return MasterDataSupport.InvalidReference("serviceCode", $"Unknown service type '{service}'.");
+        }
+
+        if (request.BookingTypeCode is not null)
+        {
+            var booking = request.BookingTypeCode.ToUpperInvariant();
+            if (!await db.VwCodeLists.AnyAsync(v => v.CategoryCode == "BOOKING_TYPE" && v.Code == booking && v.IsActive == true, ct))
+                return MasterDataSupport.InvalidReference("bookingTypeCode", $"'{booking}' is not a BOOKING_TYPE.");
+        }
+
+        return null;
+    }
+
+    private static async Task<IReadOnlyList<OrderTypeMovementResponse>> MovementsOfAsync(
+        MasterDataDbContext db, Guid orderTypeId, CancellationToken ct) =>
+        await (
+            from otm in db.OrderTypeMovements.AsNoTracking().Where(m => m.OrderTypeId == orderTypeId)
+            join m in db.Movements on otm.MovementId equals m.MovementId
+            orderby otm.SequenceNo
+            select new OrderTypeMovementResponse(
+                otm.OrderTypeMovementId, otm.MovementId, m.MovementCode, m.DescriptionEn,
+                otm.SequenceNo, otm.IsRequired, otm.IsBillable,
+                otm.CheckSealNo, otm.CheckGrossWeight, otm.RequireVesselVoyage,
+                otm.AllowDamagedRelease, otm.SkipEdi, otm.PudoMode)
+        ).ToListAsync(ct);
+
+    private static async Task<IReadOnlyList<OrderTypeChargeResponse>> ChargesOfAsync(
+        MasterDataDbContext db, Guid orderTypeId, CancellationToken ct) =>
+        await (
+            from otc in db.OrderTypeCharges.AsNoTracking().Where(c => c.OrderTypeId == orderTypeId)
+            join cc in db.ChargeCodes on otc.ChargeCodeId equals cc.ChargeCodeId
+            join mv in db.Movements on otc.MovementId equals mv.MovementId into movements
+            from mv in movements.DefaultIfEmpty()
+            orderby cc.ChargeCode1
+            select new OrderTypeChargeResponse(
+                otc.OrderTypeChargeId, otc.ChargeCodeId, cc.ChargeCode1, cc.DescriptionEn,
+                otc.MovementId, mv == null ? null : mv.MovementCode,
+                otc.PaymentTo, otc.PaymentTermCode, otc.IsDefault, otc.IsOptional,
+                otc.IsCargoCharge, otc.IsValueAddedService, otc.RaiseAtGateIn, otc.DefaultQty)
+        ).ToListAsync(ct);
+
+    private static IQueryable<OrderTypeResponse> Project(MasterDataDbContext db, IQueryable<OrderType> orderTypes) =>
+        from o in orderTypes
+        join s in db.ServiceTypes on o.ServiceTypeId equals s.ServiceTypeId into services
+        from s in services.DefaultIfEmpty()
+        select new OrderTypeResponse(
+            o.OrderTypeId, o.OrderTypeCode, o.DescriptionEn, o.DescriptionLocal, o.DirectionCode,
+            o.ServiceTypeId, s == null ? null : s.ServiceCode, o.CargoClassCode, o.BookingTypeCode,
+            o.IsActive, Convert.ToBase64String(o.RowVersion));
+}

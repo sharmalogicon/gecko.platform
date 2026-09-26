@@ -1,0 +1,751 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Gecko.Data;
+using Gecko.MasterData.Contracts;
+using Gecko.SharedKernel;
+using Gecko.Tos.Application;
+using Gecko.Tos.Domain;
+using Gecko.Tos.Infrastructure.Persistence;
+using Gecko.Tos.Infrastructure.Persistence.Entities;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.EntityFrameworkCore;
+
+namespace Gecko.Tos.Endpoints.Gate;
+
+/// <summary>
+/// The barrier (PLAN §5.2–§5.5, Phase 5). Two endpoints carry the whole depot:
+/// one that says whether a box may move, and one that records it moving.
+///
+/// THE RULE THAT SHAPES THIS FILE (§5.5): a gate event is ONE SQL TRANSACTION —
+/// truck visit, EIR, seals, the step going DONE, the yard row opening or
+/// closing, the visit journal, the assignment ending, the coupon being spent and
+/// the outbox message. Vector wrote those from five places in application code,
+/// which is why its four answers to "what is in the yard" disagree.
+/// </summary>
+internal static class GateEndpoints
+{
+    public static RouteGroupBuilder MapGateEndpoints(this RouteGroupBuilder tos)
+    {
+        var gate = tos.MapGroup("/gate").WithTags("TOS — gate");
+
+        gate.MapGet("/preflight", PreflightAsync)
+            .RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("Ask the barrier about a box before the boom lifts")
+            .WithDescription("Five seeks, all local (ADR-007): the assignment, its next step, the holds, the yard and the cut-off. Returns ALLOWED, NEEDS_OVERRIDE or BLOCKED with a reason for each finding.");
+
+        gate.MapPost("/transactions", RecordAsync)
+            .RequireBranchPermission(TosPermissions.GateCreate)
+            .Validate<GateTransactionRequest>()
+            .WithSummary("Record a box crossing the barrier — the EIR")
+            .WithDescription("One transaction: truck visit, EIR, seals, step DONE, yard row, visit event, assignment close, coupon, outbox.");
+
+        gate.MapGet("/transactions", ListAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("The gate day");
+        gate.MapGet("/transactions/{id:guid}/eir.pdf", EirPdfAsync).RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("The printed EIR (A4 PDF) — voided EIRs print too, marked VOID");
+        gate.MapGet("/transactions/{id:guid}", GetAsync).RequireBranchPermission(TosPermissions.GateView)
+            .WithName("GetGateTransaction").WithSummary("One EIR with its seals");
+
+        gate.MapPost("/transactions/{id:guid}/void", VoidAsync)
+            .RequireBranchPermission(TosPermissions.GateOverride)
+            .Validate<VoidGateTransactionRequest>()
+            .WithSummary("Void an EIR and re-open the step it completed")
+            .WithDescription("The number is kept and never reused (Q4). Reissue by recording the move again; the new EIR points back at this one.");
+
+        gate.MapGet("/visits", ListVisitsAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("Trucks at the depot");
+        gate.MapGet("/visits/{id:guid}", GetVisitAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("One truck visit and its boxes");
+        gate.MapPost("/visits/{id:guid}/depart", DepartAsync).RequireBranchPermission(TosPermissions.GateCreate)
+            .WithSummary("The truck leaves — closes the visit and stops the dwell clock");
+
+        // The stock list, from yard.vw_container_in_yard: gate-in time read from the
+        // EIR, the hold flag from the hold rows, dwell computed. Nothing stored twice
+        // (D-5) — Vector's four sources disagreed by three boxes.
+        tos.MapGet("/yard/containers", InYardAsync)
+            .RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("What is in the yard right now");
+
+        return tos;
+    }
+
+    // ── preflight ───────────────────────────────────────────────────────────
+
+    private static async Task<Results<Ok<GatePreflightResponse>, ValidationProblem, ProblemHttpResult>> PreflightAsync(
+        BarrierReader barrier, TosDbContext db, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
+        Guid? branchId = null, string? containerNo = null, string? direction = null, DateTimeOffset? at = null)
+    {
+        if (branchId is null) return TosSupport.Invalid("branchId", "Which gate? A barrier belongs to a depot.");
+        if (string.IsNullOrWhiteSpace(containerNo)) return TosSupport.Invalid("containerNo", "The number the camera or the clerk read.");
+
+        var way = direction.Clean() ?? GateRules.In;
+        if (!GateRules.Directions.Contains(way)) return TosSupport.Invalid("direction", "Use IN or OUT.");
+        if (!scope.HasAt(TosPermissions.GateView, branchId.Value))
+            return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
+
+        var view = await barrier.ReadAsync(branchId.Value, containerNo, way, at ?? time.GetUtcNow(), ct);
+        return TypedResults.Ok(await ProjectAsync(db, view, ct));
+    }
+
+    // ── the gate event ──────────────────────────────────────────────────────
+
+    private static async Task<Results<Created<GateTransactionResponse>, ValidationProblem, ProblemHttpResult>> RecordAsync(
+        GateTransactionRequest request, TosDbContext db, BarrierReader barrier, IMasterDataReferences master,
+        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
+        var branchId = request.BranchId!.Value;
+        var way = request.Direction.Clean()!;
+        if (!scope.HasAt(TosPermissions.GateCreate, branchId))
+            return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
+
+        var branch = (await clock.BranchesAsync([branchId], ct)).GetValueOrDefault(branchId);
+        if (branch is null) return TosSupport.Invalid("branchId", "Unknown branch.");
+
+        var now = time.GetUtcNow();
+        var at = request.TransactionAt ?? now;
+        if (at > now.AddMinutes(5))
+            return TosSupport.Invalid("transactionAt", "A box cannot cross the barrier in the future.");
+
+        var seals = request.Seals ?? [];
+
+        // §5.5 — everything below commits together or not at all.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        // The barrier read is done INSIDE the transaction: a hold applied two
+        // seconds ago must still stop this box.
+        var view = await barrier.ReadAsync(branchId, request.ContainerNo, way, at, ct);
+        if (view.Booking is null || view.Step is null || view.StepRules is null || view.Assignment is null)
+            return Refused(view);
+
+        var findings = view.Findings.ToList();
+        findings.AddRange(GateRules.Observations(view.StepRules, request.GrossWeightKg, seals.Count));
+
+        if (findings.Any(f => f.Severity == GateSeverity.Block)) return Refused(view with { Findings = findings });
+
+        // An override is a permission AND a typed reason. Either alone is a shrug.
+        if (view.NeedsLateOverride)
+        {
+            if (!scope.HasAt(TosPermissions.CutoffOverride, branchId))
+                return Forbidden($"This box is late. Only someone holding {TosPermissions.CutoffOverride} can let it in.", findings);
+            if (string.IsNullOrWhiteSpace(request.LateOverrideReason))
+                return TosSupport.Invalid("lateOverrideReason", "Say why the late gate is allowed. Vector let 686 boxes in during 2025 with nothing written here.");
+        }
+        if (view.NeedsCheckDigitOverride)
+        {
+            if (!scope.HasAt(TosPermissions.GateOverride, branchId))
+                return Forbidden($"{view.ContainerNo} fails its check digit. Only someone holding {TosPermissions.GateOverride} can accept it.", findings);
+            if (string.IsNullOrWhiteSpace(request.CheckDigitOverrideReason))
+                return TosSupport.Invalid("checkDigitOverrideReason", "Say why a number that fails ISO 6346 is being accepted.");
+        }
+
+        // ── the truck ───────────────────────────────────────────────────────
+        TruckVisit visit;
+        if (request.TruckVisitId is { } visitId)
+        {
+            var existing = await db.TruckVisits.SingleOrDefaultAsync(v => v.TruckVisitId == visitId, ct);
+            if (existing is null) return TosSupport.Invalid("truckVisitId", "Unknown truck visit.");
+            if (existing.GateOutAt is not null) return TosSupport.Conflict($"Visit {existing.VisitNo} has already left.");
+            if (existing.BranchId != branchId) return TosSupport.Invalid("truckVisitId", "That visit belongs to another depot.");
+            visit = existing;
+        }
+        else
+        {
+            if (request.Truck is null)
+                return TosSupport.Invalid("truck", "Name the truck, or the open visit it is already on.");
+
+            var haulier = request.Truck.HaulierCode.Clean() is { } code
+                ? (await master.PartiesAsync([code], ct)).GetValueOrDefault(code)
+                : null;
+            if (request.Truck.HaulierCode.Clean() is not null && haulier is null)
+                return TosSupport.Invalid("truck.haulierCode", "Unknown haulier.");
+
+            visit = new TruckVisit
+            {
+                TenantId = caller.TenantId(),
+                BranchId = branchId,
+                VisitNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.TruckVisit, branchId, branch.BranchCode, clock.LocalNow(branch), ct),
+                TruckPlate = request.Truck.Plate.Trim(),
+                TrailerPlate = request.Truck.TrailerPlate?.Trim(),
+                HaulierPartyId = haulier?.PartyId,
+                HaulierPartyCode = haulier?.PartyCode,
+                DriverName = request.Truck.DriverName?.Trim(),
+                DriverLicenceHash = Hash(request.Truck.DriverLicence),
+                LaneCode = request.Truck.LaneCode.Clean(),
+                ArrivedAt = request.Truck.ArrivedAt ?? at,
+                Source = "GATE",
+            };
+            db.TruckVisits.Add(visit);
+        }
+        visit.GateInAt ??= at;
+        if (visit.ArrivedAt > at) visit.ArrivedAt = at;   // the CHECK: in never precedes arrival
+        await db.SaveChangesAsync(ct);
+
+        // ≤ 2 boxes each way (drop-one-take-one, twin 20s); the index is the backstop.
+        var taken = await db.GateTransactions
+            .CountAsync(g => g.TruckVisitId == visit.TruckVisitId && g.Direction == way && g.Status == "COMPLETED", ct);
+        if (taken >= 2)
+            return TosSupport.Conflict($"Visit {visit.VisitNo} already has {taken} box(es) going {way}.", "A truck carries two.");
+
+        // ── the EIR ─────────────────────────────────────────────────────────
+        var declaredSeal = view.Assignment.DeclaredSealNo.Clean();
+        var sealMismatch = declaredSeal is not null && seals.Count > 0
+                           && !seals.Any(s => string.Equals(s.SealNo.Trim(), declaredSeal, StringComparison.OrdinalIgnoreCase));
+
+        var transaction = new GateTransaction
+        {
+            TenantId = caller.TenantId(),
+            BranchId = branchId,
+            EirNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.Eir, branchId, branch.BranchCode, clock.LocalNow(branch), ct),
+            TruckVisitId = visit.TruckVisitId,
+            Direction = way,
+            PositionNo = (byte)(taken + 1),
+            MovementId = view.Step.MovementId,
+            MovementCode = view.Step.MovementCode,
+            FullEmpty = view.StepRules.FullEmpty,
+            ContainerNo = view.ContainerNo,
+            ContainerId = view.Registry?.ContainerId,
+            IsCheckDigitValid = view.IsCheckDigitValid,
+            CheckDigitOverrideBy = view.IsCheckDigitValid ? null : caller.UserId(),
+            CheckDigitOverrideReason = view.IsCheckDigitValid ? null : (request.CheckDigitOverrideReason?.Trim() ?? "Recorded: the depot does not enforce the check digit."),
+            EquipmentTypeId = view.Requirement?.EquipmentTypeId,
+            EquipmentTypeCode = view.Requirement?.EquipmentTypeCode,
+            IsoCode = request.IsoCode.Clean(),
+            BookingId = view.Booking.BookingId,
+            BookingContainerId = view.Assignment.BookingContainerId,
+            MovementPlanId = view.Step.MovementPlanId,
+            LinePartyId = view.Booking.LinePartyId,
+            LinePartyCode = view.Booking.LinePartyCode,
+            VesselCallId = view.Booking.VesselCallId,
+            GrossWeightKg = request.GrossWeightKg,
+            TareWeightKg = request.TareWeightKg,
+            VgmKg = request.VgmKg,
+            VgmMethod = request.VgmMethod,
+            WeightSource = request.WeightSource,
+            ConditionCode = request.ConditionCode.Clean(),
+            GradeCode = request.GradeCode.Clean(),
+            SealMismatch = sealMismatch,
+            TempObservedC = request.TemperatureC,
+            YardId = request.YardId,
+            YardSlotId = request.YardSlotId,
+            PositionText = request.PositionText.Clean(),
+            CutoffKindApplied = view.CutoffKind,
+            CutoffAtApplied = view.CutoffAt,
+            IsLate = view.IsLate,
+            CutoffExceptionId = view.CoveringException?.CutoffExceptionId,
+            LateOverrideBy = view.NeedsLateOverride ? caller.UserId() : null,
+            LateOverrideReason = view.NeedsLateOverride ? request.LateOverrideReason!.Trim() : null,
+            GateAuthorizationId = view.Coupon?.GateAuthorizationId,
+            TransactionAt = at,
+            RecordedAt = now,
+            Status = "COMPLETED",
+            Remarks = request.Remarks?.Trim(),
+        };
+        db.GateTransactions.Add(transaction);
+        await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
+
+        foreach (var seal in seals)
+            db.GateTransactionSeals.Add(new GateTransactionSeal
+            {
+                TenantId = transaction.TenantId,
+                GateTransactionId = transaction.GateTransactionId,
+                SealNo = seal.SealNo.Trim(),
+                SealType = seal.SealType,
+                IsIntact = seal.IsIntact,
+                MatchesDeclared = declaredSeal is null ? null : string.Equals(seal.SealNo.Trim(), declaredSeal, StringComparison.OrdinalIgnoreCase),
+            });
+
+        // ── the step, and any optional one it overtook (§5.3) ───────────────
+        foreach (var skipped in view.StepsToSkip)
+        {
+            var row = await db.MovementPlans.SingleAsync(p => p.MovementPlanId == skipped.MovementPlanId, ct);
+            row.Status = "SKIPPED";
+            row.SkippedAt = at;
+            row.SkippedBy = caller.UserId();
+            row.SkipReason = GateRules.SkipReason;
+        }
+
+        var stepRow = await db.MovementPlans.SingleAsync(p => p.MovementPlanId == view.Step.MovementPlanId, ct);
+        if (stepRow.Status != "PENDING") return TosSupport.Conflict($"{stepRow.MovementCode} is already {stepRow.Status}.");
+        stepRow.Status = "DONE";
+        stepRow.GateTransactionId = transaction.GateTransactionId;
+
+        // ── the yard (D-5): one row, opened or closed, never both ───────────
+        Guid? containerVisitId = null;
+        if (way == GateRules.In)
+        {
+            var yardRow = new ContainerVisit
+            {
+                TenantId = transaction.TenantId,
+                BranchId = branchId,
+                ContainerNo = view.ContainerNo,
+                ContainerId = view.Registry?.ContainerId,
+                EquipmentTypeId = view.Requirement?.EquipmentTypeId,
+                EquipmentTypeCode = view.Requirement?.EquipmentTypeCode,
+                LinePartyId = view.Booking.LinePartyId,
+                LinePartyCode = view.Booking.LinePartyCode,
+                GateInTransactionId = transaction.GateTransactionId,
+                FullEmpty = view.StepRules.FullEmpty,
+                ConditionCode = request.ConditionCode.Clean(),
+                GradeCode = request.GradeCode.Clean(),
+                YardId = request.YardId,
+                YardSlotId = request.YardSlotId,
+                PositionText = request.PositionText.Clean(),
+                CurrentBookingContainerId = view.Assignment.BookingContainerId,
+                LastEventAt = at,
+            };
+            db.ContainerVisits.Add(yardRow);
+            await db.SaveChangesAsync(ct);
+            containerVisitId = yardRow.ContainerVisitId;
+            AddEvent(db, yardRow, "GATE_IN", null, transaction.EirNo, at, caller.UserId(), transaction.GateTransactionId);
+        }
+        else if (view.OpenVisit is { } open)
+        {
+            var yardRow = await db.ContainerVisits.SingleAsync(v => v.ContainerVisitId == open.ContainerVisitId, ct);
+            yardRow.GateOutTransactionId = transaction.GateTransactionId;
+            yardRow.LastEventAt = at;
+            containerVisitId = yardRow.ContainerVisitId;
+            AddEvent(db, yardRow, "GATE_OUT", yardRow.FullEmpty, transaction.EirNo, at, caller.UserId(), transaction.GateTransactionId);
+        }
+
+        // ── the assignment: the last step ends it (D-3) ─────────────────────
+        var stillPending = await db.MovementPlans.CountAsync(p =>
+            p.BookingContainerId == view.Assignment.BookingContainerId
+            && p.Status == "PENDING" && p.MovementPlanId != stepRow.MovementPlanId, ct);
+        var completed = stillPending == 0;
+        if (completed)
+        {
+            var assignment = await db.BookingContainers.SingleAsync(x => x.BookingContainerId == view.Assignment.BookingContainerId, ct);
+            assignment.EndedAt = at;
+            assignment.EndedBy = caller.UserId();
+            assignment.EndReason = "COMPLETED";
+        }
+
+        // ── the coupon (ADR-007): spent here, once ──────────────────────────
+        if (view.Coupon is { } coupon)
+        {
+            var couponRow = await db.GateAuthorizations.SingleAsync(a => a.GateAuthorizationId == coupon.GateAuthorizationId, ct);
+            couponRow.ConsumedByGateTransactionId = transaction.GateTransactionId;
+            couponRow.ConsumedAt = at;
+        }
+
+        // ── the outbox: the LINE message leaves from here, not from the barrier ─
+        await QueueAsync(db, transaction, view, completed, ct);
+
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        await tx.CommitAsync(ct);
+
+        var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct);
+        return TypedResults.Created($"/api/tos/gate/transactions/{transaction.GateTransactionId}", response);
+    }
+
+    // ── void ────────────────────────────────────────────────────────────────
+
+    private static async Task<Results<Ok<GateTransactionResponse>, NotFound, ValidationProblem, ProblemHttpResult>> VoidAsync(
+        Guid id, VoidGateTransactionRequest request, TosDbContext db, ITenantContext caller,
+        ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
+        var transaction = await db.GateTransactions.SingleOrDefaultAsync(g => g.GateTransactionId == id, ct);
+        if (transaction is null || !scope.HasAt(TosPermissions.GateOverride, transaction.BranchId)) return TypedResults.NotFound();
+        if (transaction.Status == "VOIDED")
+            return TosSupport.Conflict($"{transaction.EirNo} was already voided.", transaction.VoidReason);
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        // §10.9: the void and the re-opened step are one transaction, or a box
+        // ends up with a done step and no EIR behind it.
+        transaction.Status = "VOIDED";
+        transaction.VoidedAt = time.GetUtcNow();
+        transaction.VoidedBy = caller.UserId();
+        transaction.VoidReason = request.Reason.Trim();
+
+        var step = await db.MovementPlans.SingleOrDefaultAsync(p => p.GateTransactionId == id, ct);
+        if (step is not null)
+        {
+            step.Status = "PENDING";
+            step.GateTransactionId = null;
+        }
+
+        // The yard row goes back to what it was: a voided gate-in never happened,
+        // and a voided gate-out puts the box back in the yard.
+        var opened = await db.ContainerVisits.SingleOrDefaultAsync(v => v.GateInTransactionId == id, ct);
+        if (opened is not null)
+        {
+            opened.DeletedAt = transaction.VoidedAt;
+            opened.DeletedBy = caller.UserId();
+        }
+        var closed = await db.ContainerVisits.SingleOrDefaultAsync(v => v.GateOutTransactionId == id, ct);
+        if (closed is not null)
+        {
+            closed.GateOutTransactionId = null;
+            closed.LastEventAt = transaction.VoidedAt!.Value;
+            AddEvent(db, closed, "CORRECTION", transaction.EirNo, null, transaction.VoidedAt!.Value, caller.UserId(), id);
+        }
+
+        // An assignment closed by that step re-opens with it.
+        var assignment = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == transaction.BookingContainerId, ct);
+        if (assignment is { EndReason: "COMPLETED" })
+        {
+            assignment.EndedAt = null;
+            assignment.EndedBy = null;
+            assignment.EndReason = null;
+        }
+
+        var coupon = await db.GateAuthorizations.SingleOrDefaultAsync(a => a.ConsumedByGateTransactionId == id, ct);
+        if (coupon is not null)
+        {
+            coupon.ConsumedByGateTransactionId = null;
+            coupon.ConsumedAt = null;
+        }
+
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        await QueueVoidAsync(db, transaction, ct);
+        await tx.CommitAsync(ct);
+
+        return TypedResults.Ok(await ProjectAsync(db, id, null, false, ct));
+    }
+
+    // ── reads ───────────────────────────────────────────────────────────────
+
+    private static async Task<Results<Ok<PagedResult<GateTransactionSummaryResponse>>, ValidationProblem>> ListAsync(
+        [AsParameters] ListQuery query, TosDbContext db, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, string? direction = null, string? status = null,
+        DateTimeOffset? from = null, DateTimeOffset? to = null, bool? lateOnly = null)
+    {
+        var rows =
+            from t in db.GateTransactions.AsNoTracking()
+            join b in db.Bookings on t.BookingId equals b.BookingId
+            join v in db.TruckVisits on t.TruckVisitId equals v.TruckVisitId
+            select new { g = t, b.OrderNo, v.TruckPlate };
+
+        if (branchId is not null) rows = rows.Where(r => r.g.BranchId == branchId);
+        if (direction.Clean() is { } way)
+        {
+            if (!GateRules.Directions.Contains(way)) return TosSupport.Invalid("direction", "Use IN or OUT.");
+            rows = rows.Where(r => r.g.Direction == way);
+        }
+        if (status.Clean() is { } s) rows = rows.Where(r => r.g.Status == s);
+        if (from is not null) rows = rows.Where(r => r.g.TransactionAt >= from);
+        if (to is not null) rows = rows.Where(r => r.g.TransactionAt < to);
+        if (lateOnly == true) rows = rows.Where(r => r.g.IsLate);
+        if (query.Search.Clean() is { } q)
+        {
+            var box = ContainerNumber.Normalise(q);
+            rows = rows.Where(r => r.g.ContainerNo == box || r.g.EirNo.Contains(q) || r.OrderNo.Contains(q));
+        }
+        if (scope.BranchFilter(TosPermissions.GateView) is { } mine)
+        {
+            var allowed = mine.ToList();
+            rows = rows.Where(r => allowed.Contains(r.g.BranchId));
+        }
+
+        var page = await rows.OrderByDescending(r => r.g.TransactionAt).ToPagedAsync(query.Page, query.PageSize, ct);
+
+        return TypedResults.Ok(new PagedResult<GateTransactionSummaryResponse>(
+            page.Items.Select(r => new GateTransactionSummaryResponse(
+                r.g.GateTransactionId, r.g.EirNo, r.g.Direction, r.g.MovementCode, r.g.FullEmpty,
+                r.g.ContainerNo, r.OrderNo, r.g.LinePartyCode, r.TruckPlate,
+                r.g.TransactionAt, r.g.IsLate, r.g.Status)).ToList(),
+            page.Page, page.PageSize, page.TotalCount));
+    }
+
+    private static async Task<Results<FileContentHttpResult, NotFound>> EirPdfAsync(
+        Guid id, TosDbContext db, EirDocument eir, ICallerPermissions scope, CancellationToken ct)
+    {
+        var branchId = await db.GateTransactions.AsNoTracking()
+            .Where(g => g.GateTransactionId == id).Select(g => (Guid?)g.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is not { } b || !scope.HasAt(TosPermissions.GateView, b)) return TypedResults.NotFound();
+
+        var rendered = await eir.RenderAsync(id, ct);
+        return rendered is null
+            ? TypedResults.NotFound()
+            : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
+    }
+
+    private static async Task<Results<Ok<GateTransactionResponse>, NotFound>> GetAsync(
+        Guid id, TosDbContext db, ICallerPermissions scope, CancellationToken ct)
+    {
+        var branchId = await db.GateTransactions.AsNoTracking()
+            .Where(g => g.GateTransactionId == id).Select(g => (Guid?)g.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is not { } b || !scope.HasAt(TosPermissions.GateView, b)) return TypedResults.NotFound();
+
+        return TypedResults.Ok(await ProjectAsync(db, id, null, false, ct));
+    }
+
+    private static async Task<Results<Ok<PagedResult<TruckVisitResponse>>, ValidationProblem>> ListVisitsAsync(
+        [AsParameters] ListQuery query, TosDbContext db, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, bool? openOnly = null, DateTimeOffset? from = null, DateTimeOffset? to = null)
+    {
+        var rows = db.TruckVisits.AsNoTracking();
+        if (branchId is not null) rows = rows.Where(v => v.BranchId == branchId);
+        if (openOnly == true) rows = rows.Where(v => v.GateOutAt == null);
+        if (from is not null) rows = rows.Where(v => v.ArrivedAt >= from);
+        if (to is not null) rows = rows.Where(v => v.ArrivedAt < to);
+        if (query.Search.Clean() is { } q) rows = rows.Where(v => v.VisitNo.Contains(q) || v.TruckPlate.Contains(q));
+        if (scope.BranchFilter(TosPermissions.GateView) is { } mine)
+        {
+            var allowed = mine.ToList();
+            rows = rows.Where(v => allowed.Contains(v.BranchId));
+        }
+
+        var page = await rows.OrderByDescending(v => v.ArrivedAt).ToPagedAsync(query.Page, query.PageSize, ct);
+
+        return TypedResults.Ok(new PagedResult<TruckVisitResponse>(
+            page.Items.Select(v => Project(v, [])).ToList(), page.Page, page.PageSize, page.TotalCount));
+    }
+
+    private static async Task<Results<Ok<TruckVisitResponse>, NotFound>> GetVisitAsync(
+        Guid id, TosDbContext db, ICallerPermissions scope, CancellationToken ct)
+    {
+        var visit = await db.TruckVisits.AsNoTracking().SingleOrDefaultAsync(v => v.TruckVisitId == id, ct);
+        if (visit is null || !scope.HasAt(TosPermissions.GateView, visit.BranchId)) return TypedResults.NotFound();
+
+        var boxes = await (
+            from t in db.GateTransactions.AsNoTracking().Where(x => x.TruckVisitId == id)
+            join b in db.Bookings on t.BookingId equals b.BookingId
+            orderby t.Direction, t.PositionNo
+            select new GateTransactionSummaryResponse(
+                t.GateTransactionId, t.EirNo, t.Direction, t.MovementCode, t.FullEmpty,
+                t.ContainerNo, b.OrderNo, t.LinePartyCode, visit.TruckPlate,
+                t.TransactionAt, t.IsLate, t.Status)).ToListAsync(ct);
+
+        return TypedResults.Ok(Project(visit, boxes));
+    }
+
+    private static async Task<Results<Ok<TruckVisitResponse>, NotFound, ValidationProblem, ProblemHttpResult>> DepartAsync(
+        Guid id, DepartTruckRequest? request, TosDbContext db, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
+        var visit = await db.TruckVisits.SingleOrDefaultAsync(v => v.TruckVisitId == id, ct);
+        if (visit is null || !scope.HasAt(TosPermissions.GateCreate, visit.BranchId)) return TypedResults.NotFound();
+        if (visit.GateOutAt is not null) return TosSupport.Conflict($"Visit {visit.VisitNo} left at {visit.GateOutAt:u}.");
+
+        var departedAt = request?.DepartedAt ?? time.GetUtcNow();
+        if (visit.GateInAt is null) return TosSupport.Conflict($"Visit {visit.VisitNo} never came in.", "Record the gate-in first.");
+        if (departedAt < visit.GateInAt) return TosSupport.Invalid("departedAt", "A truck cannot leave before it came in (V-13: Vector has 38,148 of these).");
+
+        visit.GateOutAt = departedAt;
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+
+        return TypedResults.Ok(Project(visit, []));
+    }
+
+    private static async Task<Results<Ok<PagedResult<YardContainerResponse>>, ValidationProblem>> InYardAsync(
+        [AsParameters] ListQuery query, TosDbContext db, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, string? lineCode = null, string? fullEmpty = null, bool? heldOnly = null, int? minDays = null)
+    {
+        var rows = db.VwContainerInYards.AsNoTracking();
+
+        if (branchId is not null) rows = rows.Where(v => v.BranchId == branchId);
+        if (lineCode.Clean() is { } line) rows = rows.Where(v => v.LinePartyCode == line);
+        if (fullEmpty.Clean() is { } load)
+        {
+            if (load is not (GateRules.Full or GateRules.Empty)) return TosSupport.Invalid("fullEmpty", "Use FULL or EMPTY.");
+            rows = rows.Where(v => v.FullEmpty == load);
+        }
+        if (heldOnly == true) rows = rows.Where(v => v.IsHeld == true);
+        if (minDays is { } days) rows = rows.Where(v => v.DaysInYard >= days);
+        if (query.Search.Clean() is { } q)
+        {
+            var box = ContainerNumber.Normalise(q);
+            rows = rows.Where(v => v.ContainerNo == box || v.PositionText!.Contains(q));
+        }
+        if (scope.BranchFilter(TosPermissions.GateView) is { } mine)
+        {
+            var allowed = mine.ToList();
+            rows = rows.Where(v => allowed.Contains(v.BranchId));
+        }
+
+        var page = await rows.OrderByDescending(v => v.GateInAt).ToPagedAsync(query.Page, query.PageSize, ct);
+
+        return TypedResults.Ok(new PagedResult<YardContainerResponse>(
+            page.Items.Select(v => new YardContainerResponse(
+                v.ContainerVisitId, v.BranchId, v.ContainerNo, v.EquipmentTypeCode, v.LinePartyCode,
+                v.FullEmpty, v.ConditionCode, v.GradeCode, v.PositionText,
+                // The view computes both; EF types a view column as nullable.
+                v.GateInAt, v.GateInEirNo, v.GateInMovementCode, v.DaysInYard ?? 0, v.IsHeld == true,
+                v.CurrentBookingContainerId, v.LastEventAt)).ToList(),
+            page.Page, page.PageSize, page.TotalCount));
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    private static byte[]? Hash(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : SHA256.HashData(Encoding.UTF8.GetBytes(value.Trim().ToUpperInvariant()));
+
+    private static void AddEvent(TosDbContext db, ContainerVisit visit, string type, string? from, string? to,
+        DateTimeOffset at, Guid? by, Guid? reference) =>
+        db.VisitEvents.Add(new VisitEvent
+        {
+            TenantId = visit.TenantId,
+            ContainerVisitId = visit.ContainerVisitId,
+            EventType = type,
+            FromValue = from,
+            ToValue = to,
+            EventAt = at,
+            EventBy = by,
+            ReferenceId = reference,
+        });
+
+    /// <summary>
+    /// The gate event. Notification turns it into the LINE message; Revenue prices
+    /// it (PLAN_BILLING §4.3), so it carries every axis the resolver needs, because
+    /// Revenue may not come and read gecko_tos (ADR-007). It goes in the SAME
+    /// transaction as the EIR (11_outbox): if the gate event rolls back, the
+    /// message was never queued.
+    /// </summary>
+    private static Task QueueAsync(TosDbContext db, GateTransaction transaction, BarrierView view, bool completed, CancellationToken ct)
+    {
+        var booking = view.Booking!;
+        return EnqueueAsync(db, transaction,
+            transaction.Direction == GateRules.In ? "ContainerGatedIn" : "ContainerGatedOut",
+            new
+            {
+                gateTransactionId = transaction.GateTransactionId,
+                eirNo = transaction.EirNo,
+                branchId = transaction.BranchId,
+                containerNo = transaction.ContainerNo,
+                direction = transaction.Direction,
+                movementCode = transaction.MovementCode,
+                fullEmpty = transaction.FullEmpty,
+                bookingId = transaction.BookingId,
+                bookingContainerId = transaction.BookingContainerId,
+                orderNo = booking.OrderNo,
+                orderTypeCode = booking.OrderTypeCode,
+                bookingTypeCode = booking.BookingTypeCode,
+                lineCode = transaction.LinePartyCode,
+                customerCode = booking.CustomerPartyCode,
+                agentPartyCode = booking.AgentPartyCode,
+                forwarderPartyCode = booking.ForwarderPartyCode,
+                haulierPartyCode = booking.HaulierPartyCode,
+                equipmentTypeCode = transaction.EquipmentTypeCode,
+                isoCode = transaction.IsoCode,
+                cargoClassCode = booking.CargoClassCode,
+                cargoCategoryCode = booking.CargoCategoryCode,
+                isDangerousGoods = BarrierReader.IsDangerous(booking, view.Requirement),
+                grossWeightKg = transaction.GrossWeightKg,
+                gateAuthorizationId = transaction.GateAuthorizationId,
+                transactionAt = transaction.TransactionAt,
+                isLate = transaction.IsLate,
+                bookingContainerCompleted = completed,
+            }, ct);
+    }
+
+    /// <summary>
+    /// A void is news too: anything raised from that gate move — a charge, a
+    /// LINE message, a CODECO — must be able to take it back.
+    /// </summary>
+    private static Task QueueVoidAsync(TosDbContext db, GateTransaction transaction, CancellationToken ct) =>
+        EnqueueAsync(db, transaction, "GateTransactionVoided", new
+        {
+            gateTransactionId = transaction.GateTransactionId,
+            eirNo = transaction.EirNo,
+            branchId = transaction.BranchId,
+            containerNo = transaction.ContainerNo,
+            direction = transaction.Direction,
+            movementCode = transaction.MovementCode,
+            bookingId = transaction.BookingId,
+            bookingContainerId = transaction.BookingContainerId,
+            voidedAt = transaction.VoidedAt,
+            voidReason = transaction.VoidReason,
+        }, ct);
+
+    private static async Task EnqueueAsync(TosDbContext db, GateTransaction transaction, string messageType, object payload, CancellationToken ct) =>
+        await db.Database.ExecuteSqlRawAsync(
+            "INSERT INTO outbox.message (tenant_id, aggregate_type, aggregate_id, message_type, payload_json) " +
+            "VALUES ({0}, 'GATE_TRANSACTION', {1}, {2}, {3})",
+            [transaction.TenantId, transaction.GateTransactionId, messageType, JsonSerializer.Serialize(payload)],
+            ct);
+
+    private static ProblemHttpResult Refused(BarrierView view) =>
+        TypedResults.Problem(
+            title: $"{view.ContainerNo} cannot go {view.Direction}.",
+            detail: string.Join(" ", view.Findings.Where(f => f.Severity == GateSeverity.Block).Select(f => f.Message)),
+            statusCode: StatusCodes.Status409Conflict,
+            extensions: new Dictionary<string, object?>
+            {
+                ["decision"] = view.Decision,
+                ["findings"] = view.Findings.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList(),
+            });
+
+    private static ProblemHttpResult Forbidden(string title, IReadOnlyList<GateFinding> findings) =>
+        TypedResults.Problem(
+            title: title,
+            statusCode: StatusCodes.Status403Forbidden,
+            extensions: new Dictionary<string, object?>
+            {
+                ["findings"] = findings.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList(),
+            });
+
+    private static TruckVisitResponse Project(TruckVisit v, IReadOnlyList<GateTransactionSummaryResponse> boxes) => new(
+        v.TruckVisitId, v.VisitNo, v.BranchId, v.TruckPlate, v.TrailerPlate, v.HaulierPartyCode, v.DriverName, v.LaneCode,
+        v.ArrivedAt, v.GateInAt, v.GateOutAt, v.DwellMinutes,
+        v.GateOutAt is not null ? "DEPARTED" : v.GateInAt is not null ? "ON_SITE" : "ARRIVED",
+        v.Source, boxes);
+
+    private static async Task<GatePreflightResponse> ProjectAsync(TosDbContext db, BarrierView view, CancellationToken ct)
+    {
+        string? callRef = view.Booking?.VesselCallId is { } callId
+            ? await db.VesselCalls.AsNoTracking().Where(c => c.VesselCallId == callId).Select(c => c.CallRef).SingleOrDefaultAsync(ct)
+            : null;
+
+        return new GatePreflightResponse(
+            view.ContainerNo, view.Direction, view.At, view.Decision,
+            view.Findings.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList(),
+            view.Booking is null || view.Assignment is null ? null : new GateBookingResponse(
+                view.Booking.BookingId, view.Booking.OrderNo, view.Booking.BranchId, view.Booking.OrderTypeCode,
+                view.Booking.DirectionCode, view.Booking.LinePartyCode, view.Booking.CustomerPartyCode,
+                view.Booking.VesselCallId, callRef, view.Booking.ValidTo,
+                view.Assignment.BookingContainerId, view.Assignment.DeclaredSealNo, view.Assignment.DeclaredVgmKg,
+                view.Requirement?.EquipmentTypeCode),
+            view.Step is null || view.StepRules is null ? null : new GateStepResponse(
+                view.Step.MovementPlanId, view.Step.SequenceNo, view.Step.MovementCode, view.StepRules.Direction,
+                view.StepRules.FullEmpty, view.Step.IsRequired, view.StepRules.CheckSealNo, view.StepRules.CheckGrossWeight,
+                view.StepRules.RequireVesselVoyage, view.StepRules.AllowDamagedRelease, view.StepRules.RequiresSurvey,
+                view.StepsToSkip.Select(s => s.MovementCode).ToList()),
+            view.Holds.Select(h => new GateHoldResponse(
+                h.Hold.ContainerHoldId, h.Hold.HoldCode, h.Definition?.DescriptionEn, h.Definition?.BlockingScope,
+                h.Definition?.ReleaseAuthority, h.Hold.HeldVia,
+                h.Definition is not null && HoldRules.Blocks(h.Definition.BlockingScope, view.Direction))).ToList(),
+            view.OpenVisit is null ? null : new GateYardResponse(
+                view.OpenVisit.ContainerVisitId, view.OpenVisit.BranchId, view.OpenVisit.FullEmpty,
+                view.OpenVisit.PositionText, view.OpenVisit.LastEventAt),
+            view.CutoffKind is null || view.CutoffAt is null ? null : new GateCutoffResponse(
+                view.CutoffKind, view.CutoffAt.Value, view.IsLate, view.CoveringException?.CutoffExceptionId),
+            view.Coupon is null ? null : new GateCouponResponse(
+                view.Coupon.GateAuthorizationId, view.Coupon.CouponRef, view.Coupon.PaymentChannel, view.Coupon.ValidUntil),
+            view.IsCheckDigitValid, view.Registry is not null);
+    }
+
+    private static async Task<GateTransactionResponse> ProjectAsync(
+        TosDbContext db, Guid id, Guid? containerVisitId, bool completed, CancellationToken ct)
+    {
+        var row = await (
+            from t in db.GateTransactions.AsNoTracking().Where(x => x.GateTransactionId == id)
+            join b in db.Bookings on t.BookingId equals b.BookingId
+            join v in db.TruckVisits on t.TruckVisitId equals v.TruckVisitId
+            select new { g = t, b.OrderNo, v.VisitNo, v.TruckPlate }).SingleAsync(ct);
+
+        var seals = await db.GateTransactionSeals.AsNoTracking()
+            .Where(s => s.GateTransactionId == id)
+            .Select(s => new GateSealResponse(s.SealNo, s.SealType, s.IsIntact, s.MatchesDeclared))
+            .ToListAsync(ct);
+
+        var visitId = containerVisitId ?? await db.ContainerVisits.AsNoTracking()
+            .Where(v => v.GateInTransactionId == id || v.GateOutTransactionId == id)
+            .Select(v => (Guid?)v.ContainerVisitId).FirstOrDefaultAsync(ct);
+
+        var g = row.g;
+        return new GateTransactionResponse(
+            g.GateTransactionId, g.EirNo, g.BranchId, g.Direction, g.PositionNo,
+            g.MovementCode, g.FullEmpty, g.ContainerNo, g.IsCheckDigitValid,
+            g.EquipmentTypeCode, g.BookingId, row.OrderNo, g.LinePartyCode,
+            g.TruckVisitId, row.VisitNo, row.TruckPlate,
+            g.GrossWeightKg, g.VgmKg, g.VgmMethod, g.WeightSource,
+            g.ConditionCode, g.GradeCode, g.SealMismatch, seals,
+            g.CutoffKindApplied, g.CutoffAtApplied, g.IsLate,
+            g.CutoffExceptionId, g.LateOverrideReason, g.CheckDigitOverrideReason,
+            g.GateAuthorizationId,
+            g.TransactionAt, g.RecordedAt, g.Status,
+            visitId, completed, Convert.ToBase64String(g.RowVersion));
+    }
+}

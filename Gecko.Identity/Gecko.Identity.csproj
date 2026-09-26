@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Other modules: reference their .Contracts project only. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Gecko.SharedKernel\Gecko.SharedKernel.csproj" />
+    <ProjectReference Include="..\Gecko.Data\Gecko.Data.csproj" />
+    <ProjectReference Include="..\Gecko.Identity.Contracts\Gecko.Identity.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
+    <PackageReference Include="Konscious.Security.Cryptography.Argon2" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" />
+  </ItemGroup>
+
+</Project>

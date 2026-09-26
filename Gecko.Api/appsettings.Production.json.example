@@ -1,0 +1,76 @@
+// TEMPLATE - every setting the API reads in production. NO REAL SECRETS HERE, EVER.
+//
+// On the VM, secrets come from ENVIRONMENT VARIABLES on the Gecko.Api service
+// (DEPLOY_VM.md section 6). The name is the JSON path with ':' written as '__':
+//
+//   ConnectionStrings:IdentityApp   ->  ConnectionStrings__IdentityApp
+//   Identity:Jwt:SigningKey         ->  Identity__Jwt__SigningKey
+//
+// Environment variables override appsettings*.json, so the non-secret values below
+// can live in a real appsettings.Production.json next to Gecko.Api.dll and the
+// secrets only in the environment. Leave every "" below EMPTY in any file.
+//
+// Two logins, and which connection gets which (09_security_hardening.sql):
+//   *App     -> User Id=gecko_app     every ordinary request
+//   *System  -> User Id=gecko_system  login, provisioning, the outbox dispatchers
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.EntityFrameworkCore.Database.Command": "Warning"
+    }
+  },
+
+  // The public host name(s) Caddy/IIS forwards, ';'-separated.
+  "AllowedHosts": "tos.example.co.th",
+
+  // SECRETS - set as environment variables, not here. Shape of each value:
+  //   Server=localhost\SQLEXPRESS;Database=gecko_identity;User Id=gecko_app;Password=<GECKO_APP_PASSWORD>;TrustServerCertificate=true;Encrypt=true
+  // (TrustServerCertificate: SQL Express on the same box uses its self-signed cert.)
+  "ConnectionStrings": {
+    "IdentityApp": "",       // gecko_identity  / gecko_app
+    "IdentitySystem": "",    // gecko_identity  / gecko_system
+    "MasterDataApp": "",     // gecko_master    / gecko_app
+    "RevenueApp": "",        // gecko_revenue   / gecko_app
+    "RevenueSystem": "",     // gecko_revenue   / gecko_system  (Revenue outbox dispatcher)
+    "TosApp": "",            // gecko_tos       / gecko_app
+    "TosSystem": ""          // gecko_tos       / gecko_system  (TOS outbox dispatcher)
+  },
+
+  // Proxy hops in front of the API (Caddy/IIS, then next start). Only loopback peers are trusted.
+  "ForwardedHeaders": {
+    "ForwardLimit": 2
+  },
+
+  "Identity": {
+    "Jwt": {
+      "Issuer": "gecko-identity",
+      "Audience": "gecko-platform",
+      "SigningKey": "",            // SECRET: base64 of >= 32 random bytes (DEPLOY_VM.md section 6.2)
+      "AccessTokenMinutes": 15     // ADR-006. Development raises it; production must not.
+    },
+    "Lockout": {
+      "MaxFailedAttempts": 5,
+      "LockoutMinutes": 15,
+      "LoginAttemptsPerMinutePerIp": 10   // per real client IP: X-Forwarded-For is honoured from loopback
+                                          // proxies only (ForwardedHeaders below, DEPLOY_VM.md 6.3)
+    },
+    "Session": {
+      "RefreshTokenDays": 30,
+      "RotationGraceSeconds": 10
+    }
+  },
+
+  // Gate photos / attachments. On the DATA disk, backed up with the databases.
+  // Default when empty: <content root>\_files - i.e. inside the deploy folder, wiped by the next deploy.
+  "FileStore": {
+    "Root": "F:\\gecko\\files"
+  },
+
+  // Both outbox dispatchers (TOS -> Notification/Revenue, Revenue -> TOS gate coupon).
+  "Outbox": {
+    "Enabled": true,
+    "PollSeconds": 5
+  }
+}

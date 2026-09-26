@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- The ONE deployable. Composes modules; contains no business logic. -->
+  <PropertyGroup>
+    <UserSecretsId>gecko-platform-api</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Gecko.Identity\Gecko.Identity.csproj" />
+    <ProjectReference Include="..\Gecko.MasterData\Gecko.MasterData.csproj" />
+    <ProjectReference Include="..\Gecko.Revenue\Gecko.Revenue.csproj" />
+    <ProjectReference Include="..\Gecko.Tos\Gecko.Tos.csproj" />
+    <ProjectReference Include="..\Gecko.Notification\Gecko.Notification.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+  </ItemGroup>
+
+</Project>

@@ -63,7 +63,8 @@ public sealed record CodeResolutionResponse(
 public sealed record NumberSeriesResponse(
     Guid NumberSeriesId, Guid? BranchId, string SeriesKey, string? DocumentTypeCode, string? Description,
     string? Prefix, string Separator, bool IncludeBranchCode, string DatePartFormat, string ResetPeriod,
-    byte NumberLength, long StartNumber, bool IsGapFreeRequired, bool IsActive, string RowVersion);
+    byte NumberLength, long StartNumber, bool IsGapFreeRequired, bool IsActive, string RowVersion,
+    bool HasIssuedNumbers = false);
 
 public sealed record SaveNumberSeriesRequest(
     [property: Required, RegularExpression("^[A-Z0-9][A-Z0-9_]{0,29}$")] string SeriesKey,
@@ -86,14 +87,22 @@ public sealed record NextNumberRequest(
     Guid? BranchId = null,
     [property: MaxLength(30)] string? BranchCode = null);
 
+/// <summary>
+/// TenantRowVersion / BranchRowVersion are the versions of the tenant's own rows
+/// at each scope (null where the tenant has none). Writing a scope sends that
+/// scope's version back.
+/// </summary>
 public sealed record TenantSettingResponse(
     string SettingKey, string? Value, string? TenantValue, string? BranchValue, string? DefaultValue,
-    string ValueType, string AllowedScope, string OwningModule, string DescriptionEn, string ResolvedFrom);
+    string ValueType, string AllowedScope, string OwningModule, string DescriptionEn, string ResolvedFrom,
+    string? TenantRowVersion = null, string? BranchRowVersion = null);
 
+/// <summary>SettingValue null = clear this scope's value (it falls back to the next layer). RowVersion = the version of the row at this scope, when there is one.</summary>
 public sealed record SaveTenantSettingRequest(
     [property: Required, MaxLength(100)] string SettingKey,
     [property: MaxLength(4000)] string? SettingValue,
-    Guid? BranchId = null);
+    Guid? BranchId = null,
+    string? RowVersion = null);
 
 /// <summary>
 /// The tenant's own configuration layer: code lists it extends, partner codes it
@@ -125,6 +134,7 @@ internal static class ConfigEndpoints
         var series = master.MapGroup("/number-series").WithTags("Master data — number series");
         series.MapGet("/", ListSeriesAsync).RequirePermission(MasterDataPermissions.ConfigView).WithSummary("List document number series");
         series.MapPost("/", CreateSeriesAsync).RequirePermission(MasterDataPermissions.ConfigManage).Validate<SaveNumberSeriesRequest>().WithSummary("Create a number series");
+        series.MapPut("/{numberSeriesId:guid}", UpdateSeriesAsync).RequirePermission(MasterDataPermissions.ConfigManage).Validate<SaveNumberSeriesRequest>().WithSummary("Update a number series (how an in-use series resets cannot change)");
         series.MapPost("/next", NextNumberAsync).RequirePermission(MasterDataPermissions.ConfigView).Validate<NextNumberRequest>().WithSummary("Issue the next number (branch series wins over tenant-wide)");
         series.MapDelete("/{numberSeriesId:guid}", DeleteSeriesAsync).RequirePermission(MasterDataPermissions.ConfigManage).WithSummary("Soft-delete a number series");
 
@@ -461,7 +471,8 @@ internal static class ConfigEndpoints
             .Select(s => new NumberSeriesResponse(
                 s.NumberSeriesId, s.BranchId, s.SeriesKey, s.DocumentTypeCode, s.Description, s.Prefix,
                 s.Separator, s.IncludeBranchCode, s.DatePartFormat, s.ResetPeriod, s.NumberLength,
-                s.StartNumber, s.IsGapFreeRequired, s.IsActive, Convert.ToBase64String(s.RowVersion)))
+                s.StartNumber, s.IsGapFreeRequired, s.IsActive, Convert.ToBase64String(s.RowVersion),
+                db.NumberSeriesCounters.Any(c => c.NumberSeriesId == s.NumberSeriesId)))
             .ToListAsync(ct));
     }
 
@@ -474,17 +485,7 @@ internal static class ConfigEndpoints
         // are numbered inside gecko_tos, where the barrier issues them.
         if (TosOwnedSeriesKeys.Contains(key))
             return MasterDataSupport.InvalidReference("seriesKey", $"'{key}' is numbered by the TOS module, not master data.");
-
-        // Mirrors ck_number_series__reset_needs_date: a series that resets yearly
-        // but carries no year in the number produces duplicates every January.
-        if (request.ResetPeriod == "YEARLY" && request.DatePartFormat == "NONE")
-            return MasterDataSupport.InvalidReference("datePartFormat", "A YEARLY reset needs a year in the number, or it repeats itself every January.");
-        if (request.ResetPeriod == "MONTHLY" && request.DatePartFormat is not ("YYMM" or "YYYYMM"))
-            return MasterDataSupport.InvalidReference("datePartFormat", "A MONTHLY reset needs YYMM or YYYYMM in the number.");
-
-        if (request.DocumentTypeCode is not null &&
-            !await db.DocumentTypes.AnyAsync(d => d.Code == request.DocumentTypeCode.ToUpperInvariant(), ct))
-            return MasterDataSupport.InvalidReference("documentTypeCode", $"Unknown document type '{request.DocumentTypeCode}'.");
+        if (await ValidateSeriesAsync(db, request, ct) is { } invalid) return invalid;
 
         var clash = await db.NumberSeries.AnyAsync(s => s.SeriesKey == key && s.BranchId == request.BranchId, ct);
         if (clash)
@@ -515,6 +516,76 @@ internal static class ConfigEndpoints
             series.Prefix, series.Separator, series.IncludeBranchCode, series.DatePartFormat, series.ResetPeriod,
             series.NumberLength, series.StartNumber, series.IsGapFreeRequired, series.IsActive,
             Convert.ToBase64String(series.RowVersion)));
+    }
+
+    /// <summary>The format rules both create and update enforce.</summary>
+    private static async Task<ValidationProblem?> ValidateSeriesAsync(MasterDataDbContext db, SaveNumberSeriesRequest request, CancellationToken ct)
+    {
+        // Mirrors ck_number_series__reset_needs_date: a series that resets yearly
+        // but carries no year in the number produces duplicates every January.
+        if (request.ResetPeriod == "YEARLY" && request.DatePartFormat == "NONE")
+            return MasterDataSupport.InvalidReference("datePartFormat", "A YEARLY reset needs a year in the number, or it repeats itself every January.");
+        if (request.ResetPeriod == "MONTHLY" && request.DatePartFormat is not ("YYMM" or "YYYYMM"))
+            return MasterDataSupport.InvalidReference("datePartFormat", "A MONTHLY reset needs YYMM or YYYYMM in the number.");
+
+        if (request.DocumentTypeCode is not null &&
+            !await db.DocumentTypes.AnyAsync(d => d.Code == request.DocumentTypeCode.ToUpperInvariant(), ct))
+            return MasterDataSupport.InvalidReference("documentTypeCode", $"Unknown document type '{request.DocumentTypeCode}'.");
+        return null;
+    }
+
+    /// <summary>
+    /// Everything about a series can be edited except what it is (key, branch)
+    /// and — once it has issued numbers — HOW IT COUNTS. The counter is kept per
+    /// period ('ALL', 'YYYY', 'YYYYMM'); changing the reset or the date part moves
+    /// it to a new period that starts again at the start number, so a YEARLY
+    /// PARTY_CODE turned NEVER would issue 20260001 a second time. Prefix,
+    /// separator, length and gap-free change the shape of numbers from now on and
+    /// never repeat one.
+    /// </summary>
+    private static async Task<Results<Ok<NumberSeriesResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateSeriesAsync(
+        Guid numberSeriesId, SaveNumberSeriesRequest request, MasterDataDbContext db, CancellationToken ct)
+    {
+        var series = await db.NumberSeries.SingleOrDefaultAsync(s => s.NumberSeriesId == numberSeriesId, ct);
+        if (series is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(series, request.RowVersion) is { } missing) return missing;
+
+        if (!string.Equals(request.SeriesKey, series.SeriesKey, StringComparison.OrdinalIgnoreCase))
+            return MasterDataSupport.InvalidReference("seriesKey", "The series key cannot change. Create a new series instead.");
+        if (request.BranchId != series.BranchId)
+            return MasterDataSupport.InvalidReference("branchId", "A series cannot move to another branch. Create one for that branch instead.");
+        if (await ValidateSeriesAsync(db, request, ct) is { } invalid) return invalid;
+
+        var issued = await db.NumberSeriesCounters.AsNoTracking()
+            .Where(c => c.NumberSeriesId == numberSeriesId).MaxAsync(c => (long?)c.LastNumber, ct);
+        if (issued is not null)
+        {
+            var errors = new Dictionary<string, string[]>();
+            const string why = "Numbers have been issued from this series (up to {0}); changing this would start counting again and repeat them.";
+            if (request.ResetPeriod != series.ResetPeriod) errors["resetPeriod"] = [string.Format(why, issued)];
+            if (request.DatePartFormat != series.DatePartFormat) errors["datePartFormat"] = [string.Format(why, issued)];
+            if (request.StartNumber != series.StartNumber) errors["startNumber"] = [$"Numbers have been issued from this series (up to {issued}); the start number no longer applies."];
+            if (errors.Count > 0) return TypedResults.ValidationProblem(errors);
+        }
+
+        series.DocumentTypeCode = request.DocumentTypeCode?.ToUpperInvariant();
+        series.Description = request.Description;
+        series.Prefix = request.Prefix?.ToUpperInvariant();
+        series.Separator = request.Separator;
+        series.IncludeBranchCode = request.IncludeBranchCode;
+        series.DatePartFormat = request.DatePartFormat;
+        series.ResetPeriod = request.ResetPeriod;
+        series.NumberLength = request.NumberLength;
+        series.StartNumber = request.StartNumber;
+        series.IsGapFreeRequired = request.IsGapFreeRequired;
+        series.IsActive = request.IsActive;
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+
+        return TypedResults.Ok(new NumberSeriesResponse(
+            series.NumberSeriesId, series.BranchId, series.SeriesKey, series.DocumentTypeCode, series.Description,
+            series.Prefix, series.Separator, series.IncludeBranchCode, series.DatePartFormat, series.ResetPeriod,
+            series.NumberLength, series.StartNumber, series.IsGapFreeRequired, series.IsActive,
+            Convert.ToBase64String(series.RowVersion), issued is not null));
     }
 
     /// <summary>
@@ -560,6 +631,12 @@ internal static class ConfigEndpoints
         var series = await db.NumberSeries.SingleOrDefaultAsync(s => s.NumberSeriesId == numberSeriesId, ct);
         if (series is null) return TypedResults.NotFound();
         if (db.ExpectVersion(series, rowVersion) is { } missing) return missing;
+        // A series that has issued numbers is what those documents were numbered
+        // by (PARTY_CODE numbers every new customer): deleting it breaks the next
+        // registration. Deactivate it instead.
+        if (await db.NumberSeriesCounters.AnyAsync(c => c.NumberSeriesId == numberSeriesId, ct))
+            return MasterDataSupport.Conflict("Numbers have been issued from this series.",
+                "Documents were numbered by it and the next one may still need it. Set it inactive instead of deleting it.");
         db.NumberSeries.Remove(series);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
@@ -574,39 +651,48 @@ internal static class ConfigEndpoints
     /// for the 90% of settings nobody has touched.
     /// </summary>
     private static async Task<Ok<IReadOnlyList<TenantSettingResponse>>> ListSettingsAsync(
-        MasterDataDbContext db, CancellationToken ct, Guid? branchId = null, string? owningModule = null)
+        MasterDataDbContext db, CancellationToken ct, Guid? branchId = null, string? owningModule = null) =>
+        TypedResults.Ok(await ResolveSettingsAsync(db, branchId, owningModule, key: null, ct));
+
+    /// <summary>
+    /// Every declared setting (or one) with its resolved value, where it came
+    /// from, and the version of the tenant's own row at each scope.
+    /// </summary>
+    private static async Task<IReadOnlyList<TenantSettingResponse>> ResolveSettingsAsync(
+        MasterDataDbContext db, Guid? branchId, string? owningModule, string? key, CancellationToken ct)
     {
         var definitions = db.SettingDefinitions.AsNoTracking().Where(d => d.IsActive);
         if (!string.IsNullOrWhiteSpace(owningModule))
             definitions = definitions.Where(d => d.OwningModule == owningModule.ToUpperInvariant());
+        if (key is not null) definitions = definitions.Where(d => d.SettingKey == key);
 
         var declared = await definitions.OrderBy(d => d.OwningModule).ThenBy(d => d.SettingKey).ToListAsync(ct);
-        var overrides = await db.TenantSettings.AsNoTracking()
-            .Select(s => new { s.SettingKey, s.BranchId, s.SettingValue }).ToListAsync(ct);
+        var rows = db.TenantSettings.AsNoTracking();
+        if (key is not null) rows = rows.Where(s => s.SettingKey == key);
+        var overrides = await rows.Select(s => new { s.SettingKey, s.BranchId, s.SettingValue, s.RowVersion }).ToListAsync(ct);
 
-        var result = declared.Select(d =>
+        return declared.Select(d =>
         {
-            var branchValue = branchId is null || d.AllowedScope != "BRANCH"
+            var branchRow = branchId is null || d.AllowedScope != "BRANCH"
                 ? null
-                : overrides.SingleOrDefault(o => o.SettingKey == d.SettingKey && o.BranchId == branchId)?.SettingValue;
-            var tenantValue = overrides.SingleOrDefault(o => o.SettingKey == d.SettingKey && o.BranchId == null)?.SettingValue;
+                : overrides.SingleOrDefault(o => o.SettingKey == d.SettingKey && o.BranchId == branchId);
+            var tenantRow = overrides.SingleOrDefault(o => o.SettingKey == d.SettingKey && o.BranchId == null);
 
             var (value, from) =
-                branchValue is not null ? (branchValue, "BRANCH")
-                : tenantValue is not null ? (tenantValue, "TENANT")
+                branchRow is not null ? (branchRow.SettingValue, "BRANCH")
+                : tenantRow is not null ? (tenantRow.SettingValue, "TENANT")
                 : (d.DefaultValue, "DEFAULT");
 
             return new TenantSettingResponse(
-                d.SettingKey, value, tenantValue, branchValue, d.DefaultValue,
-                d.ValueType, d.AllowedScope, d.OwningModule, d.DescriptionEn, from);
+                d.SettingKey, value, tenantRow?.SettingValue, branchRow?.SettingValue, d.DefaultValue,
+                d.ValueType, d.AllowedScope, d.OwningModule, d.DescriptionEn, from,
+                tenantRow is null ? null : Convert.ToBase64String(tenantRow.RowVersion),
+                branchRow is null ? null : Convert.ToBase64String(branchRow.RowVersion));
         }).ToList();
-
-        return TypedResults.Ok<IReadOnlyList<TenantSettingResponse>>(result);
     }
 
     private static async Task<Results<Ok<TenantSettingResponse>, ValidationProblem, ProblemHttpResult>> UpsertSettingAsync(
-        SaveTenantSettingRequest request, MasterDataDbContext db, ITenantContext caller,
-        TenantSettingReader reader, CancellationToken ct)
+        SaveTenantSettingRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
         var key = request.SettingKey;
         var definition = await db.SettingDefinitions.AsNoTracking()
@@ -622,6 +708,19 @@ internal static class ConfigEndpoints
 
         var existing = await db.TenantSettings.SingleOrDefaultAsync(
             s => s.SettingKey == key && s.BranchId == request.BranchId, ct);
+
+        // The row at this scope is versioned like every tenant row — also when the
+        // write clears it. No row yet: this write creates it; a caller that sent a
+        // version for a row that is gone lost a race.
+        if (existing is not null)
+        {
+            if (db.ExpectVersion(existing, request.RowVersion) is { } missing) return missing;
+        }
+        else if (!string.IsNullOrWhiteSpace(request.RowVersion))
+        {
+            return MasterDataSupport.Conflict("The record changed since you loaded it.",
+                "This value was cleared meanwhile. Re-read the settings and apply your change again.");
+        }
 
         if (request.SettingValue is null)
         {
@@ -643,12 +742,7 @@ internal static class ConfigEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-
-        var resolved = await reader.GetAsync(key, request.BranchId, ct);
-        return TypedResults.Ok(new TenantSettingResponse(
-            key, resolved, null, null, definition.DefaultValue,
-            definition.ValueType, definition.AllowedScope, definition.OwningModule, definition.DescriptionEn,
-            request.SettingValue is null ? "DEFAULT" : request.BranchId is null ? "TENANT" : "BRANCH"));
+        return TypedResults.Ok((await ResolveSettingsAsync(db, request.BranchId, null, key, ct)).Single());
     }
 
     private static bool ParsesAs(string valueType, string value) => valueType switch

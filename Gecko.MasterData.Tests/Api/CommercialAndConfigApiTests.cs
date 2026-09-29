@@ -379,7 +379,7 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{CodeLists}/TRUCKING_ZONE/{code}", ct);
+            await RowVersions.DeleteCurrentFromListAsync(sct, $"{CodeLists}/TRUCKING_ZONE/{code}", ct);
         }
     }
 

@@ -13,9 +13,18 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Gecko.MasterData.Endpoints.Config;
 
+/// <summary>
+/// RowVersion is the tenant's OWN row (a value it added, or its override of a
+/// global one); null when the tenant has none and the value is the global row
+/// as shipped. Send it back on PUT / DELETE.
+/// </summary>
 public sealed record CodeListValueResponse(
     string CategoryCode, string Code, string DescriptionEn, string? DescriptionLocal,
-    string? IsoCode, short SortOrder, bool IsActive, bool IsTenantDefined);
+    string? IsoCode, short SortOrder, bool IsActive, bool IsTenantDefined, string? RowVersion = null);
+
+/// <summary>A code list the tenant can see. Closed (AllowsTenantValues = false) = the platform branches on its values.</summary>
+public sealed record CodeListCategoryResponse(
+    string CategoryCode, string DescriptionEn, string OwningModule, bool AllowsTenantValues, int ValueCount);
 
 public sealed record SaveCodeListValueRequest(
     [property: Required, MaxLength(40)] string CategoryCode,
@@ -24,7 +33,8 @@ public sealed record SaveCodeListValueRequest(
     [property: MaxLength(200)] string? DescriptionLocal = null,
     [property: MaxLength(20)] string? IsoCode = null,
     [property: Range(0, 9999)] short SortOrder = 100,
-    bool IsActive = true);
+    bool IsActive = true,
+    string? RowVersion = null);
 
 public sealed record CodeMappingResponse(
     Guid CodeMappingId, string MappingType, string? CodeListCategory, Guid? PartyId, string? PartyCode,
@@ -100,6 +110,7 @@ internal static class ConfigEndpoints
     public static RouteGroupBuilder MapConfigEndpoints(this RouteGroupBuilder master)
     {
         var codeLists = master.MapGroup("/code-lists").WithTags("Master data — code lists");
+        codeLists.MapGet("/", ListCategoriesAsync).RequirePermission(MasterDataPermissions.ConfigView).WithSummary("List the code list categories with how many values this tenant sees in each");
         codeLists.MapGet("/{categoryCode}", ListCodeValuesAsync).RequirePermission(MasterDataPermissions.ConfigView).WithSummary("List a code list as this tenant sees it (global + tenant overrides)");
         codeLists.MapPut("/{categoryCode}/{code}", UpsertCodeValueAsync).RequirePermission(MasterDataPermissions.ConfigManage).Validate<SaveCodeListValueRequest>().WithSummary("Add or override a code list value for this tenant");
         codeLists.MapDelete("/{categoryCode}/{code}", DeleteCodeValueAsync).RequirePermission(MasterDataPermissions.ConfigManage).WithSummary("Remove this tenant's override (the global value, if any, reappears)");
@@ -126,6 +137,24 @@ internal static class ConfigEndpoints
 
     // ── code lists ──────────────────────────────────────────────────────────
 
+    private static async Task<Ok<IReadOnlyList<CodeListCategoryResponse>>> ListCategoriesAsync(
+        MasterDataDbContext db, CancellationToken ct)
+    {
+        var counts = await db.VwCodeLists.AsNoTracking()
+            .Where(v => v.IsActive == true)
+            .GroupBy(v => v.CategoryCode)
+            .Select(g => new { Category = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(g => g.Category ?? "", g => g.Count, ct);
+        var categories = await db.CodeListCategories.AsNoTracking()
+            .Where(c => c.IsActive)
+            .OrderBy(c => c.CategoryCode)
+            .ToListAsync(ct);
+        return TypedResults.Ok<IReadOnlyList<CodeListCategoryResponse>>(categories
+            .Select(c => new CodeListCategoryResponse(c.CategoryCode, c.DescriptionEn, c.OwningModule, c.AllowsTenantValues,
+                counts.GetValueOrDefault(c.CategoryCode)))
+            .ToList());
+    }
+
     private static async Task<Ok<IReadOnlyList<CodeListValueResponse>>> ListCodeValuesAsync(
         string categoryCode, MasterDataDbContext db, CancellationToken ct, bool includeInactive = false)
     {
@@ -133,14 +162,21 @@ internal static class ConfigEndpoints
         var values = db.VwCodeLists.AsNoTracking().Where(v => v.CategoryCode == category);
         if (!includeInactive) values = values.Where(v => v.IsActive == true);
 
-        return TypedResults.Ok<IReadOnlyList<CodeListValueResponse>>(await values
-            .OrderBy(v => v.SortOrder).ThenBy(v => v.Code)
-            // A VIEW scaffolds every column nullable, so the non-null contract this
-            // API promises is restored here rather than leaked to the caller.
+        // The view resolves global + tenant but carries no row_version; the tenant's
+        // own rows (few per category) are read beside it for the concurrency token.
+        var own = await db.CodeListValues.AsNoTracking().Where(v => v.CategoryCode == category)
+            .Select(v => new { v.Code, v.RowVersion }).ToListAsync(ct);
+        var versions = own.ToDictionary(v => v.Code, v => Convert.ToBase64String(v.RowVersion), StringComparer.OrdinalIgnoreCase);
+
+        var rows = await values.OrderBy(v => v.SortOrder).ThenBy(v => v.Code).ToListAsync(ct);
+        // A VIEW scaffolds every column nullable, so the non-null contract this
+        // API promises is restored here rather than leaked to the caller.
+        return TypedResults.Ok<IReadOnlyList<CodeListValueResponse>>(rows
             .Select(v => new CodeListValueResponse(
                 v.CategoryCode ?? category, v.Code ?? "", v.DescriptionEn ?? "", v.DescriptionLocal, v.IsoCode,
-                v.SortOrder ?? (short)100, v.IsActive ?? false, v.IsTenantDefined ?? false))
-            .ToListAsync(ct));
+                v.SortOrder ?? (short)100, v.IsActive ?? false, v.IsTenantDefined ?? false,
+                versions.GetValueOrDefault(v.Code ?? "")))
+            .ToList());
     }
 
     private static async Task<Results<Ok<CodeListValueResponse>, ValidationProblem, ProblemHttpResult>> UpsertCodeValueAsync(
@@ -164,9 +200,19 @@ internal static class ConfigEndpoints
             return MasterDataSupport.InvalidReference("code",
                 $"'{category}' is a closed category — the platform branches on its values, so a new one would never be acted on.");
 
+        // The tenant's own row is versioned like every tenant row: editing one
+        // needs the version read with it. No own row yet = this PUT creates it; a
+        // caller that sent a version for a row that is gone lost a race.
         var existing = await db.CodeListValues.SingleOrDefaultAsync(v => v.CategoryCode == category && v.Code == value, ct);
-        if (existing is null)
+        if (existing is not null)
         {
+            if (db.ExpectVersion(existing, request.RowVersion) is { } missing) return missing;
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(request.RowVersion))
+                return MasterDataSupport.Conflict("The record changed since you loaded it.",
+                    "This tenant's value was removed meanwhile. Re-read the list and apply your change again.");
             existing = new CodeListValue { TenantId = caller.TenantId(), CategoryCode = category, Code = value };
             db.CodeListValues.Add(existing);
         }
@@ -181,18 +227,19 @@ internal static class ConfigEndpoints
 
         return TypedResults.Ok(new CodeListValueResponse(
             category, value, existing.DescriptionEn, existing.DescriptionLocal,
-            existing.IsoCode, existing.SortOrder, existing.IsActive, !isGlobal));
+            existing.IsoCode, existing.SortOrder, existing.IsActive, !isGlobal, Convert.ToBase64String(existing.RowVersion)));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteCodeValueAsync(
-        string categoryCode, string code, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteCodeValueAsync(
+        string categoryCode, string code, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var value = await db.CodeListValues.SingleOrDefaultAsync(
             v => v.CategoryCode == categoryCode.ToUpperInvariant() && v.Code == code.ToUpperInvariant(), ct);
         if (value is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(value, rowVersion) is { } missing) return missing;
 
         db.CodeListValues.Remove(value);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -262,6 +309,7 @@ internal static class ConfigEndpoints
         SaveCodeMappingRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
         if (await ValidateMappingAsync(db, request, ct) is { } problem) return problem;
+        if (await DuplicateMappingAsync(db, request, exceptId: null, ct) is { } duplicate) return duplicate;
 
         var mapping = new CodeMapping { TenantId = caller.TenantId() };
         Apply(mapping, request);
@@ -279,6 +327,7 @@ internal static class ConfigEndpoints
         if (!db.TrySetExpectedVersion(mapping, request.RowVersion))
             return MasterDataSupport.InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
         if (await ValidateMappingAsync(db, request, ct) is { } problem) return problem;
+        if (await DuplicateMappingAsync(db, request, exceptId: codeMappingId, ct) is { } duplicate) return duplicate;
 
         Apply(mapping, request);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
@@ -326,6 +375,65 @@ internal static class ConfigEndpoints
 
         if (request.PartyId is not null && !await db.Parties.AnyAsync(p => p.PartyId == request.PartyId, ct))
             return MasterDataSupport.InvalidReference("partyId", "Unknown party for this tenant.");
+
+        // internal_code is a soft reference into the master the type names. A
+        // mapping to a code that does not exist resolves an inbound message to
+        // nothing the platform knows — worse than no mapping, which is rejected.
+        var code = request.InternalCode.Trim().ToUpperInvariant();
+        var category = request.CodeListCategory?.ToUpperInvariant();
+        var known = request.MappingType switch
+        {
+            "CODE_LIST" => await db.VwCodeLists.AnyAsync(v => v.CategoryCode == category && v.Code == code, ct),
+            "CARGO_CLASS" => await db.CargoClasses.AnyAsync(x => x.Code == code, ct),
+            "PARTY" => await db.Parties.AnyAsync(x => x.PartyCode == code, ct),
+            "VESSEL" => await db.Vessels.AnyAsync(x => x.VesselCode == code, ct),
+            "PORT" => await db.Ports.AnyAsync(x => x.PortCode == code, ct),
+            "ORDER_TYPE" => await db.OrderTypes.AnyAsync(x => x.OrderTypeCode == code, ct),
+            "CHARGE_CODE" => await db.ChargeCodes.AnyAsync(x => x.ChargeCode1 == code, ct),
+            "MOVEMENT" => await db.Movements.AnyAsync(x => x.MovementCode == code, ct),
+            "HOLD" => await db.Holds.AnyAsync(x => x.HoldCode == code, ct),
+            "REPAIR_CODE" => await db.RepairCodes.AnyAsync(x => x.RepairCode1 == code, ct),
+            "DAMAGE_CODE" => await db.DamageCodes.AnyAsync(x => x.DamageCode1 == code, ct),
+            "CONTAINER_CONDITION" => await db.ContainerConditions.AnyAsync(x => x.ConditionCode == code, ct),
+            "EQUIPMENT_TYPE" => await db.EquipmentTypes.AnyAsync(x => x.TypeCode == code, ct),
+            _ => true,
+        };
+        if (!known)
+            return MasterDataSupport.InvalidReference("internalCode",
+                request.MappingType == "CODE_LIST"
+                    ? $"'{code}' is not a value of the {category} code list."
+                    : $"'{code}' is not a {request.MappingType.Replace('_', ' ').ToLowerInvariant()} in this tenant's master data.");
+
+        return null;
+    }
+
+    /// <summary>
+    /// The four filtered unique indexes, checked first so a clash is a 409 that
+    /// names the mapping already there instead of a 500 from the index: inbound,
+    /// one internal code per external code; outbound, one external code per
+    /// internal code — per partner, or tenant-wide when there is none.
+    /// </summary>
+    private static async Task<ProblemHttpResult?> DuplicateMappingAsync(
+        MasterDataDbContext db, SaveCodeMappingRequest request, Guid? exceptId, CancellationToken ct)
+    {
+        var category = request.CodeListCategory?.ToUpperInvariant();
+        var external = request.ExternalCode.Trim().ToUpperInvariant();
+        var internalCode = request.InternalCode.Trim().ToUpperInvariant();
+        var same = db.CodeMappings.AsNoTracking().Where(m =>
+            m.MappingType == request.MappingType && m.CodeListCategory == category && m.PartyId == request.PartyId
+            && m.Channel == request.Channel && m.CodeMappingId != exceptId);
+
+        if (request.Direction is "INBOUND" or "BOTH"
+            && await same.Where(m => (m.Direction == "INBOUND" || m.Direction == "BOTH") && m.ExternalCode == external)
+                .Select(m => m.InternalCode).FirstOrDefaultAsync(ct) is { } already)
+            return MasterDataSupport.Conflict("This inbound code is already mapped.",
+                $"{external} already maps to {already} on {request.Channel}. Edit that mapping instead of adding a second one.");
+
+        if (request.Direction is "OUTBOUND" or "BOTH"
+            && await same.Where(m => (m.Direction == "OUTBOUND" || m.Direction == "BOTH") && m.InternalCode == internalCode)
+                .Select(m => m.ExternalCode).FirstOrDefaultAsync(ct) is { } sent)
+            return MasterDataSupport.Conflict("This outbound code is already mapped.",
+                $"{internalCode} is already sent as {sent} on {request.Channel}. Edit that mapping instead of adding a second one.");
 
         return null;
     }

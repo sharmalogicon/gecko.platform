@@ -43,7 +43,7 @@ internal static class AuthEndpoints
             .Validate<LoginRequest>()
             .RequireRateLimiting(LoginRateLimitPolicy)
             .WithSummary("Exchange email + password for an access token (+ refresh cookie)")
-            .WithDescription("Fixture users: any address from dev_02 with password Gecko#Test2026, e.g. admin@sct.co.th (TENANT_OWNER) or ops.lcb@sct.co.th (branch-scoped OPS_MANAGER).");
+            .WithDescription("Accounts are created by invitation; there is no self-service signup. A wrong email and a wrong password both return the same 401.");
 
         auth.MapPost("/refresh", RefreshAsync)
             .AllowAnonymous()

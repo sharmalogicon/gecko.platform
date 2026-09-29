@@ -50,10 +50,17 @@ var app = builder.Build();
 // sent by anything else is ignored, so it cannot be used to dodge the limit.
 app.UseForwardedHeaders(GeckoForwardedHeaders.Options(app.Configuration));
 
+// Vercel hosting: the proxy's egress IPs rotate, so it vouches for the client IP
+// with a shared key instead (off unless ClientIp:ProxyKey is set).
+app.UseTrustedProxyClientIp(app.Configuration);
+
 app.UseExceptionHandler();
 app.UseStatusCodePages();
 
-if (app.Environment.IsDevelopment())
+// Swagger at /swagger/index.html, and "/" opens it, so a fresh deploy shows something useful.
+// On in every environment for the pilot; every endpoint behind it still needs a token.
+// Set OpenApi:Enabled=false (App Service: OpenApi__Enabled) to hide the endpoint list.
+if (app.Configuration.GetValue("OpenApi:Enabled", true))
 {
     app.MapOpenApi();
     app.UseSwaggerUI(options =>
@@ -61,6 +68,7 @@ if (app.Environment.IsDevelopment())
         options.SwaggerEndpoint("/openapi/v1.json", "GECKO Platform v1");
         options.EnablePersistAuthorization();   // survive a page refresh while testing
     });
+    app.MapGet("/", () => Results.Redirect("/swagger/index.html")).AllowAnonymous().ExcludeFromDescription();
 }
 
 app.UseHttpsRedirection();

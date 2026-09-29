@@ -202,6 +202,104 @@ public sealed class EquipmentCodeApiTests(MasterDataApiFactory api)
         Assert.Equal(HttpStatusCode.Forbidden, write.StatusCode);
     }
 
+    private static object HoldBody(string code, string? rowVersion = null, string description = "Test hold") => new
+    {
+        holdCode = code, descriptionEn = description, holdType = "OPERATIONS",
+        blockingScope = "RELEASE", releaseAuthority = "SUPERVISOR", priority = 5, rowVersion,
+    };
+
+    private static async Task<HoldRow> NewHoldAsync(HttpClient client, string code, CancellationToken ct)
+    {
+        var response = await client.PostAsJsonAsync(Holds, HoldBody(code), ct);
+        Assert.True(response.StatusCode == HttpStatusCode.Created,
+            $"POST {Holds} returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
+        return (await response.Content.ReadFromJsonAsync<HoldRow>(ct))!;
+    }
+
+    [Fact]
+    public async Task Hold_errors_name_their_field()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var code = NewCode("H");
+        var hold = await NewHoldAsync(sct, code, ct);
+        try
+        {
+            async Task Expect(object body, string field)
+            {
+                var response = await sct.PostAsJsonAsync(Holds, body, ct);
+                var text = await response.Content.ReadAsStringAsync(ct);
+                Assert.True(response.StatusCode == HttpStatusCode.BadRequest, $"expected 400 on {field}, got {(int)response.StatusCode}: {text}");
+                using var doc = System.Text.Json.JsonDocument.Parse(text);
+                Assert.True(doc.RootElement.GetProperty("errors").TryGetProperty(field, out _), $"expected an error on '{field}': {text}");
+            }
+
+            var ok = new { holdCode = NewCode("H"), descriptionEn = "X", holdType = "OPERATIONS", blockingScope = "RELEASE", releaseAuthority = "SUPERVISOR" };
+            await Expect(ok with { holdCode = "bad code" }, "holdCode");
+            await Expect(ok with { descriptionEn = "" }, "descriptionEn");
+            await Expect(ok with { holdType = "WEATHER" }, "holdType");
+            await Expect(ok with { blockingScope = "SOMETIMES" }, "blockingScope");
+            await Expect(ok with { releaseAuthority = "ANYONE" }, "releaseAuthority");
+            await Expect(new { ok.holdCode, ok.descriptionEn, ok.holdType, ok.blockingScope, ok.releaseAuthority, priority = 12 }, "priority");
+            await Expect(new { ok.holdCode, ok.descriptionEn, ok.holdType, ok.blockingScope, ok.releaseAuthority, displayColorHex = "red" }, "displayColorHex");
+
+            // Edits and deletes name the version they saw.
+            var noVersion = await sct.PutAsJsonAsync($"{Holds}/{code}", HoldBody(code), ct);
+            Assert.Equal(HttpStatusCode.BadRequest, noVersion.StatusCode);
+            Assert.Equal(HttpStatusCode.BadRequest, (await sct.DeleteAsync($"{Holds}/{code}", ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await sct.PutAsJsonAsync($"{Holds}/{code}", HoldBody(code, hold.RowVersion, "Edited"), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.Conflict, (await sct.PutAsJsonAsync($"{Holds}/{code}", HoldBody(code, hold.RowVersion, "Stale"), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.Conflict,
+                (await sct.DeleteAsync(RowVersions.WithVersion($"{Holds}/{code}", hold.RowVersion), ct)).StatusCode);
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, $"{Holds}/{code}", ct); }
+    }
+
+    [Fact]
+    public async Task Holds_need_equipment_manage_to_change_and_stay_inside_the_tenant()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var edi = await api.ClientForAsync(MasterDataApiFactory.SctEdi);          // mdm.equipment.view, not manage
+        var other = await api.ClientForAsync(MasterDataApiFactory.SiamCommercialAdmin);
+        var code = NewCode("H");
+        var hold = await NewHoldAsync(sct, code, ct);
+        try
+        {
+            var one = $"{Holds}/{code}";
+            Assert.Equal(HttpStatusCode.OK, (await edi.GetAsync(one, ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await edi.PostAsJsonAsync(Holds, HoldBody(NewCode("H")), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await edi.PutAsJsonAsync(one, HoldBody(code, hold.RowVersion), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await edi.DeleteAsync(RowVersions.WithVersion(one, hold.RowVersion), ct)).StatusCode);
+
+            Assert.Equal(HttpStatusCode.NotFound, (await other.GetAsync(one, ct)).StatusCode);
+            Assert.DoesNotContain((await other.GetFromJsonAsync<List<HoldRow>>($"{Holds}?includeInactive=true", ct))!, h => h.HoldId == hold.HoldId);
+            Assert.Equal(HttpStatusCode.NotFound, (await other.PutAsJsonAsync(one, HoldBody(code, hold.RowVersion), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await other.DeleteAsync(RowVersions.WithVersion(one, hold.RowVersion), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await sct.GetAsync(one, ct)).StatusCode);   // untouched by the other tenant
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, $"{Holds}/{code}", ct); }
+    }
+
+    /// <summary>uq_hold__code ignores deleted rows: a retired code is free to be set up again.</summary>
+    [Fact]
+    public async Task A_deleted_hold_code_can_be_set_up_again()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var code = NewCode("H");
+        try
+        {
+            var first = await NewHoldAsync(sct, code, ct);
+            Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync(RowVersions.WithVersion($"{Holds}/{code}", first.RowVersion), ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await sct.GetAsync($"{Holds}/{code}", ct)).StatusCode);
+
+            var second = await NewHoldAsync(sct, code, ct);
+            Assert.NotEqual(first.HoldId, second.HoldId);
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, $"{Holds}/{code}", ct); }
+    }
+
     private static string NewCode(string prefix) => $"{prefix}{Guid.NewGuid():N}"[..6].ToUpperInvariant();
 
     private sealed record HoldRow(

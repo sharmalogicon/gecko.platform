@@ -142,6 +142,66 @@ public sealed class HoldApiTests(TosApiFactory api)
     }
 
     /// <summary>
+    /// Deleting a hold TYPE in master data must not free the boxes that carry it.
+    /// The type goes out of use — no new holds of it — but a hold already on a box
+    /// still stops the moves its scope covers, and can still be released by the
+    /// authority it was placed under. Before, the definition vanished with the
+    /// soft delete: the barrier read no scope (so no block) and release answered
+    /// 409 "restore the hold type first" — which master data cannot do.
+    /// </summary>
+    [Fact]
+    public async Task A_deleted_hold_type_still_holds_the_boxes_that_carry_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var box = TestBox();
+        var code = $"ZZ_DEL_{Random.Shared.Next(1000, 9999)}";
+        var type = $"/api/master/holds/{code}";
+        try
+        {
+            var created = await client.PostAsJsonAsync("/api/master/holds", new
+            {
+                holdCode = code, descriptionEn = "Deleted-type test", holdType = "OPERATIONS",
+                blockingScope = "ALL", releaseAuthority = "SUPERVISOR", priority = 3,
+            }, ct);
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            var hold = await ApplyAsync(client, new { containerNo = box, holdCode = code, reason = "Held before the type was retired" }, ct);
+
+            var typeVersion = (await created.Content.ReadFromJsonAsync<HoldTypeRow>(ct))!.RowVersion;
+            Assert.Equal(HttpStatusCode.NoContent, (await client.DeleteAsync($"{type}?rowVersion={Uri.EscapeDataString(typeVersion)}", ct)).StatusCode);
+
+            // Still held, and still with what it blocks — that is what the barrier reads.
+            var seen = (await client.GetFromJsonAsync<ContainerHoldsResponse>($"/api/tos/containers/{box}/holds", ct))!;
+            Assert.True(seen.IsHeld);
+            var active = Assert.Single(seen.Holds, h => h.HoldCode == code);
+            Assert.Equal(("ALL", "SUPERVISOR"), (active.BlockingScope, active.ReleaseAuthority));
+
+            // Out of use: nobody places a new hold of a deleted type.
+            var other = TestBox();
+            var refused = await client.PostAsJsonAsync(Holds, new { containerNo = other, holdCode = code, reason = "new" }, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+
+            // And the one on the box can still be lifted, by the authority it was placed under.
+            var released = await client.PostAsJsonAsync($"{Holds}/{hold.ContainerHoldId}/release",
+                new { reason = "Type retired; box cleared", rowVersion = hold.RowVersion }, ct);
+            Assert.True(released.StatusCode == HttpStatusCode.OK,
+                $"release returned {(int)released.StatusCode}: {await released.Content.ReadAsStringAsync(ct)}");
+        }
+        finally
+        {
+            await TestDatabase.RemoveHoldsAsync(box);
+            // In case the test stopped before the delete.
+            if (await client.GetAsync(type, ct) is { StatusCode: HttpStatusCode.OK } live)
+            {
+                var version = (await live.Content.ReadFromJsonAsync<HoldTypeRow>(ct))!.RowVersion;
+                await client.DeleteAsync($"{type}?rowVersion={Uri.EscapeDataString(version)}", ct);
+            }
+        }
+    }
+
+    private sealed record HoldTypeRow(string HoldCode, string RowVersion);
+
+    /// <summary>
     /// The rule that makes a hold worth having (PLAN §10.7): WHO may lift it comes
     /// from the MDM hold type, not from whoever has the screen open. OPS_MANAGER
     /// holds tos.hold.release.operations and .line — not .finance.

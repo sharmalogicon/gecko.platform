@@ -237,11 +237,26 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .ToDictionaryAsync(g => g.Code, StringComparer.OrdinalIgnoreCase, ct);
     }
 
+    /// <summary>
+    /// Resolves DELETED hold types too. TOS asks by the code on holds already
+    /// placed; a hold type deleted in master data must not free the boxes that
+    /// carry it (the barrier would read no scope, so no block) nor strand them
+    /// (release needs the release authority). A deleted type comes back with
+    /// IsActive = false, so nobody places a new hold of it. When a code was
+    /// deleted and created again, the live row wins.
+    /// </summary>
     public async Task<IReadOnlyDictionary<string, HoldRef>> HoldsAsync(IEnumerable<string> holdCodes, CancellationToken ct)
     {
         var codes = Normalise(holdCodes);
-        return await db.Holds.AsNoTracking().Where(h => codes.Contains(h.HoldCode)).Select(ToHoldRef)
-            .ToDictionaryAsync(h => h.HoldCode, StringComparer.OrdinalIgnoreCase, ct);
+        var rows = await db.Holds.IgnoreQueryFilters().AsNoTracking()   // soft-delete filter only; RLS still scopes the tenant
+            .Where(h => codes.Contains(h.HoldCode))
+            .OrderBy(h => h.DeletedAt != null).ThenByDescending(h => h.DeletedAt)
+            .Select(h => new HoldRef(
+                h.HoldId, h.HoldCode, h.DescriptionEn, h.HoldType,
+                h.BlockingScope, h.ReleaseAuthority, h.Priority, h.DisplayColorHex, h.IsActive && h.DeletedAt == null, h.AutoApplyOnEvent))
+            .ToListAsync(ct);
+        return rows.GroupBy(h => h.HoldCode, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
     }
 
     public async Task<IReadOnlyList<HoldRef>> ActiveHoldsAsync(CancellationToken ct) =>

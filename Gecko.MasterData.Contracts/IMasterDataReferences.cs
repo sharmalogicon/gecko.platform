@@ -77,6 +77,8 @@ public interface IMasterDataReferences
     /// the code on every hold row, but the decision at release time — and at the
     /// barrier — is made from <see cref="HoldRef.ReleaseAuthority"/> and
     /// <see cref="HoldRef.BlockingScope"/>, which live here (gecko_tos PLAN §4.3).
+    /// A hold type deleted in master data still resolves, with IsActive = false:
+    /// the boxes that carry it stay held and can still be released.
     /// </summary>
     Task<IReadOnlyDictionary<string, HoldRef>> HoldsAsync(IEnumerable<string> holdCodes, CancellationToken ct);
 

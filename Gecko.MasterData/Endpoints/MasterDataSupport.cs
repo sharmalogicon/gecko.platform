@@ -134,3 +134,26 @@ internal static class MasterDataSupport
         }
     }
 }
+
+/// <summary>
+/// The errors of a replaced set (charge variants, order-type steps and charges),
+/// keyed the way a screen finds the cell: <c>variants[1].taxCode</c> for a cell,
+/// <c>variants[1]</c> for a whole row, <c>variants</c> for the set. All of them are
+/// returned at once, so an editor can mark every bad cell in one pass.
+/// </summary>
+internal sealed class RowErrors(string list)
+{
+    private readonly Dictionary<string, List<string>> _errors = [];
+
+    public int Count => _errors.Count;
+
+    public void Add(int? row, string? column, string message)
+    {
+        var key = row is null ? list : column is null ? $"{list}[{row}]" : $"{list}[{row}].{column}";
+        if (!_errors.TryGetValue(key, out var messages)) _errors[key] = messages = [];
+        messages.Add(message);
+    }
+
+    public ValidationProblem Problem() =>
+        TypedResults.ValidationProblem(_errors.ToDictionary(e => e.Key, e => e.Value.ToArray()));
+}

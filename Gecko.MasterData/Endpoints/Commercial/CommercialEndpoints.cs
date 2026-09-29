@@ -244,13 +244,7 @@ internal static class CommercialEndpoints
 
         // Every problem, each on its own row and column (variants[1].taxCode), so the
         // editor can mark the bad cells in one pass instead of one per save.
-        var errors = new Dictionary<string, List<string>>();
-        void Add(int row, string? column, string message)
-        {
-            var key = column is null ? $"variants[{row}]" : $"variants[{row}].{column}";
-            if (!errors.TryGetValue(key, out var list)) errors[key] = list = [];
-            list.Add(message);
-        }
+        var errors = new RowErrors("variants");
 
         var unknownBillTo = (await db.UnknownBillToAsync(wanted.Select(v => v.BillTo), ct)).ToHashSet();
         var terms = wanted.Select(v => v.PaymentTermCode).Distinct().ToList();
@@ -268,26 +262,25 @@ internal static class CommercialEndpoints
             var v = wanted[i];
             // uq_charge_code_variant__matrix: one row per (bill-to, payment term).
             if (!seen.Add((v.BillTo, v.PaymentTermCode)))
-                Add(i, null, $"Repeated bill-to / payment-term pair: {v.BillTo}/{v.PaymentTermCode}.");
+                errors.Add(i, null, $"Repeated bill-to / payment-term pair: {v.BillTo}/{v.PaymentTermCode}.");
             if (unknownBillTo.Contains(v.BillTo))
-                Add(i, "billTo", $"Unknown bill-to role(s): {v.BillTo}.");
+                errors.Add(i, "billTo", $"Unknown bill-to role(s): {v.BillTo}.");
             if (!knownTerms.Contains(v.PaymentTermCode))
-                Add(i, "paymentTermCode", $"Unknown payment term '{v.PaymentTermCode}'.");
+                errors.Add(i, "paymentTermCode", $"Unknown payment term '{v.PaymentTermCode}'.");
             if (v.TaxCode is not null && taxCodes.All(t => t.TaxCode1 != v.TaxCode.ToUpperInvariant()))
-                Add(i, "taxCode", $"Unknown tax code '{v.TaxCode}'.");
+                errors.Add(i, "taxCode", $"Unknown tax code '{v.TaxCode}'.");
             if (v.WithholdingTaxCode is not null)
             {
                 var wht = taxCodes.SingleOrDefault(t => t.TaxCode1 == v.WithholdingTaxCode.ToUpperInvariant());
                 if (wht is null)
-                    Add(i, "withholdingTaxCode", $"Unknown tax code '{v.WithholdingTaxCode}'.");
+                    errors.Add(i, "withholdingTaxCode", $"Unknown tax code '{v.WithholdingTaxCode}'.");
                 // A withholding slot holding a VAT code silently deducts the wrong
                 // amount from a supplier payment, which nobody notices until audit.
                 else if (wht.TaxType != "WITHHOLDING")
-                    Add(i, "withholdingTaxCode", $"'{v.WithholdingTaxCode}' is a {wht.TaxType} code, not WITHHOLDING.");
+                    errors.Add(i, "withholdingTaxCode", $"'{v.WithholdingTaxCode}' is a {wht.TaxType} code, not WITHHOLDING.");
             }
         }
-        if (errors.Count > 0)
-            return TypedResults.ValidationProblem(errors.ToDictionary(e => e.Key, e => e.Value.ToArray()));
+        if (errors.Count > 0) return errors.Problem();
 
         if (db.TouchParent(charge, request.RowVersion) is { } missing) return missing;
 

@@ -197,31 +197,54 @@ internal static class OrderTypeEndpoints
         var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
         if (orderType is null) return TypedResults.NotFound();
 
-        var wanted = request.Movements
+        // Rows keep the caller's order for error keys (movements[1].movementCode);
+        // the sequence check below works on the sorted copy.
+        var rows = request.Movements
             .Select(m => m with { MovementCode = m.MovementCode.ToUpperInvariant(), PudoMode = m.PudoMode?.ToUpperInvariant() })
-            .OrderBy(m => m.SequenceNo).ToList();
-
-        if (wanted.Select(m => m.MovementCode).Distinct().Count() != wanted.Count)
-            return MasterDataSupport.InvalidReference("movements", "The same movement appears twice. Each movement may appear once per order type.");
-        if (wanted.Select(m => m.SequenceNo).Distinct().Count() != wanted.Count)
-            return MasterDataSupport.InvalidReference("movements", "Two steps share a sequence number.");
-
-        // 1, 2, 3 with no gaps: the gate walks the sequence, and a hole in it means
-        // a step that silently never runs.
-        for (var i = 0; i < wanted.Count; i++)
-            if (wanted[i].SequenceNo != i + 1)
-                return MasterDataSupport.InvalidReference("movements",
-                    $"Sequence numbers must run 1..{wanted.Count} with no gaps; found {string.Join(", ", wanted.Select(m => m.SequenceNo))}.");
+            .ToList();
+        var errors = new RowErrors("movements");
 
         var movements = await db.Movements.AsNoTracking()
             .Select(m => new { m.MovementId, m.MovementCode }).ToListAsync(ct);
-        var unknown = wanted.Select(m => m.MovementCode).Except(movements.Select(m => m.MovementCode)).ToList();
-        if (unknown.Count > 0)
-            return MasterDataSupport.InvalidReference("movements", $"Unknown movement(s): {string.Join(", ", unknown)}.");
+        var modes = await db.VwCodeLists.AsNoTracking()
+            .Where(v => v.CategoryCode == "PICKUP_DROPOFF_MODE" && v.IsActive == true).Select(v => v.Code!).ToListAsync(ct);
 
-        foreach (var mode in wanted.Select(m => m.PudoMode).Where(m => m is not null).Distinct())
-            if (!await db.VwCodeLists.AnyAsync(v => v.CategoryCode == "PICKUP_DROPOFF_MODE" && v.Code == mode && v.IsActive == true, ct))
-                return MasterDataSupport.InvalidReference("movements", $"'{mode}' is not a PICKUP_DROPOFF_MODE.");
+        var seenMovement = new HashSet<string>();
+        var seenSequence = new HashSet<short>();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var m = rows[i];
+            if (movements.All(x => x.MovementCode != m.MovementCode))
+                errors.Add(i, "movementCode", $"Unknown movement(s): {m.MovementCode}.");
+            else if (!seenMovement.Add(m.MovementCode))
+                errors.Add(i, "movementCode", $"{m.MovementCode} appears twice. Each movement may appear once per order type.");
+            if (!seenSequence.Add(m.SequenceNo))
+                errors.Add(i, "sequenceNo", $"Two steps share sequence number {m.SequenceNo}.");
+            if (m.PudoMode is not null && !modes.Contains(m.PudoMode))
+                errors.Add(i, "pudoMode", $"'{m.PudoMode}' is not a PICKUP_DROPOFF_MODE.");
+        }
+
+        // 1, 2, 3 with no gaps: the gate walks the sequence, and a hole in it means
+        // a step that silently never runs.
+        var wanted = rows.OrderBy(m => m.SequenceNo).ToList();
+        if (errors.Count == 0)
+            for (var i = 0; i < wanted.Count; i++)
+                if (wanted[i].SequenceNo != i + 1)
+                {
+                    errors.Add(null, null, $"Sequence numbers must run 1..{wanted.Count} with no gaps; found {string.Join(", ", wanted.Select(m => m.SequenceNo))}.");
+                    break;
+                }
+
+        // A charge pinned to a step that is being removed would never be raised again.
+        var dropped = await (
+            from c in db.OrderTypeCharges.AsNoTracking()
+            join mv in db.Movements on c.MovementId equals mv.MovementId
+            where c.OrderTypeId == orderType.OrderTypeId
+            select mv.MovementCode).Distinct().ToListAsync(ct);
+        foreach (var code in dropped.Where(d => !seenMovement.Contains(d)))
+            errors.Add(null, null, $"{code} still has charges pinned to it. Move or remove those charges first.");
+
+        if (errors.Count > 0) return errors.Problem();
 
         if (db.TouchParent(orderType, request.RowVersion) is { } missing) return missing;
 
@@ -272,31 +295,48 @@ internal static class OrderTypeEndpoints
                 PaymentTermCode = c.PaymentTermCode?.ToUpperInvariant(),
             })
             .ToList();
+        var errors = new RowErrors("charges");
 
-        if (await db.UnknownBillToAsync(wanted.Select(c => c.PaymentTo), ct) is { Count: > 0 } unknownPayers)
-            return MasterDataSupport.InvalidReference("charges", $"Unknown bill-to role(s): {string.Join(", ", unknownPayers)}.");
-
-        // payment_term_code is a soft ref too, and was not checked here before.
-        foreach (var term in wanted.Select(c => c.PaymentTermCode).OfType<string>().Distinct())
-            if (!await db.PaymentTerms.AnyAsync(p => p.Code == term && p.IsActive, ct))
-                return MasterDataSupport.InvalidReference("charges", $"Unknown payment term '{term}'.");
-
-        // Mirrors ck_otc__default_optional: a charge cannot be both raised by
-        // default and offered as an option.
-        if (wanted.FirstOrDefault(c => c is { IsDefault: true, IsOptional: true }) is { } contradictory)
-            return MasterDataSupport.InvalidReference("charges",
-                $"'{contradictory.ChargeCode}' is both default and optional. Pick one.");
-
+        var unknownPayers = (await db.UnknownBillToAsync(wanted.Select(c => c.PaymentTo), ct)).ToHashSet();
+        var terms = wanted.Select(c => c.PaymentTermCode).OfType<string>().Distinct().ToList();
+        var knownTerms = (await db.PaymentTerms.AsNoTracking().Where(p => terms.Contains(p.Code) && p.IsActive)
+            .Select(p => p.Code).ToListAsync(ct)).ToHashSet();
         var charges = await db.ChargeCodes.AsNoTracking().Select(c => new { c.ChargeCodeId, c.ChargeCode1 }).ToListAsync(ct);
-        var unknownCharges = wanted.Select(c => c.ChargeCode).Distinct().Except(charges.Select(c => c.ChargeCode1)).ToList();
-        if (unknownCharges.Count > 0)
-            return MasterDataSupport.InvalidReference("charges", $"Unknown charge code(s): {string.Join(", ", unknownCharges)}.");
-
         var movements = await db.Movements.AsNoTracking().Select(m => new { m.MovementId, m.MovementCode }).ToListAsync(ct);
-        var unknownMovements = wanted.Select(c => c.MovementCode).Where(m => m is not null).Distinct()
-            .Except(movements.Select(m => m.MovementCode)).ToList();
-        if (unknownMovements.Count > 0)
-            return MasterDataSupport.InvalidReference("charges", $"Unknown movement(s): {string.Join(", ", unknownMovements)}.");
+        // A charge pinned to a movement that is not one of THIS order type's steps is never raised.
+        var steps = await (
+            from s in db.OrderTypeMovements.AsNoTracking()
+            join mv in db.Movements on s.MovementId equals mv.MovementId
+            where s.OrderTypeId == orderType.OrderTypeId
+            select mv.MovementCode).ToListAsync(ct);
+
+        var seen = new HashSet<(string, string?, string)>();
+        for (var i = 0; i < wanted.Count; i++)
+        {
+            var c = wanted[i];
+            if (charges.All(x => x.ChargeCode1 != c.ChargeCode))
+                errors.Add(i, "chargeCode", $"Unknown charge code(s): {c.ChargeCode}.");
+            if (unknownPayers.Contains(c.PaymentTo))
+                errors.Add(i, "paymentTo", $"Unknown bill-to role(s): {c.PaymentTo}.");
+            // payment_term_code is a soft ref too, and was not checked here before.
+            if (c.PaymentTermCode is not null && !knownTerms.Contains(c.PaymentTermCode))
+                errors.Add(i, "paymentTermCode", $"Unknown payment term '{c.PaymentTermCode}'.");
+            if (c.MovementCode is not null)
+            {
+                if (movements.All(x => x.MovementCode != c.MovementCode))
+                    errors.Add(i, "movementCode", $"Unknown movement(s): {c.MovementCode}.");
+                else if (!steps.Contains(c.MovementCode))
+                    errors.Add(i, "movementCode", $"{c.MovementCode} is not a step of this order type, so the charge would never be raised.");
+            }
+            // Mirrors ck_otc__default_optional: a charge cannot be both raised by
+            // default and offered as an option.
+            if (c is { IsDefault: true, IsOptional: true })
+                errors.Add(i, null, $"'{c.ChargeCode}' is both default and optional. Pick one.");
+            // uq_otc: one row per (charge, step, payer).
+            if (!seen.Add((c.ChargeCode, c.MovementCode, c.PaymentTo)))
+                errors.Add(i, null, $"{c.ChargeCode} to {c.PaymentTo} on {c.MovementCode ?? "every step"} is already a row above.");
+        }
+        if (errors.Count > 0) return errors.Problem();
 
         if (db.TouchParent(orderType, request.RowVersion) is { } missing) return missing;
 

@@ -860,6 +860,9 @@ public partial class MasterDataDbContext : DbContext
                 .IsRowVersion()
                 .IsConcurrencyToken()
                 .HasColumnName("row_version");
+            entity.Property(e => e.ShortName)
+                .HasMaxLength(50)
+                .HasColumnName("short_name");
             entity.Property(e => e.State)
                 .HasMaxLength(100)
                 .HasColumnName("state");

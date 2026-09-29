@@ -3,6 +3,7 @@ using Gecko.MasterData.Application;
 using Gecko.MasterData.Endpoints.Commercial;
 using Gecko.MasterData.Endpoints.Config;
 using Gecko.MasterData.Endpoints.Equipment;
+using Gecko.MasterData.Endpoints.Org;
 using Gecko.MasterData.Endpoints.Parties;
 using Gecko.MasterData.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Builder;
@@ -62,7 +63,8 @@ public static class MasterDataModule
             .MapCommercialEndpoints()
             .MapOrderTypeEndpoints()
             .MapConfigEndpoints()
-            .MapPartyEndpoints();
+            .MapPartyEndpoints()
+            .MapOrgEndpoints();
 
         return endpoints;
     }

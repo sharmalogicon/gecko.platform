@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -49,6 +49,12 @@ public class MasterDataApiFactory : WebApplicationFactory<Program>, IAsyncLifeti
 
     /// <summary>TENANT_OWNER of another tenant, whose equipment vocabulary is deliberately different.</summary>
     public const string SiamCommercialAdmin = "admin@siamcommercial.co.th";
+
+    /// <summary>
+    /// MPJ operations manager — the other tenant in the org (company / yard) tests.
+    /// Not admin@mpj.co.th: that fixture must change its password before it can sign in.
+    /// </summary>
+    public const string MpjOps = "ops@mpj.co.th";
 
     private readonly ConcurrentDictionary<string, Lazy<Task<string>>> _tokens = new();
 

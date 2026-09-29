@@ -54,4 +54,6 @@ public partial class Company
     public Guid? DeletedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    public string? ShortName { get; set; }
 }

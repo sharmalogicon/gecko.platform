@@ -57,6 +57,7 @@ public static class MasterDataModule
     {
         endpoints.MapGroup(RoutePrefix)
             .MapEquipmentTypeEndpoints()
+            .MapEquipmentVocabulary()
             .MapIsoCodeEndpoints()
             .MapContainerEndpoints()
             .MapEquipmentCodeEndpoints()

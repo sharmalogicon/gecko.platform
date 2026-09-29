@@ -44,6 +44,9 @@ public class MasterDataApiFactory : WebApplicationFactory<Program>, IAsyncLifeti
     /// <summary>EDI_COORDINATOR, tenant-wide — holds mdm.equipment.view but NOT mdm.equipment.manage.</summary>
     public const string SctEdi = "edi@sct.co.th";
 
+    /// <summary>ACCOUNTS, tenant-wide — commercial view + manage, equipment VIEW only (gecko_identity 20).</summary>
+    public const string SctAccounts = "accounts@sct.co.th";
+
     /// <summary>OPS_MANAGER and VIEWER, BRANCH-scoped only — so no tenant-wide permission at all.</summary>
     public const string SctOpsLcb = "ops.lcb@sct.co.th";
 

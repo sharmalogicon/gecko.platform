@@ -23,6 +23,8 @@ public sealed record EquipmentTypeResponse(
 
 public sealed record EquipmentTypeDetailResponse(EquipmentTypeResponse Type, IReadOnlyList<IsoMappingResponse> IsoCodes);
 
+public sealed record EquipmentTypeCountResponse(Guid EquipmentTypeId, int Containers);
+
 public sealed record IsoMappingResponse(string IsoCode, bool IsDefaultOutbound, string? IsoDescription);
 
 /// <summary>What the gate actually asks: "a partner sent me this ISO code — what is it to us?"</summary>
@@ -113,6 +115,10 @@ internal static class EquipmentTypeEndpoints
             .Validate<UpdateEquipmentTypeRequest>()
             .WithSummary("Update an equipment type (type code is immutable)");
 
+        types.MapGet("/container-counts", ContainerCountsAsync)
+            .RequirePermission(MasterDataPermissions.EquipmentView)
+            .WithSummary("How many registry containers carry each equipment type (one GROUP BY, not a client-side count)");
+
         types.MapPut("/{equipmentTypeId:guid}/iso-codes", ReplaceIsoCodesAsync)
             .RequirePermission(MasterDataPermissions.EquipmentManage)
             .Validate<ReplaceIsoMappingRequest>()
@@ -157,6 +163,18 @@ internal static class EquipmentTypeEndpoints
     ///   known to ISO only    -> a real code this tenant has not mapped; ask an admin, do not guess
     ///   unknown entirely     -> the partner sent rubbish, reject the message
     /// </summary>
+    /// <summary>
+    /// The registry is not small — a migrated depot carries 100k+ boxes — so the
+    /// per-type count is the database's job, never a page of containers counted
+    /// in the browser.
+    /// </summary>
+    private static async Task<Ok<IReadOnlyList<EquipmentTypeCountResponse>>> ContainerCountsAsync(MasterDataDbContext db, CancellationToken ct) =>
+        TypedResults.Ok<IReadOnlyList<EquipmentTypeCountResponse>>(await db.Containers.AsNoTracking()
+            .Where(c => c.EquipmentTypeId != null)
+            .GroupBy(c => c.EquipmentTypeId!.Value)
+            .Select(g => new EquipmentTypeCountResponse(g.Key, g.Count()))
+            .ToListAsync(ct));
+
     private static async Task<Ok<IsoResolutionResponse>> ResolveAsync(
         string isoCode, MasterDataDbContext db, CancellationToken ct)
     {
@@ -268,20 +286,21 @@ internal static class EquipmentTypeEndpoints
             .Select(i => new IsoMappingItem(i.IsoCode.Trim().ToUpperInvariant(), i.IsDefaultOutbound))
             .ToList();
 
-        var duplicates = wanted.GroupBy(i => i.IsoCode).Where(g => g.Count() > 1).Select(g => g.Key).ToList();
-        if (duplicates.Count > 0)
-            return MasterDataSupport.InvalidReference("isoCodes", $"Repeated ISO code(s): {string.Join(", ", duplicates)}.");
-
-        if (wanted.Count(i => i.IsDefaultOutbound) != 1)
-            return MasterDataSupport.InvalidReference("isoCodes",
-                "Exactly one ISO code must be the default outbound code — it is what gets written back on EDI.");
-
+        // Row errors keyed isoCodes[i].isoCode, so the picker marks the bad row.
+        var errors = new RowErrors("isoCodes");
         var codes = wanted.Select(i => i.IsoCode).ToList();
-        var known = await db.IsoContainerCodes.Where(i => codes.Contains(i.IsoCode)).Select(i => i.IsoCode).ToListAsync(ct);
-        var unknown = codes.Except(known).ToList();
-        if (unknown.Count > 0)
-            return MasterDataSupport.InvalidReference("isoCodes",
-                $"Not ISO 6346 size-type codes known to the platform: {string.Join(", ", unknown)}.");
+        var known = (await db.IsoContainerCodes.Where(i => codes.Contains(i.IsoCode)).Select(i => i.IsoCode).ToListAsync(ct)).ToHashSet();
+        var seen = new HashSet<string>();
+        for (var i = 0; i < wanted.Count; i++)
+        {
+            if (!known.Contains(wanted[i].IsoCode))
+                errors.Add(i, "isoCode", $"Not ISO 6346 size-type codes known to the platform: {wanted[i].IsoCode}.");
+            else if (!seen.Add(wanted[i].IsoCode))
+                errors.Add(i, "isoCode", $"Repeated ISO code(s): {wanted[i].IsoCode}.");
+        }
+        if (wanted.Count(i => i.IsDefaultOutbound) != 1)
+            errors.Add(null, null, "Exactly one ISO code must be the default outbound code — it is what gets written back on EDI.");
+        if (errors.Count > 0) return errors.Problem();
 
         var takenByOthers = await db.EquipmentTypeIsoCodes
             .Where(m => codes.Contains(m.IsoCode) && m.EquipmentTypeId != equipmentTypeId)

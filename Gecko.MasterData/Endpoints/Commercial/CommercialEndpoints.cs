@@ -521,7 +521,7 @@ internal static class CommercialEndpoints
     private static async Task<Results<Ok<MovementResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateMovementAsync(
         string movementCode, SaveMovementRequest request, MasterDataDbContext db, CancellationToken ct)
     {
-        var movement = await db.Movements.SingleOrDefaultAsync(m => m.MovementCode == movementCode.ToUpperInvariant(), ct);
+        var movement = await db.Movements.SingleOrDefaultAsync(m => m.MovementCode == movementCode.FromRouteCode(), ct);
         if (movement is null) return TypedResults.NotFound();
         if (!db.TrySetExpectedVersion(movement, request.RowVersion))
             return MasterDataSupport.InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
@@ -534,7 +534,7 @@ internal static class CommercialEndpoints
     private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteMovementAsync(
         string movementCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
-        var movement = await db.Movements.SingleOrDefaultAsync(m => m.MovementCode == movementCode.ToUpperInvariant(), ct);
+        var movement = await db.Movements.SingleOrDefaultAsync(m => m.MovementCode == movementCode.FromRouteCode(), ct);
         if (movement is null) return TypedResults.NotFound();
         if (db.ExpectVersion(movement, rowVersion) is { } missing) return missing;
 
@@ -590,7 +590,7 @@ internal static class CommercialEndpoints
     private static async Task<Results<Ok<ServiceTypeResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateServiceAsync(
         string serviceCode, SaveServiceTypeRequest request, MasterDataDbContext db, CancellationToken ct)
     {
-        var service = await db.ServiceTypes.SingleOrDefaultAsync(s => s.ServiceCode == serviceCode.ToUpperInvariant(), ct);
+        var service = await db.ServiceTypes.SingleOrDefaultAsync(s => s.ServiceCode == serviceCode.FromRouteCode(), ct);
         if (service is null) return TypedResults.NotFound();
         if (!db.TrySetExpectedVersion(service, request.RowVersion))
             return MasterDataSupport.InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
@@ -603,7 +603,7 @@ internal static class CommercialEndpoints
     private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteServiceAsync(
         string serviceCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
-        var service = await db.ServiceTypes.SingleOrDefaultAsync(s => s.ServiceCode == serviceCode.ToUpperInvariant(), ct);
+        var service = await db.ServiceTypes.SingleOrDefaultAsync(s => s.ServiceCode == serviceCode.FromRouteCode(), ct);
         if (service is null) return TypedResults.NotFound();
         if (db.ExpectVersion(service, rowVersion) is { } missing) return missing;
 

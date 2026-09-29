@@ -73,7 +73,9 @@ public static class MasterDataModule
             .MapPortEndpoints()
             .MapVesselEndpoints()
             .MapCommodityEndpoints()
-            .MapLocationEndpoints();
+            .MapLocationEndpoints()
+            .MapSealRangeEndpoints()
+            .MapCalendarEndpoints();
 
         return endpoints;
     }

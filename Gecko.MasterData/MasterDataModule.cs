@@ -70,7 +70,10 @@ public static class MasterDataModule
             .MapContactEndpoints()
             .MapShippingLineEndpoints()
             .MapOrgEndpoints()
-            .MapPortEndpoints();
+            .MapPortEndpoints()
+            .MapVesselEndpoints()
+            .MapCommodityEndpoints()
+            .MapLocationEndpoints();
 
         return endpoints;
     }

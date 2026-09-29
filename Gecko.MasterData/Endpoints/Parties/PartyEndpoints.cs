@@ -328,6 +328,14 @@ internal static class PartyEndpoints
         if (db.ExpectVersion(party, rowVersion) is { } missing) return missing;
         if (await ShippingLineEndpoints.AgentCodesAsync(db, party.PartyId, ct) is { Count: > 0 } agents)
             return MasterDataSupport.Conflict("The party is still a principal line.", ShippingLineEndpoints.PrincipalMessage(agents));
+        // Soft references from the Tier 2 masters: a vessel it operates, a seal
+        // range it handed a depot, premises it owns.
+        var usedBy = new List<string>();
+        if (await db.Vessels.AnyAsync(v => v.OperatorPartyId == party.PartyId, ct)) usedBy.Add("the operator of a vessel");
+        if (await db.SealRanges.AnyAsync(r => r.PartyId == party.PartyId, ct)) usedBy.Add("the line of a seal range");
+        if (await db.Locations.AnyAsync(l => l.PartyId == party.PartyId, ct)) usedBy.Add("the owner of a location");
+        if (usedBy.Count > 0)
+            return MasterDataSupport.Conflict("The party is still in use.", $"It is {string.Join(", ", usedBy)}. Change those first, or set the party inactive.");
 
         db.CustomerExtensions.RemoveRange(await db.CustomerExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));
         db.ShippingLineExtensions.RemoveRange(await db.ShippingLineExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));

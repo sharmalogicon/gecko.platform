@@ -18,7 +18,11 @@ public sealed record PartySummaryResponse(
 public sealed record PartyAliasResponse(string Code, string Type, string? Label);
 
 public sealed record PartyContactResponse(
-    Guid ContactId, string? Name, string Role, string? JobTitle, string? Phone, string? Mobile, string? Email, bool IsDefault);
+    Guid ContactId, string? Name, string Role, string? JobTitle, string? Phone, string? Mobile, string? Email, bool IsDefault,
+    string? Address1, string? Address2, string? City, string? State, string? Postcode, string RowVersion);
+
+/// <summary>Another live party with the same tax id and tax branch — a dedupe hint, never merged automatically.</summary>
+public sealed record PartyDuplicateResponse(string PartyCode, string NameEn, bool IsActive);
 
 public sealed record PartyDetailResponse(
     Guid PartyId, string PartyCode, string NameEn, string? NameLocal, string? TaxId, string? BranchNo,
@@ -29,7 +33,8 @@ public sealed record PartyDetailResponse(
     IReadOnlyList<PartyAliasResponse> Aliases,
     IReadOnlyList<PartyContactResponse> Contacts,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string RowVersion,
-    string? RegistrationNo = null);
+    string? RegistrationNo = null,
+    IReadOnlyList<PartyDuplicateResponse>? Duplicates = null);
 
 /// <summary>
 /// The contract fields are NameEn … Roles. Address2 / City / State / Postcode /
@@ -129,11 +134,16 @@ internal static class PartyEndpoints
             // Collation is case-insensitive, so Contains is the case-insensitive match
             // the contract asks for — including Thai, which has no case.
             var s = search.Trim();
+            // Alias hits are found ONCE, then matched by id. As a correlated EXISTS inside
+            // the OR, SQL Server re-scanned every alias for every party — 15-16 s per search
+            // over KORAKIT's 9,540 parties / 9,543 aliases (measured 2026-09-29).
+            var aliasHits = await db.PartyAliases.AsNoTracking()
+                .Where(a => a.AliasValue.Contains(s)).Select(a => a.PartyId).Distinct().Take(500).ToListAsync(ct);
             parties = parties.Where(p =>
                 p.PartyCode.Contains(s) || p.NameEn.Contains(s) || (p.NameLocal != null && p.NameLocal.Contains(s))
                 || (p.ShortName != null && p.ShortName.Contains(s))
                 || (p.TaxId != null && p.TaxId.Contains(s))
-                || db.PartyAliases.Any(a => a.PartyId == p.PartyId && a.AliasValue.Contains(s)));
+                || aliasHits.Contains(p.PartyId));
         }
 
         if (!string.IsNullOrWhiteSpace(role))
@@ -173,10 +183,17 @@ internal static class PartyEndpoints
             .Select(a => new PartyAliasResponse(a.AliasValue, a.AliasType, a.AliasLabel))
             .ToListAsync(ct);
 
-        var contacts = await db.Contacts.AsNoTracking()
+        var contacts = (await db.Contacts.AsNoTracking()
             .Where(c => c.PartyId == p.PartyId && c.IsActive)
             .OrderByDescending(c => c.IsDefault).ThenBy(c => c.ContactType).ThenBy(c => c.ContactPerson)
-            .Select(c => new PartyContactResponse(c.ContactId, c.ContactPerson, c.ContactType, c.JobTitle, c.Phone, c.Mobile, c.Email, c.IsDefault))
+            .ToListAsync(ct)).Select(ContactEndpoints.Map).ToList();
+
+        // KORAKIT has 1,100 (tax id, branch) groups used in parallel (02_master_MAPPING §3.3):
+        // shown so a clerk picks the right code, never merged here.
+        var duplicates = p.TaxId is null ? [] : await db.Parties.AsNoTracking()
+            .Where(x => x.TaxId == p.TaxId && x.TaxBranchCode == p.TaxBranchCode && x.PartyId != p.PartyId)
+            .OrderByDescending(x => x.IsActive).ThenBy(x => x.PartyCode).Take(20)
+            .Select(x => new PartyDuplicateResponse(x.PartyCode, x.NameEn, x.IsActive))
             .ToListAsync(ct);
 
         return new PartyDetailResponse(
@@ -184,7 +201,7 @@ internal static class PartyEndpoints
             p.ShortName, p.CountryCode, p.DefaultCurrency,
             p.PrimaryAddress1, p.PrimaryAddress2, p.PrimaryCity, p.PrimaryState, p.PrimaryPostcode,
             p.PrimaryPhone, p.PrimaryEmail, p.PrimaryWebsite, p.Remarks,
-            aliases, contacts, p.CreatedAt, p.UpdatedAt, Convert.ToBase64String(p.RowVersion), p.RegistrationNo);
+            aliases, contacts, p.CreatedAt, p.UpdatedAt, Convert.ToBase64String(p.RowVersion), p.RegistrationNo, duplicates);
     }
 
     private static async Task<Results<CreatedAtRoute<PartyDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(

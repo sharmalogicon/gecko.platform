@@ -242,39 +242,52 @@ internal static class CommercialEndpoints
             .Select(v => v with { BillTo = v.BillTo.ToUpperInvariant(), PaymentTermCode = v.PaymentTermCode.ToUpperInvariant() })
             .ToList();
 
-        var duplicates = wanted.GroupBy(v => (v.BillTo, v.PaymentTermCode)).Where(g => g.Count() > 1).ToList();
-        if (duplicates.Count > 0)
-            return MasterDataSupport.InvalidReference("variants",
-                $"Repeated bill-to / payment-term pair(s): {string.Join(", ", duplicates.Select(g => $"{g.Key.BillTo}/{g.Key.PaymentTermCode}"))}.");
+        // Every problem, each on its own row and column (variants[1].taxCode), so the
+        // editor can mark the bad cells in one pass instead of one per save.
+        var errors = new Dictionary<string, List<string>>();
+        void Add(int row, string? column, string message)
+        {
+            var key = column is null ? $"variants[{row}]" : $"variants[{row}].{column}";
+            if (!errors.TryGetValue(key, out var list)) errors[key] = list = [];
+            list.Add(message);
+        }
 
-        if (await db.UnknownBillToAsync(wanted.Select(v => v.BillTo), ct) is { Count: > 0 } unknownBillTo)
-            return MasterDataSupport.InvalidReference("variants", $"Unknown bill-to role(s): {string.Join(", ", unknownBillTo)}.");
-
-        foreach (var term in wanted.Select(v => v.PaymentTermCode).Distinct())
-            if (!await db.PaymentTerms.AnyAsync(p => p.Code == term && p.IsActive, ct))
-                return MasterDataSupport.InvalidReference("variants", $"Unknown payment term '{term}'.");
+        var unknownBillTo = (await db.UnknownBillToAsync(wanted.Select(v => v.BillTo), ct)).ToHashSet();
+        var terms = wanted.Select(v => v.PaymentTermCode).Distinct().ToList();
+        var knownTerms = (await db.PaymentTerms.AsNoTracking().Where(p => terms.Contains(p.Code) && p.IsActive)
+            .Select(p => p.Code).ToListAsync(ct)).ToHashSet();
 
         // Tax codes are resolved by CODE, not id: the caller is editing a matrix of
         // strings, and making them look up GUIDs for VAT7 first would be hostile.
         var taxCodes = await db.TaxCodes.AsNoTracking()
             .Select(t => new { t.TaxCodeId, t.TaxCode1, t.TaxType }).ToListAsync(ct);
 
-        foreach (var v in wanted)
+        var seen = new HashSet<(string, string)>();
+        for (var i = 0; i < wanted.Count; i++)
         {
+            var v = wanted[i];
+            // uq_charge_code_variant__matrix: one row per (bill-to, payment term).
+            if (!seen.Add((v.BillTo, v.PaymentTermCode)))
+                Add(i, null, $"Repeated bill-to / payment-term pair: {v.BillTo}/{v.PaymentTermCode}.");
+            if (unknownBillTo.Contains(v.BillTo))
+                Add(i, "billTo", $"Unknown bill-to role(s): {v.BillTo}.");
+            if (!knownTerms.Contains(v.PaymentTermCode))
+                Add(i, "paymentTermCode", $"Unknown payment term '{v.PaymentTermCode}'.");
             if (v.TaxCode is not null && taxCodes.All(t => t.TaxCode1 != v.TaxCode.ToUpperInvariant()))
-                return MasterDataSupport.InvalidReference("variants", $"Unknown tax code '{v.TaxCode}'.");
+                Add(i, "taxCode", $"Unknown tax code '{v.TaxCode}'.");
             if (v.WithholdingTaxCode is not null)
             {
                 var wht = taxCodes.SingleOrDefault(t => t.TaxCode1 == v.WithholdingTaxCode.ToUpperInvariant());
                 if (wht is null)
-                    return MasterDataSupport.InvalidReference("variants", $"Unknown tax code '{v.WithholdingTaxCode}'.");
+                    Add(i, "withholdingTaxCode", $"Unknown tax code '{v.WithholdingTaxCode}'.");
                 // A withholding slot holding a VAT code silently deducts the wrong
                 // amount from a supplier payment, which nobody notices until audit.
-                if (wht.TaxType != "WITHHOLDING")
-                    return MasterDataSupport.InvalidReference("variants",
-                        $"'{v.WithholdingTaxCode}' is a {wht.TaxType} code, not WITHHOLDING.");
+                else if (wht.TaxType != "WITHHOLDING")
+                    Add(i, "withholdingTaxCode", $"'{v.WithholdingTaxCode}' is a {wht.TaxType} code, not WITHHOLDING.");
             }
         }
+        if (errors.Count > 0)
+            return TypedResults.ValidationProblem(errors.ToDictionary(e => e.Key, e => e.Value.ToArray()));
 
         if (db.TouchParent(charge, request.RowVersion) is { } missing) return missing;
 

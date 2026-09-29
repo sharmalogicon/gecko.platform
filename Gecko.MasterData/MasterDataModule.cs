@@ -76,7 +76,8 @@ public static class MasterDataModule
             .MapLocationEndpoints()
             .MapSealRangeEndpoints()
             .MapCalendarEndpoints()
-            .MapSurveyCodeEndpoints();
+            .MapSurveyCodeEndpoints()
+            .MapYardLayoutEndpoints();
 
         return endpoints;
     }

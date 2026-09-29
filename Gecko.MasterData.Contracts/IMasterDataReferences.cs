@@ -1,4 +1,4 @@
-namespace Gecko.MasterData.Contracts;
+﻿namespace Gecko.MasterData.Contracts;
 
 /// <summary>
 /// How another module checks the master-data codes it stores — the only way,
@@ -111,6 +111,12 @@ public interface IMasterDataReferences
     /// branch has no profile or no company. A field MDM does not hold is null — never guessed.
     /// </summary>
     Task<InvoicingCompanyRef?> InvoicingCompanyAsync(Guid branchId, CancellationToken ct);
+
+    /// <summary>
+    /// Stated capacity of a branch's active yards (org.yard.capacity_teu), summed.
+    /// Null when no active yard records a capacity — "unknown", not zero.
+    /// </summary>
+    Task<int?> YardCapacityTeuAsync(Guid branchId, CancellationToken ct);
 }
 
 /// <summary>
@@ -156,7 +162,7 @@ public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 
 /// <summary><see cref="SizeCode"/> is the length in feet as the tariffs write it: "20", "40", "45".</summary>
-public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, string SizeCode, bool IsReefer, bool IsOog, bool IsActive);
+public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, string SizeCode, bool IsReefer, bool IsOog, bool IsActive, decimal Teu);
 
 public sealed record VesselRef(Guid VesselId, string VesselCode, string VesselName, string? ImoNumber, bool IsActive);
 

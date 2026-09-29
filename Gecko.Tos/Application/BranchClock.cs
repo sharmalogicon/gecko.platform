@@ -29,6 +29,23 @@ internal sealed class BranchClock(IMasterDataReferences masterData, TimeProvider
 
     public DateOnly Today(Branch branch) => DateOnly.FromDateTime(LocalNow(branch).DateTime);
 
+    /// <summary>The instant the depot's <paramref name="day"/> begins (its local midnight).</summary>
+    public static DateTimeOffset StartOf(Branch branch, DateOnly day)
+    {
+        var midnight = day.ToDateTime(TimeOnly.MinValue);
+        return new DateTimeOffset(midnight, branch.Zone.GetUtcOffset(midnight));
+    }
+
+    /// <summary>
+    /// The zone as SQL Server's AT TIME ZONE names it (sys.time_zone_info holds
+    /// Windows ids: "SE Asia Standard Time", not "Asia/Bangkok"), so a query can
+    /// bucket by the depot's day and hour itself.
+    /// </summary>
+    public static string SqlZoneName(Branch branch) =>
+        branch.Zone.HasIanaId && TimeZoneInfo.TryConvertIanaIdToWindowsId(branch.Zone.Id, out var windowsId)
+            ? windowsId
+            : branch.Zone.Id;
+
     /// <summary>Today per branch, for a page of bookings; unknown branches fall back to the default zone.</summary>
     public async Task<Func<Guid, DateOnly>> TodayForAsync(IEnumerable<Guid> branchIds, CancellationToken ct)
     {

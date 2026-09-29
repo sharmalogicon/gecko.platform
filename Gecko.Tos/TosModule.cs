@@ -1,7 +1,8 @@
-using Gecko.Data;
+﻿using Gecko.Data;
 using Gecko.Data.Documents;
 using Gecko.Tos.Application;
 using Gecko.Tos.Endpoints.Bookings;
+using Gecko.Tos.Endpoints.Dashboard;
 using Gecko.Tos.Endpoints.Gate;
 using Gecko.Tos.Endpoints.Holds;
 using Gecko.Tos.Endpoints.Vessels;
@@ -63,7 +64,8 @@ public static class TosModule
             .MapHoldEndpoints()
             .MapGateEndpoints()
             .MapSurveyEndpoints()
-            .MapAttachmentEndpoints();
+            .MapAttachmentEndpoints()
+            .MapDashboardEndpoints();
 
         return endpoints;
     }

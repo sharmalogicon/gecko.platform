@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Linq.Expressions;
 using Gecko.MasterData.Contracts;
 using Gecko.MasterData.Infrastructure.Persistence;
@@ -72,10 +72,10 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var rows = await db.EquipmentTypes.AsNoTracking()
             .Where(e => e.IsActive)
             .OrderBy(e => e.LengthFt).ThenBy(e => e.TypeCode)
-            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive })
+            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive, e.Teu })
             .ToListAsync(ct);
         return rows.Select(e => new EquipmentTypeRef(e.EquipmentTypeId, e.TypeCode,
-            decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive)).ToList();
+            decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive, e.Teu)).ToList();
     }
 
     public async Task<IReadOnlyList<string>> CodeListAsync(string categoryCode, CancellationToken ct)
@@ -121,14 +121,14 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(typeCodes);
         var rows = await db.EquipmentTypes.AsNoTracking()
             .Where(e => codes.Contains(e.TypeCode))
-            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive })
+            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive, e.Teu })
             .ToListAsync(ct);
 
         // Length is DECIMAL(4,1) — 20.0 — and tariffs speak of "20".
         return rows.ToDictionary(
             e => e.TypeCode,
             e => new EquipmentTypeRef(e.EquipmentTypeId, e.TypeCode,
-                decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive),
+                decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive, e.Teu),
             StringComparer.OrdinalIgnoreCase);
     }
 
@@ -292,6 +292,15 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         select new ChargeVariantRef(cc.ChargeCodeId, cc.ChargeCode1, cc.DescriptionEn, cc.DescriptionLocal,
             cc.ChargeType, cc.ChargeCategory, cc.BillingUnitCode, v.BillTo, v.PaymentTermCode,
             t == null ? null : t.TaxCode1, t == null ? 0m : t.RatePct, v.CreditTermDays);
+
+    public async Task<int?> YardCapacityTeuAsync(Guid branchId, CancellationToken ct)
+    {
+        var stated = await db.Yards.AsNoTracking()
+            .Where(y => y.BranchId == branchId && y.IsActive && y.CapacityTeu != null)
+            .Select(y => y.CapacityTeu!.Value)
+            .ToListAsync(ct);
+        return stated.Count == 0 ? null : stated.Sum();
+    }
 
     public async Task<InvoicingCompanyRef?> InvoicingCompanyAsync(Guid branchId, CancellationToken ct)
     {

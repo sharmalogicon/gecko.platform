@@ -16,6 +16,9 @@ internal sealed class GeckoExceptionHandler(IProblemDetailsService problemDetail
     {
         (int status, string title)? mapped = exception switch
         {
+            // Binding failures (missing ?branchId=, malformed Guid). Development throws
+            // them (RouteHandlerOptions.ThrowOnBadRequest); Production answers 400 itself.
+            BadHttpRequestException e => (e.StatusCode, e.Message),
             MissingTenantContextException => (StatusCodes.Status401Unauthorized, "No tenant in the access token."),
             InvalidStateTransitionException e => (StatusCodes.Status409Conflict, e.Message),
             DomainException e => (StatusCodes.Status422UnprocessableEntity, e.Message),

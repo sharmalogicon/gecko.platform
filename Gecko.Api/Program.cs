@@ -71,7 +71,10 @@ if (app.Configuration.GetValue("OpenApi:Enabled", true))
     app.MapGet("/", () => Results.Redirect("/swagger/index.html")).AllowAnonymous().ExcludeFromDescription();
 }
 
-app.UseHttpsRedirection();
+// Not in Development: with both 5100 and 7100 bound, every http request would
+// 307 to 7100 and break the UI's one-origin proxy to http://localhost:5100.
+if (!app.Environment.IsDevelopment())
+    app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();

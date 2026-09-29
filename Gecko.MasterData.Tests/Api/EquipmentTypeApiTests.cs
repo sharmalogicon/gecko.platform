@@ -126,8 +126,8 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            var deleted = await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
-            Assert.Equal(HttpStatusCode.NoContent, deleted.StatusCode);
+            var deleted = await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
+            Assert.Equal(HttpStatusCode.NoContent, deleted!.StatusCode);
         }
     }
 
@@ -158,7 +158,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
         }
     }
 
@@ -212,7 +212,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
         }
     }
 
@@ -236,7 +236,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
         }
     }
 
@@ -256,7 +256,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
         }
     }
 
@@ -272,6 +272,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         {
             var first = await sct.PutAsJsonAsync(url, new
             {
+                rowVersion = created.Type.RowVersion,
                 isoCodes = new[]
                 {
                     new { isoCode = FreeIsoCodeA, isDefaultOutbound = false },
@@ -279,17 +280,21 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
                 },
             }, ct);
             Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+            // Replacing the mapping is an edit of the type: the next write needs the version it moved to.
+            var afterFirst = (await first.Content.ReadFromJsonAsync<Detail>(ct))!;
+            Assert.NotEqual(created.Type.RowVersion, afterFirst.Type.RowVersion);
 
             // Drop one, keep one, and move the default. The dropped row has to be
             // soft-deleted and FLUSHED before the survivors are re-saved, or the
             // filtered unique index rejects the batch.
             var second = await sct.PutAsJsonAsync(url, new
             {
+                rowVersion = afterFirst.Type.RowVersion,
                 isoCodes = new[] { new { isoCode = FreeIsoCodeA, isDefaultOutbound = true } },
             }, ct);
             Assert.Equal(HttpStatusCode.OK, second.StatusCode);
 
-            var mapping = (await second.Content.ReadFromJsonAsync<List<IsoMapping>>(ct))!;
+            var mapping = (await second.Content.ReadFromJsonAsync<Detail>(ct))!.IsoCodes;
             Assert.Single(mapping);
             Assert.Equal(FreeIsoCodeA, mapping[0].IsoCode);
             Assert.True(mapping[0].IsDefaultOutbound);
@@ -301,7 +306,7 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{created.Type.EquipmentTypeId}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{created.Type.EquipmentTypeId}", ct);
         }
     }
 
@@ -314,7 +319,8 @@ public sealed class EquipmentTypeApiTests(MasterDataApiFactory api)
         var types = (await sct.GetFromJsonAsync<Paged<EquipmentType>>($"{Base}?pageSize=200", ct))!.Items;
         var inUse = types.Single(t => t.TypeCode == "20GP");
 
-        var response = await sct.DeleteAsync($"{Base}/{inUse.EquipmentTypeId}", ct);
+        // At its current version, so the refusal is about the containers using it.
+        var response = (await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{inUse.EquipmentTypeId}", ct))!;
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Contains("container", await response.Content.ReadAsStringAsync(ct), StringComparison.OrdinalIgnoreCase);

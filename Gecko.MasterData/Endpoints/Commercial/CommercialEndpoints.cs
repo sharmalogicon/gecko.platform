@@ -49,8 +49,10 @@ public sealed record ChargeVariantItem(
     [property: MaxLength(20)] string? CostGl = null,
     [property: MaxLength(20)] string? LegacyChargeCode = null);
 
+/// <summary>The whole matrix, plus the charge code's rowVersion: replacing the variants is an edit of the charge code.</summary>
 public sealed record ReplaceChargeVariantsRequest(
-    [property: Required, MinLength(1)] IReadOnlyList<ChargeVariantItem> Variants);
+    [property: Required, MinLength(1)] IReadOnlyList<ChargeVariantItem> Variants,
+    string? RowVersion = null);
 
 // ── tax codes ───────────────────────────────────────────────────────────────
 
@@ -230,13 +232,10 @@ internal static class CommercialEndpoints
     /// clash halfway through. Sending the whole intended matrix lets it be checked
     /// once, up front.
     /// </summary>
-    private static async Task<Results<Ok<IReadOnlyList<ChargeVariantResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceVariantsAsync(
+    private static async Task<Results<Ok<ChargeCodeDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceVariantsAsync(
         string chargeCode, ReplaceChargeVariantsRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
-        var charge = await db.ChargeCodes.AsNoTracking()
-            .Where(c => c.ChargeCode1 == chargeCode.ToUpperInvariant())
-            .Select(c => new { c.ChargeCodeId })
-            .SingleOrDefaultAsync(ct);
+        var charge = await db.ChargeCodes.SingleOrDefaultAsync(c => c.ChargeCode1 == chargeCode.ToUpperInvariant(), ct);
         if (charge is null) return TypedResults.NotFound();
 
         var wanted = request.Variants
@@ -277,9 +276,15 @@ internal static class CommercialEndpoints
             }
         }
 
+        if (db.TouchParent(charge, request.RowVersion) is { } missing) return missing;
+
+        // One transaction: the soft deletes are flushed first (past the filtered unique
+        // index) together with the version-guarded touch of the charge code, so a stale
+        // editor is refused before anything changes, and a failed insert loses nothing.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
         var existing = await db.ChargeCodeVariants.Where(v => v.ChargeCodeId == charge.ChargeCodeId).ToListAsync(ct);
         foreach (var gone in existing) db.ChargeCodeVariants.Remove(gone);
-        if (existing.Count > 0) await db.SaveChangesAsync(ct);   // flush the soft deletes past the filtered unique index
+        if (await db.SaveOrConflictAsync(ct) is { } stale) return stale;
 
         foreach (var v in wanted)
         {
@@ -300,14 +305,16 @@ internal static class CommercialEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-        return TypedResults.Ok(await VariantsOfAsync(db, charge.ChargeCodeId, ct));
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok(new ChargeCodeDetailResponse(MapCharge(charge), await VariantsOfAsync(db, charge.ChargeCodeId, ct)));
     }
 
-    private static async Task<Results<NoContent, NotFound, ProblemHttpResult>> DeleteChargeAsync(
-        string chargeCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteChargeAsync(
+        string chargeCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var charge = await db.ChargeCodes.SingleOrDefaultAsync(c => c.ChargeCode1 == chargeCode.ToUpperInvariant(), ct);
         if (charge is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(charge, rowVersion) is { } missing) return missing;
 
         // An order type or movement still raising this charge would raise a charge
         // that no longer exists. No FKs, so this is the only place it is caught.
@@ -319,7 +326,7 @@ internal static class CommercialEndpoints
         foreach (var variant in await db.ChargeCodeVariants.Where(v => v.ChargeCodeId == charge.ChargeCodeId).ToListAsync(ct))
             db.ChargeCodeVariants.Remove(variant);
         db.ChargeCodes.Remove(charge);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -416,17 +423,18 @@ internal static class CommercialEndpoints
         return TypedResults.Ok(MapTax(tax));
     }
 
-    private static async Task<Results<NoContent, NotFound, ProblemHttpResult>> DeleteTaxAsync(
-        string taxCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteTaxAsync(
+        string taxCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var tax = await db.TaxCodes.SingleOrDefaultAsync(t => t.TaxCode1 == taxCode.ToUpperInvariant(), ct);
         if (tax is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(tax, rowVersion) is { } missing) return missing;
 
         if (await db.ChargeCodeVariants.AnyAsync(v => v.TaxCodeId == tax.TaxCodeId || v.WithholdingTaxCodeId == tax.TaxCodeId, ct))
             return MasterDataSupport.Conflict("Tax code is still referenced by a charge code variant.");
 
         db.TaxCodes.Remove(tax);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -517,11 +525,12 @@ internal static class CommercialEndpoints
         return TypedResults.Ok(MapMovement(movement));
     }
 
-    private static async Task<Results<NoContent, NotFound, ProblemHttpResult>> DeleteMovementAsync(
-        string movementCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteMovementAsync(
+        string movementCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var movement = await db.Movements.SingleOrDefaultAsync(m => m.MovementCode == movementCode.ToUpperInvariant(), ct);
         if (movement is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(movement, rowVersion) is { } missing) return missing;
 
         if (await db.OrderTypeMovements.AnyAsync(m => m.MovementId == movement.MovementId, ct))
             return MasterDataSupport.Conflict("Movement is still part of an order type.", "Remove it from the order types first, or set isActive = false.");
@@ -529,7 +538,7 @@ internal static class CommercialEndpoints
         foreach (var charge in await db.MovementCharges.Where(c => c.MovementId == movement.MovementId).ToListAsync(ct))
             db.MovementCharges.Remove(charge);
         db.Movements.Remove(movement);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -585,17 +594,18 @@ internal static class CommercialEndpoints
         return TypedResults.Ok(MapService(service));
     }
 
-    private static async Task<Results<NoContent, NotFound, ProblemHttpResult>> DeleteServiceAsync(
-        string serviceCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteServiceAsync(
+        string serviceCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var service = await db.ServiceTypes.SingleOrDefaultAsync(s => s.ServiceCode == serviceCode.ToUpperInvariant(), ct);
         if (service is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(service, rowVersion) is { } missing) return missing;
 
         if (await db.OrderTypes.AnyAsync(o => o.ServiceTypeId == service.ServiceTypeId, ct))
             return MasterDataSupport.Conflict("Service type is still used by an order type.");
 
         db.ServiceTypes.Remove(service);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 

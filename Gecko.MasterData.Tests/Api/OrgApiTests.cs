@@ -16,7 +16,7 @@ public sealed class OrgApiTests(MasterDataApiFactory api)
     // Fixture branches (gecko_identity dev_* scripts, mirrored into org.branch_profile).
     private static readonly Guid SctLcb01 = Guid.Parse("C558E785-33A5-F111-9B0D-00919E4766D5");   // -> SCT-HQ
     private static readonly Guid SctLkr01 = Guid.Parse("785AE785-33A5-F111-9B0D-00919E4766D5");   // -> SCT-LOG
-    private static readonly Guid MpjLcb01 = Guid.Parse("CA59E785-33A5-F111-9B0D-00919E4766D5");   // -> MPJ
+    private static readonly Guid OtherLcb01 = Guid.Parse("7A5AE785-33A5-F111-9B0D-00919E4766D5"); // SIAM-COMMERCIAL SCC-LCB01 -> SCC
 
     // ── company ─────────────────────────────────────────────────────────────
 
@@ -60,12 +60,12 @@ public sealed class OrgApiTests(MasterDataApiFactory api)
     {
         var ct = TestContext.Current.CancellationToken;
         var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
-        var mpj = await api.ClientForAsync(MasterDataApiFactory.MpjOps);
+        var other = await api.ClientForAsync(MasterDataApiFactory.SiamCommercialAdmin);
 
-        var own = await mpj.GetFromJsonAsync<CompanyRow>($"{Company}?branchId={MpjLcb01}", ct);
-        var leaked = await sct.GetAsync($"{Company}?branchId={MpjLcb01}", ct);
+        var own = await other.GetFromJsonAsync<CompanyRow>($"{Company}?branchId={OtherLcb01}", ct);
+        var leaked = await sct.GetAsync($"{Company}?branchId={OtherLcb01}", ct);
 
-        Assert.Equal("MPJ", own!.CompanyCode);
+        Assert.Equal("SCC", own!.CompanyCode);
         Assert.Equal(HttpStatusCode.NotFound, leaked.StatusCode);
     }
 
@@ -107,10 +107,10 @@ public sealed class OrgApiTests(MasterDataApiFactory api)
     {
         var ct = TestContext.Current.CancellationToken;
         var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
-        var mpj = await api.ClientForAsync(MasterDataApiFactory.MpjOps);
+        var other = await api.ClientForAsync(MasterDataApiFactory.SiamCommercialAdmin);
 
-        var own = await mpj.GetFromJsonAsync<Paged<YardRow>>($"{Yards}?branchId={MpjLcb01}", ct);
-        var leaked = await sct.GetFromJsonAsync<Paged<YardRow>>($"{Yards}?branchId={MpjLcb01}&activeOnly=false", ct);
+        var own = await other.GetFromJsonAsync<Paged<YardRow>>($"{Yards}?branchId={OtherLcb01}", ct);
+        var leaked = await sct.GetFromJsonAsync<Paged<YardRow>>($"{Yards}?branchId={OtherLcb01}&activeOnly=false", ct);
 
         Assert.Equal("Y-MAIN", Assert.Single(own!.Items).YardCode);
         Assert.Empty(leaked!.Items);

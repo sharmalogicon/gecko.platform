@@ -155,13 +155,14 @@ internal static class EquipmentCodeEndpoints
         return TypedResults.Ok(MapHold(hold));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteHoldAsync(
-        string holdCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteHoldAsync(
+        string holdCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var hold = await db.Holds.SingleOrDefaultAsync(h => h.HoldCode == holdCode.ToUpperInvariant(), ct);
         if (hold is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(hold, rowVersion) is { } missing) return missing;
         db.Holds.Remove(hold);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -242,13 +243,14 @@ internal static class EquipmentCodeEndpoints
         return TypedResults.Ok(MapGrade(grade));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteGradeAsync(
-        string gradeCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteGradeAsync(
+        string gradeCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var grade = await db.ContainerGrades.SingleOrDefaultAsync(g => g.GradeCode == gradeCode.ToUpperInvariant(), ct);
         if (grade is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(grade, rowVersion) is { } missing) return missing;
         db.ContainerGrades.Remove(grade);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -300,13 +302,14 @@ internal static class EquipmentCodeEndpoints
         return TypedResults.Ok(MapCondition(condition));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteConditionAsync(
-        string conditionCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteConditionAsync(
+        string conditionCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var condition = await db.ContainerConditions.SingleOrDefaultAsync(c => c.ConditionCode == conditionCode.ToUpperInvariant(), ct);
         if (condition is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(condition, rowVersion) is { } missing) return missing;
         db.ContainerConditions.Remove(condition);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 

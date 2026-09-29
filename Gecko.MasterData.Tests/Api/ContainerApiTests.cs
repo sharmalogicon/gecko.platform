@@ -159,8 +159,8 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            var deleted = await sct.DeleteAsync($"{Base}/{number}", ct);
-            Assert.Equal(HttpStatusCode.NoContent, deleted.StatusCode);
+            var deleted = await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{number}", ct);
+            Assert.Equal(HttpStatusCode.NoContent, deleted!.StatusCode);
         }
     }
 
@@ -280,7 +280,7 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{Base}/{number}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{number}", ct);
         }
     }
 

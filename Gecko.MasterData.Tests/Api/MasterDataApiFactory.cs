@@ -50,12 +50,6 @@ public class MasterDataApiFactory : WebApplicationFactory<Program>, IAsyncLifeti
     /// <summary>TENANT_OWNER of another tenant, whose equipment vocabulary is deliberately different.</summary>
     public const string SiamCommercialAdmin = "admin@siamcommercial.co.th";
 
-    /// <summary>
-    /// MPJ operations manager — the other tenant in the org (company / yard) tests.
-    /// Not admin@mpj.co.th: that fixture must change its password before it can sign in.
-    /// </summary>
-    public const string MpjOps = "ops@mpj.co.th";
-
     private readonly ConcurrentDictionary<string, Lazy<Task<string>>> _tokens = new();
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

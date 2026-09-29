@@ -91,6 +91,33 @@ internal static class MasterDataSupport
         return true;
     }
 
+    public static ValidationProblem MissingRowVersion() =>
+        InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
+
+    /// <summary>
+    /// A DELETE names the version it saw (?rowVersion=), exactly like a PUT: deleting
+    /// a row someone else has just changed is the same lost update. Null when the
+    /// version is applied; the soft delete then fails with 409 in
+    /// <see cref="SaveOrConflictAsync"/> if the row has moved on.
+    /// </summary>
+    public static ValidationProblem? ExpectVersion<TEntity>(this DbContext db, TEntity entity, string? rowVersion)
+        where TEntity : class =>
+        db.TrySetExpectedVersion(entity, rowVersion) ? null : MissingRowVersion();
+
+    /// <summary>
+    /// Replacing a child set (charge variants, order-type steps and charges, ISO
+    /// mappings) is an edit of the PARENT. The parent is touched — an UPDATE guarded
+    /// by the version the caller saw — so its row_version moves, and a second editor
+    /// still holding the old one gets 409 instead of silently overwriting the set.
+    /// </summary>
+    public static ValidationProblem? TouchParent<TEntity>(this DbContext db, TEntity parent, string? rowVersion)
+        where TEntity : class
+    {
+        if (!db.TrySetExpectedVersion(parent, rowVersion)) return MissingRowVersion();
+        db.Entry(parent).Property("UpdatedAt").IsModified = true;   // AuditStampInterceptor stamps the value
+        return null;
+    }
+
     /// <summary>Saves, turning a lost optimistic-concurrency race into 409 rather than an unhandled 500.</summary>
     public static async Task<ProblemHttpResult?> SaveOrConflictAsync(this DbContext db, CancellationToken ct)
     {

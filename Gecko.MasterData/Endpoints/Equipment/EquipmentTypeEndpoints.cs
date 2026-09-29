@@ -69,8 +69,10 @@ public sealed record IsoMappingItem(
     [property: Required, RegularExpression("^[A-Z0-9]{4}$", ErrorMessage = "ISO 6346 size-type code, 4 characters, e.g. 22G1.")] string IsoCode,
     bool IsDefaultOutbound = false);
 
+/// <summary>The whole mapping, plus the equipment type's rowVersion: replacing the ISO codes is an edit of the type.</summary>
 public sealed record ReplaceIsoMappingRequest(
-    [property: Required, MinLength(1)] IReadOnlyList<IsoMappingItem> IsoCodes);
+    [property: Required, MinLength(1)] IReadOnlyList<IsoMappingItem> IsoCodes,
+    string? RowVersion = null);
 
 /// <summary>
 /// The tenant's own equipment vocabulary, and the mapping from the global ISO
@@ -256,11 +258,11 @@ internal static class EquipmentTypeEndpoints
     /// default per type. Sending the whole intended set lets both be checked once,
     /// up front, instead of discovering the clash halfway through.
     /// </summary>
-    private static async Task<Results<Ok<IReadOnlyList<IsoMappingResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceIsoCodesAsync(
+    private static async Task<Results<Ok<EquipmentTypeDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceIsoCodesAsync(
         Guid equipmentTypeId, ReplaceIsoMappingRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
-        if (!await db.EquipmentTypes.AnyAsync(t => t.EquipmentTypeId == equipmentTypeId, ct))
-            return TypedResults.NotFound();
+        var type = await db.EquipmentTypes.SingleOrDefaultAsync(t => t.EquipmentTypeId == equipmentTypeId, ct);
+        if (type is null) return TypedResults.NotFound();
 
         var wanted = request.IsoCodes
             .Select(i => new IsoMappingItem(i.IsoCode.Trim().ToUpperInvariant(), i.IsDefaultOutbound))
@@ -297,8 +299,13 @@ internal static class EquipmentTypeEndpoints
         // takes them out of the filtered unique index, and SQL Server enforces the
         // index per statement — insert the replacements in the same SaveChanges and
         // the old row is still live when the new one lands.
+        if (db.TouchParent(type, request.RowVersion) is { } missing) return missing;
+
+        // One transaction, and the version-guarded touch of the type goes in the first
+        // flush: a stale editor is refused before any mapping changes.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
         foreach (var gone in existing.Except(keep)) db.EquipmentTypeIsoCodes.Remove(gone);
-        if (existing.Count != keep.Count) await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } stale) return stale;
 
         foreach (var item in wanted)
         {
@@ -320,14 +327,16 @@ internal static class EquipmentTypeEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-        return TypedResults.Ok(await IsoCodesOfAsync(db, equipmentTypeId, ct));
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok(new EquipmentTypeDetailResponse(Map(type), await IsoCodesOfAsync(db, equipmentTypeId, ct)));
     }
 
-    private static async Task<Results<NoContent, NotFound, ProblemHttpResult>> DeleteAsync(
-        Guid equipmentTypeId, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ProblemHttpResult, ValidationProblem>> DeleteAsync(
+        Guid equipmentTypeId, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var type = await db.EquipmentTypes.SingleOrDefaultAsync(t => t.EquipmentTypeId == equipmentTypeId, ct);
         if (type is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(type, rowVersion) is { } missing) return missing;
 
         // No FKs to stop this, so the references have to be checked here. A container
         // whose type vanished is a box nobody can price, plan or gate out.
@@ -345,7 +354,7 @@ internal static class EquipmentTypeEndpoints
             db.EquipmentTypeIsoCodes.Remove(mapping);
 
         db.EquipmentTypes.Remove(type);   // AuditStampInterceptor turns this into UPDATE deleted_at
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
         return TypedResults.NoContent();
     }

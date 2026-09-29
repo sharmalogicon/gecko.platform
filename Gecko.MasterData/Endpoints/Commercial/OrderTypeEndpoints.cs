@@ -65,8 +65,10 @@ public sealed record OrderTypeMovementItem(
     bool SkipEdi = false,
     [property: MaxLength(20)] string? PudoMode = null);
 
+/// <summary>The whole sequence, plus the order type's rowVersion: replacing the steps is an edit of the order type.</summary>
 public sealed record ReplaceOrderTypeMovementsRequest(
-    [property: Required, MinLength(1)] IReadOnlyList<OrderTypeMovementItem> Movements);
+    [property: Required, MinLength(1)] IReadOnlyList<OrderTypeMovementItem> Movements,
+    string? RowVersion = null);
 
 public sealed record OrderTypeChargeItem(
     [property: Required, MaxLength(15)] string ChargeCode,
@@ -80,7 +82,8 @@ public sealed record OrderTypeChargeItem(
     bool RaiseAtGateIn = false,
     [property: Range(0.001, 99999)] decimal? DefaultQty = null);
 
-public sealed record ReplaceOrderTypeChargesRequest(IReadOnlyList<OrderTypeChargeItem> Charges);
+/// <summary>The whole charge set, plus the order type's rowVersion: replacing the charges is an edit of the order type.</summary>
+public sealed record ReplaceOrderTypeChargesRequest(IReadOnlyList<OrderTypeChargeItem> Charges, string? RowVersion = null);
 
 /// <summary>
 /// An order type is what the depot is being asked to do — "export CY to CY",
@@ -129,6 +132,12 @@ internal static class OrderTypeEndpoints
         return TypedResults.Ok(await Project(db, orderTypes.OrderBy(o => o.OrderTypeCode))
             .ToPagedAsync(query.Page, query.PageSize, ct));
     }
+
+    /// <summary>The order type with its steps and charges — what GET returns, and what a child-set replace answers with (carrying the new rowVersion).</summary>
+    private static async Task<OrderTypeDetailResponse> DetailAsync(MasterDataDbContext db, Guid orderTypeId, CancellationToken ct) =>
+        new(await Project(db, db.OrderTypes.AsNoTracking().Where(o => o.OrderTypeId == orderTypeId)).SingleAsync(ct),
+            await MovementsOfAsync(db, orderTypeId, ct),
+            await ChargesOfAsync(db, orderTypeId, ct));
 
     private static async Task<Results<Ok<OrderTypeDetailResponse>, NotFound>> GetAsync(
         string orderTypeCode, MasterDataDbContext db, CancellationToken ct)
@@ -182,12 +191,10 @@ internal static class OrderTypeEndpoints
     /// movement) and uq_otm__sequence (one row per position) — and a sequence with
     /// a gap or a repeat is a gate that does not know what happens next.
     /// </summary>
-    private static async Task<Results<Ok<IReadOnlyList<OrderTypeMovementResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceMovementsAsync(
+    private static async Task<Results<Ok<OrderTypeDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceMovementsAsync(
         string orderTypeCode, ReplaceOrderTypeMovementsRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
-        var orderType = await db.OrderTypes.AsNoTracking()
-            .Where(o => o.OrderTypeCode == orderTypeCode.FromRouteCode())
-            .Select(o => new { o.OrderTypeId }).SingleOrDefaultAsync(ct);
+        var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
         if (orderType is null) return TypedResults.NotFound();
 
         var wanted = request.Movements
@@ -216,9 +223,15 @@ internal static class OrderTypeEndpoints
             if (!await db.VwCodeLists.AnyAsync(v => v.CategoryCode == "PICKUP_DROPOFF_MODE" && v.Code == mode && v.IsActive == true, ct))
                 return MasterDataSupport.InvalidReference("movements", $"'{mode}' is not a PICKUP_DROPOFF_MODE.");
 
+        if (db.TouchParent(orderType, request.RowVersion) is { } missing) return missing;
+
+        // One transaction: the soft deletes flush (past the filtered unique indexes)
+        // with the version-guarded touch of the order type, so a stale editor is
+        // refused before anything changes and a failed insert loses nothing.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
         var existing = await db.OrderTypeMovements.Where(m => m.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct);
         foreach (var gone in existing) db.OrderTypeMovements.Remove(gone);
-        if (existing.Count > 0) await db.SaveChangesAsync(ct);   // flush past the filtered unique indexes
+        if (await db.SaveOrConflictAsync(ct) is { } stale) return stale;
 
         foreach (var m in wanted)
         {
@@ -240,15 +253,14 @@ internal static class OrderTypeEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-        return TypedResults.Ok(await MovementsOfAsync(db, orderType.OrderTypeId, ct));
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok(await DetailAsync(db, orderType.OrderTypeId, ct));
     }
 
-    private static async Task<Results<Ok<IReadOnlyList<OrderTypeChargeResponse>>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceChargesAsync(
+    private static async Task<Results<Ok<OrderTypeDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceChargesAsync(
         string orderTypeCode, ReplaceOrderTypeChargesRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
-        var orderType = await db.OrderTypes.AsNoTracking()
-            .Where(o => o.OrderTypeCode == orderTypeCode.FromRouteCode())
-            .Select(o => new { o.OrderTypeId }).SingleOrDefaultAsync(ct);
+        var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
         if (orderType is null) return TypedResults.NotFound();
 
         var wanted = request.Charges
@@ -286,9 +298,15 @@ internal static class OrderTypeEndpoints
         if (unknownMovements.Count > 0)
             return MasterDataSupport.InvalidReference("charges", $"Unknown movement(s): {string.Join(", ", unknownMovements)}.");
 
+        if (db.TouchParent(orderType, request.RowVersion) is { } missing) return missing;
+
+        // One transaction: the soft deletes flush (past the filtered unique indexes)
+        // with the version-guarded touch of the order type, so a stale editor is
+        // refused before anything changes and a failed insert loses nothing.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
         var existing = await db.OrderTypeCharges.Where(c => c.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct);
         foreach (var gone in existing) db.OrderTypeCharges.Remove(gone);
-        if (existing.Count > 0) await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } stale) return stale;
 
         foreach (var c in wanted)
         {
@@ -310,21 +328,23 @@ internal static class OrderTypeEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-        return TypedResults.Ok(await ChargesOfAsync(db, orderType.OrderTypeId, ct));
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok(await DetailAsync(db, orderType.OrderTypeId, ct));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteAsync(
-        string orderTypeCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteAsync(
+        string orderTypeCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var orderType = await db.OrderTypes.SingleOrDefaultAsync(o => o.OrderTypeCode == orderTypeCode.FromRouteCode(), ct);
         if (orderType is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(orderType, rowVersion) is { } missing) return missing;
 
         foreach (var m in await db.OrderTypeMovements.Where(m => m.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
             db.OrderTypeMovements.Remove(m);
         foreach (var c in await db.OrderTypeCharges.Where(c => c.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
             db.OrderTypeCharges.Remove(c);
         db.OrderTypes.Remove(orderType);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
         return TypedResults.NoContent();
     }

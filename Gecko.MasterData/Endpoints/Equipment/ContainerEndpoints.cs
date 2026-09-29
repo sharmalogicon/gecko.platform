@@ -306,18 +306,19 @@ internal static class ContainerEndpoints
             .SingleAsync(ct));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteAsync(
-        string containerNo, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteAsync(
+        string containerNo, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var number = ContainerNumber.Normalise(containerNo);
         var container = await db.Containers.SingleOrDefaultAsync(c => c.ContainerNo == number, ct);
         if (container is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(container, rowVersion) is { } missing) return missing;
 
         // No reference check against TOS: this database cannot see gate moves, and
         // a cross-context query would be the wrong answer anyway (ADR-007). Soft
         // delete keeps the row and its history for anything that still points here.
         db.Containers.Remove(container);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
         return TypedResults.NoContent();
     }

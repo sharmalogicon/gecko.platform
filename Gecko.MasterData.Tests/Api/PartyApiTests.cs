@@ -340,8 +340,8 @@ public sealed class PartyApiTests(MasterDataApiFactory api)
 
     private static async Task DeleteAsync(HttpClient client, string code, CancellationToken ct)
     {
-        var response = await client.DeleteAsync($"{Base}/{Uri.EscapeDataString(code)}", ct);
-        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        var response = await RowVersions.DeleteCurrentAsync(client, $"{Base}/{Uri.EscapeDataString(code)}", ct);
+        Assert.Equal(HttpStatusCode.NoContent, response?.StatusCode);
     }
 
     /// <summary>A 13-digit tax id no fixture uses ('9' prefix), unique per call.</summary>

@@ -286,13 +286,14 @@ internal static class ConfigEndpoints
         return TypedResults.Ok(await Project(db, db.CodeMappings.AsNoTracking().Where(m => m.CodeMappingId == codeMappingId)).SingleAsync(ct));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteMappingAsync(
-        Guid codeMappingId, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteMappingAsync(
+        Guid codeMappingId, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var mapping = await db.CodeMappings.SingleOrDefaultAsync(m => m.CodeMappingId == codeMappingId, ct);
         if (mapping is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(mapping, rowVersion) is { } missing) return missing;
         db.CodeMappings.Remove(mapping);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 
@@ -445,13 +446,14 @@ internal static class ConfigEndpoints
         }
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteSeriesAsync(
-        Guid numberSeriesId, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteSeriesAsync(
+        Guid numberSeriesId, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var series = await db.NumberSeries.SingleOrDefaultAsync(s => s.NumberSeriesId == numberSeriesId, ct);
         if (series is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(series, rowVersion) is { } missing) return missing;
         db.NumberSeries.Remove(series);
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 

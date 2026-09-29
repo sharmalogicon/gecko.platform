@@ -46,7 +46,7 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         Assert.True(response.StatusCode == HttpStatusCode.Created,
             $"POST returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
 
-        await sct.DeleteAsync($"{Charges}/{code}", ct);
+        await RowVersions.DeleteCurrentAsync(sct, $"{Charges}/{code}", ct);
     }
 
     [Fact]
@@ -157,6 +157,7 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
             // Lower-case payer is normalised, and a real term (COD) is accepted.
             var good = await sct.PutAsJsonAsync($"{OrderTypes}/{code}/charges", new
             {
+                rowVersion = await RowVersions.OfAsync(sct, $"{OrderTypes}/{code}", ct),
                 charges = new[] { new { chargeCode = "LIFTIN", paymentTo = "line", paymentTermCode = "COD" } },
             }, ct);
             Assert.True(good.StatusCode == HttpStatusCode.OK,
@@ -165,8 +166,8 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.PutAsJsonAsync($"{OrderTypes}/{code}/charges", new { charges = Array.Empty<object>() }, ct);
-            await sct.DeleteAsync($"{OrderTypes}/{code}", ct);
+            // Deleting the order type takes its charges with it.
+            await RowVersions.DeleteCurrentAsync(sct, $"{OrderTypes}/{code}", ct);
         }
     }
 
@@ -199,9 +200,11 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         var ct = TestContext.Current.CancellationToken;
         var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
 
-        var response = await sct.DeleteAsync($"{Charges}/LIFTIN", ct);
+        // At its current version, so the refusal is about the order type using it — not a stale or missing rowVersion.
+        var response = (await RowVersions.DeleteCurrentAsync(sct, $"{Charges}/LIFTIN", ct))!;
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("still used by an order type", await response.Content.ReadAsStringAsync(ct));
     }
 
     // ── tax codes ───────────────────────────────────────────────────────────
@@ -272,7 +275,7 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         // leak a row on every run.
         var url = $"{OrderTypes}/{Uri.EscapeDataString(code)}";
         Assert.Equal(HttpStatusCode.OK, (await sct.GetAsync(url, ct)).StatusCode);
-        Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync(url, ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await RowVersions.DeleteCurrentAsync(sct, url, ct))!.StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await sct.GetAsync(url, ct)).StatusCode);
     }
 
@@ -332,7 +335,7 @@ public sealed class CommercialAndConfigApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            await sct.DeleteAsync($"{OrderTypes}/{code}", ct);
+            await RowVersions.DeleteCurrentAsync(sct, $"{OrderTypes}/{code}", ct);
         }
     }
 

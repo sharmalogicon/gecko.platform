@@ -279,11 +279,12 @@ internal static class PartyEndpoints
         return TypedResults.Ok(await DetailAsync(db, saved, ct));
     }
 
-    private static async Task<Results<NoContent, NotFound>> DeleteAsync(
-        string partyCode, MasterDataDbContext db, CancellationToken ct)
+    private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteAsync(
+        string partyCode, string? rowVersion, MasterDataDbContext db, CancellationToken ct)
     {
         var party = await db.Parties.SingleOrDefaultAsync(p => p.PartyCode == partyCode.FromRouteCode(), ct);
         if (party is null) return TypedResults.NotFound();
+        if (db.ExpectVersion(party, rowVersion) is { } missing) return missing;
 
         db.CustomerExtensions.RemoveRange(await db.CustomerExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));
         db.ShippingLineExtensions.RemoveRange(await db.ShippingLineExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));
@@ -292,7 +293,7 @@ internal static class PartyEndpoints
         db.PartyAliases.RemoveRange(await db.PartyAliases.Where(a => a.PartyId == party.PartyId).ToListAsync(ct));
         db.Contacts.RemoveRange(await db.Contacts.Where(c => c.PartyId == party.PartyId).ToListAsync(ct));
         db.Parties.Remove(party);   // soft delete: AuditStampInterceptor turns it into deleted_at
-        await db.SaveChangesAsync(ct);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         return TypedResults.NoContent();
     }
 

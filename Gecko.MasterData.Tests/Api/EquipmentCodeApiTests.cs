@@ -140,7 +140,7 @@ public sealed class EquipmentCodeApiTests(MasterDataApiFactory api)
         }
         finally
         {
-            Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync($"{Holds}/{code}", ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.NoContent, (await RowVersions.DeleteCurrentAsync(sct, $"{Holds}/{code}", ct))!.StatusCode);
         }
     }
 
@@ -168,8 +168,8 @@ public sealed class EquipmentCodeApiTests(MasterDataApiFactory api)
         Assert.True(condition.StatusCode == HttpStatusCode.OK,
             $"POST {Conditions} returned {(int)condition.StatusCode}: {await condition.Content.ReadAsStringAsync(ct)}");
 
-        Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync($"{Grades}/{gradeCode}", ct)).StatusCode);
-        Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync($"{Conditions}/{conditionCode}", ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await RowVersions.DeleteCurrentFromListAsync(sct, $"{Grades}/{gradeCode}", ct))!.StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await RowVersions.DeleteCurrentFromListAsync(sct, $"{Conditions}/{conditionCode}", ct))!.StatusCode);
     }
 
     [Fact]

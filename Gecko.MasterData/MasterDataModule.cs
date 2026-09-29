@@ -3,6 +3,7 @@ using Gecko.MasterData.Application;
 using Gecko.MasterData.Endpoints.Commercial;
 using Gecko.MasterData.Endpoints.Config;
 using Gecko.MasterData.Endpoints.Equipment;
+using Gecko.MasterData.Endpoints.Logistics;
 using Gecko.MasterData.Endpoints.Org;
 using Gecko.MasterData.Endpoints.Parties;
 using Gecko.MasterData.Infrastructure.Persistence;
@@ -68,7 +69,8 @@ public static class MasterDataModule
             .MapPartyEndpoints()
             .MapContactEndpoints()
             .MapShippingLineEndpoints()
-            .MapOrgEndpoints();
+            .MapOrgEndpoints()
+            .MapPortEndpoints();
 
         return endpoints;
     }

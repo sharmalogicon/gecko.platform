@@ -207,25 +207,47 @@ internal static class PartyEndpoints
     private static async Task<Results<CreatedAtRoute<PartyDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
         SavePartyRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
     {
+        var roles = NormaliseRoles(request.Roles, out var badRole);
+        if (badRole is not null) return MasterDataSupport.InvalidReference("roles", badRole);
+        if (roles.Count == 0) roles = ["CUSTOMER"];
+
+        var registered = await RegisterAsync(db, caller, request, roles, withRoles: null, ct);
+        if (registered.Invalid is { } invalid) return invalid;
+        if (registered.Problem is { } problem) return problem;
+
+        var saved = await db.Parties.AsNoTracking().SingleAsync(p => p.PartyId == registered.Party!.PartyId, ct);
+        return TypedResults.CreatedAtRoute(await DetailAsync(db, saved, ct), "GetParty", new { partyCode = saved.PartyCode });
+    }
+
+    /// <summary>What registering a party produced: the saved party, or the problem that stopped it.</summary>
+    internal sealed record Registration(Party? Party, ValidationProblem? Invalid = null, ProblemHttpResult? Problem = null);
+
+    /// <summary>
+    /// Registers a party with its roles in one transaction: tax id + duplicate
+    /// check, currency default, the PARTY_CODE number. <paramref name="withRoles"/>
+    /// runs after the role rows are added and before the commit, so a caller can
+    /// fill a role's own columns (the shipping-line screen does) inside the same
+    /// transaction.
+    /// </summary>
+    internal static async Task<Registration> RegisterAsync(
+        MasterDataDbContext db, ITenantContext caller, SavePartyRequest request, IReadOnlyCollection<string> roles,
+        Action<Party>? withRoles, CancellationToken ct)
+    {
         var company = await db.Companies.AsNoTracking()
             .OrderBy(c => c.DefaultCurrency == null).ThenBy(c => c.CompanyCode)
             .Select(c => new { c.CountryCode, c.DefaultCurrency })
             .FirstOrDefaultAsync(ct);
         var countryCode = company?.CountryCode ?? "TH";
 
-        var roles = NormaliseRoles(request.Roles, out var badRole);
-        if (badRole is not null) return MasterDataSupport.InvalidReference("roles", badRole);
-        if (roles.Count == 0) roles = ["CUSTOMER"];
-
         var taxId = Clean(request.TaxId);
         var branchNo = Clean(request.BranchNo);
-        if (ValidateTaxId(taxId, countryCode) is { } taxProblem) return taxProblem;
-        if (await DuplicateAsync(db, taxId, branchNo, exceptPartyId: null, ct) is { } duplicate) return duplicate;
+        if (ValidateTaxId(taxId, countryCode) is { } taxProblem) return new(null, taxProblem);
+        if (await DuplicateAsync(db, taxId, branchNo, exceptPartyId: null, ct) is { } duplicate) return new(null, Problem: duplicate);
 
         // A party with no currency cannot be quoted or invoiced: default it to the
         // tenant's own (org.company), else THB.
         var currency = Clean(request.DefaultCurrency)?.ToUpperInvariant() ?? Clean(company?.DefaultCurrency) ?? "THB";
-        if (await CurrencyProblemAsync(db, currency, ct) is { } currencyProblem) return currencyProblem;
+        if (await CurrencyProblemAsync(db, currency, ct) is { } currencyProblem) return new(null, currencyProblem);
 
         // party_id is NEWSEQUENTIALID() in the database, so it only exists after the
         // party row is inserted; the role rows are keyed on it. Party first, roles
@@ -234,7 +256,7 @@ internal static class PartyEndpoints
 
         var code = await NextPartyCodeAsync(db, ct);
         if (code is null)
-            return MasterDataSupport.InvalidReference("partyCode", "No active PARTY_CODE number series for this tenant.");
+            return new(null, MasterDataSupport.InvalidReference("partyCode", "No active PARTY_CODE number series for this tenant."));
 
         var party = new Party
         {
@@ -250,11 +272,10 @@ internal static class PartyEndpoints
         if (party.PartyId == Guid.Empty) throw new InvalidOperationException("party_id was not read back after insert.");
 
         await SetRolesAsync(db, party, roles, caller.TenantId(), removeOthers: false, ct);
+        withRoles?.Invoke(party);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
-
-        var saved = await db.Parties.AsNoTracking().SingleAsync(p => p.PartyId == party.PartyId, ct);
-        return TypedResults.CreatedAtRoute(await DetailAsync(db, saved, ct), "GetParty", new { partyCode = code });
+        return new(party);
     }
 
     private static async Task<Results<Ok<PartyDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
@@ -289,6 +310,9 @@ internal static class PartyEndpoints
 
         Apply(party, request, taxId, branchNo, isCreate: false);
         if (request.IsActive is { } active) party.IsActive = active;
+        if (roles.Count > 0 && !roles.Contains("SHIPPING_LINE")
+            && await ShippingLineEndpoints.AgentCodesAsync(db, party.PartyId, ct) is { Count: > 0 } agents)
+            return MasterDataSupport.InvalidReference("roles", ShippingLineEndpoints.PrincipalMessage(agents));
         if (roles.Count > 0) await SetRolesAsync(db, party, roles, caller.TenantId(), removeOthers: true, ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
@@ -302,6 +326,8 @@ internal static class PartyEndpoints
         var party = await db.Parties.SingleOrDefaultAsync(p => p.PartyCode == partyCode.FromRouteCode(), ct);
         if (party is null) return TypedResults.NotFound();
         if (db.ExpectVersion(party, rowVersion) is { } missing) return missing;
+        if (await ShippingLineEndpoints.AgentCodesAsync(db, party.PartyId, ct) is { Count: > 0 } agents)
+            return MasterDataSupport.Conflict("The party is still a principal line.", ShippingLineEndpoints.PrincipalMessage(agents));
 
         db.CustomerExtensions.RemoveRange(await db.CustomerExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));
         db.ShippingLineExtensions.RemoveRange(await db.ShippingLineExtensions.Where(e => e.PartyId == party.PartyId).ToListAsync(ct));

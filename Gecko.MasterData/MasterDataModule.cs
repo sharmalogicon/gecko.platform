@@ -67,6 +67,7 @@ public static class MasterDataModule
             .MapConfigEndpoints()
             .MapPartyEndpoints()
             .MapContactEndpoints()
+            .MapShippingLineEndpoints()
             .MapOrgEndpoints();
 
         return endpoints;

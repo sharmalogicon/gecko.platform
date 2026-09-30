@@ -39,6 +39,32 @@ internal static class TestDatabase
     }
 
     /// <summary>
+    /// Synthetic TOS message ids live far above anything the TOS outbox has issued,
+    /// so a test can hand a handler a message without colliding with a real one.
+    /// </summary>
+    public const long SyntheticMessageIdFloor = 9_000_000_000_000;
+
+    /// <summary>
+    /// Removes what the reefer tests fed the projections: ZZTU boxes' sessions and
+    /// stays, and the inbox rows of the synthetic messages. Projection rows have no
+    /// soft delete (gecko_app may not DELETE), so this is the sysadmin door.
+    /// </summary>
+    public static async Task RemoveReeferTestRowsAsync()
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM billing.inbox WHERE source_context = 'TOS' AND message_id >= @floor;
+            DELETE FROM projection.reefer_session WHERE container_no LIKE 'ZZTU%';
+            DELETE FROM projection.container_stay WHERE container_no LIKE 'ZZTU%';
+            """;
+        command.Parameters.AddWithValue("@floor", SyntheticMessageIdFloor);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
     /// Soft-deletes a test tariff and everything under it, whatever its status.
     /// Test-only: production has no way to remove an approved price, by design.
     /// </summary>

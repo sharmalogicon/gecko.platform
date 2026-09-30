@@ -173,6 +173,9 @@ internal static class TestDatabase
             DECLARE @rs TABLE (id UNIQUEIDENTIFIER);
             INSERT @rs SELECT reefer_power_session_id FROM yard.reefer_power_session WHERE container_visit_id IN (SELECT id FROM @cv);
             DELETE FROM outbox.message         WHERE aggregate_type = 'REEFER_SESSION' AND aggregate_id IN (SELECT id FROM @rs);
+            -- Revenue's copy of the sessions (its handler runs in this host too).
+            DELETE FROM gecko_revenue.billing.inbox WHERE source_context = 'TOS' AND aggregate_id IN (SELECT id FROM @rs);
+            DELETE FROM gecko_revenue.projection.reefer_session WHERE session_id IN (SELECT id FROM @rs);
             DELETE FROM yard.reefer_power_session WHERE reefer_power_session_id IN (SELECT id FROM @rs);
             DELETE FROM yard.visit_event       WHERE container_visit_id IN (SELECT id FROM @cv);
             DELETE FROM yard.container_visit   WHERE container_visit_id IN (SELECT id FROM @cv);

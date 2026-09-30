@@ -329,7 +329,7 @@ internal sealed class AutomaticCoupons(
 
             var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);
             // Something is (or may become) payable in cash: that is the window's job.
-            if (quote.Lines.Count > 0 || quote.StorageApplies) continue;
+            if (quote.Lines.Count > 0 || quote.StorageApplies || quote.ReeferApplies) continue;
 
             await RevenueOutbox.EnqueueAsync(db, plan.TenantId, "BOOKING", plan.BookingId, RevenueOutbox.CouponIssued,
                 new CouponIssuedPayload(

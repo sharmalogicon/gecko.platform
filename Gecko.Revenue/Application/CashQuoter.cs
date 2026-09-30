@@ -19,6 +19,7 @@ internal sealed record QuoteLine(
 {
     public const string Movement = "MOVEMENT";
     public const string Storage = "STORAGE";
+    public const string Reefer = "REEFER";
 
     public decimal Total => Amount + TaxAmount;
 }
@@ -29,7 +30,8 @@ internal sealed record TriedVariant(string ChargeCode, string BillTo, string Pay
 internal sealed record MovementQuote(
     Guid BookingContainerId, string? ContainerNo, string MovementCode, string Direction,
     DateOnly? PaidUntil, ContainerStay? Stay, int? StayDays, bool StorageApplies,
-    IReadOnlyList<QuoteLine> Lines, IReadOnlyList<TriedVariant> Tried)
+    IReadOnlyList<QuoteLine> Lines, IReadOnlyList<TriedVariant> Tried,
+    bool ReeferApplies = false, ReeferPowerQuote? Reefer = null)
 {
     public decimal Subtotal => Lines.Sum(l => l.Amount);
     public decimal Tax => Lines.Sum(l => l.TaxAmount);
@@ -54,7 +56,7 @@ internal sealed record MovementQuote(
 /// again; storage already paid is subtracted, so coming back after the paid-until
 /// date quotes only the extra days.
 /// </summary>
-internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences master, ITariffPricing pricing)
+internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences master, ITariffPricing pricing, ReeferPowerQuoter reefer)
 {
     private const string Cash = "CASH";
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
@@ -84,9 +86,10 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             .Select(c => new { c.ChargeCode, c.BillTo, c.PaymentTermCode, c.Amount, c.ServiceTo, c.Quantity })
             .ToListAsync(ct);
 
-        var size = box.EquipmentTypeCode is { Length: > 0 } type
-            ? (await master.EquipmentTypesAsync([type], ct)).GetValueOrDefault(type)?.SizeCode
+        var equipment = box.EquipmentTypeCode is { Length: > 0 } type
+            ? (await master.EquipmentTypesAsync([type], ct)).GetValueOrDefault(type)
             : null;
+        var size = equipment?.SizeCode;
 
         // ── the movement's own charges ──────────────────────────────────────
         var menu = (await master.OrderTypeChargesAsync(plan.OrderTypeCode, ct))
@@ -183,8 +186,63 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             }
         }
 
+        // ── reefer power, on the way out: per started hour plugged in ────────
+        ReeferPowerQuote? power = null;
+        var reeferApplies = false;
+        if (stay is not null)
+        {
+            var sessions = await db.ReeferSessions.AsNoTracking()
+                .Where(r => r.InGateTransactionId == stay.InGateTransactionId)
+                .ToListAsync(ct);
+            if (sessions.Count > 0 || box.IsReefer || equipment?.IsReefer == true)
+            {
+                var typeCode = sessions.Select(r => r.EquipmentTypeCode).FirstOrDefault(t => t is not null)
+                               ?? stay.EquipmentTypeCode ?? box.EquipmentTypeCode;
+                power = await reefer.QuoteAsync(sessions,
+                    new ReeferPricingContext(plan.BranchId, stay.ContainerNo, typeCode, plan, box, step.MovementCode, step.Direction, step.FullEmpty),
+                    now, ct);
+                // A reefer box whose power the tariff prices must come to the window,
+                // even at 0 hours so far — no automatic coupon for it. A rate that is not
+                // set charges nothing and holds nothing.
+                reeferApplies = power.RateAvailable;
+                AddReefer(power, plan, settled.Select(s => (s.ChargeCode, s.BillTo)).ToList(), lines, tried);
+            }
+        }
+
         return new MovementQuote(box.BookingContainerId, box.ContainerNo, step.MovementCode, step.Direction,
-            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried);
+            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power);
+    }
+
+    /// <summary>
+    /// The priced reefer variants become lines (quantity = billable hours); everything
+    /// else goes in the trail with its reason, as an unpriced storage variant does —
+    /// never on the receipt. Reefer power is paid once per box × movement: a variant
+    /// already settled is not quoted again (the coupon it paid for is already out).
+    /// </summary>
+    private static void AddReefer(ReeferPowerQuote power, BookingPlan plan, List<(string ChargeCode, string BillTo)> settled,
+        List<QuoteLine> lines, List<TriedVariant> tried)
+    {
+        if (power.Outcome == ReeferOutcomes.NoSessions) return;
+        if (power.Outcome == ReeferOutcomes.ChargeCodeNotSet)
+        {
+            tried.Add(new TriedVariant(ReeferPowerQuoter.ChargeType, "-", Cash, power.Outcome, null, [power.Message]));
+            return;
+        }
+
+        foreach (var v in power.Variants)
+        {
+            var trail = v.Trail.Append($"{power.BillableHours} started hour(s), {power.MinutesPlugged} min plugged in over {power.Sessions} session(s).").ToList();
+            if (settled.Contains((v.Variant.ChargeCode, v.Variant.BillTo)))
+            {
+                tried.Add(new TriedVariant(v.Variant.ChargeCode, v.Variant.BillTo, Cash, "SETTLED", null, trail));
+                continue;
+            }
+            tried.Add(new TriedVariant(v.Variant.ChargeCode, v.Variant.BillTo, Cash, v.Outcome, v.Amount, trail));
+            if (v.Outcome != ReeferOutcomes.Priced) continue;
+
+            lines.Add(Line(QuoteLine.Reefer, v.Variant, PayerFor(plan, v.Variant.BillTo), power.BillableHours,
+                v.Price!.UnitRate, v.Amount!.Value, v.Price, null, null));
+        }
     }
 
     private static PriceRequest Request(BookingPlan plan, BookingPlanContainer box, OrderTypeStepRef step, string? size,

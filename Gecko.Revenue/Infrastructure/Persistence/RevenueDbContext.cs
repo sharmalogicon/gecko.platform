@@ -58,6 +58,8 @@ public partial class RevenueDbContext : DbContext
 
     public virtual DbSet<ReceiptPayment> ReceiptPayments { get; set; }
 
+    public virtual DbSet<ReeferSession> ReeferSessions { get; set; }
+
     public virtual DbSet<Schedule> Schedules { get; set; }
 
     public virtual DbSet<Shift> Shifts { get; set; }
@@ -293,7 +295,7 @@ public partial class RevenueDbContext : DbContext
                 .IsUnique()
                 .HasFilter("([source]='STORAGE' AND [status]<>'CANCELLED')");
 
-            entity.HasIndex(e => new { e.TenantId, e.BookingContainerId, e.MovementCode, e.ChargeCode, e.BillTo, e.PaymentTermCode }, "uq_charge__window")
+            entity.HasIndex(e => new { e.TenantId, e.BookingContainerId, e.MovementCode, e.ChargeCode, e.BillTo, e.PaymentTermCode, e.ServiceFrom }, "uq_charge__window")
                 .IsUnique()
                 .HasFilter("([source]='WINDOW' AND [status]<>'CANCELLED')");
 
@@ -1410,6 +1412,60 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.TenderedAmount)
                 .HasColumnType("decimal(18, 2)")
                 .HasColumnName("tendered_amount");
+        });
+
+        modelBuilder.Entity<ReeferSession>(entity =>
+        {
+            entity.HasKey(e => e.SessionId).HasName("pk_reefer_session");
+
+            entity.ToTable("reefer_session", "projection");
+
+            entity.HasIndex(e => new { e.TenantId, e.InGateTransactionId }, "ix_reefer_session__stay").HasFilter("([in_gate_transaction_id] IS NOT NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.ContainerVisitId }, "ix_reefer_session__visit");
+
+            entity.Property(e => e.SessionId)
+                .ValueGeneratedNever()
+                .HasColumnName("session_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.CloseGateTransactionId).HasColumnName("close_gate_transaction_id");
+            entity.Property(e => e.CloseReason)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("close_reason");
+            entity.Property(e => e.ContainerNo)
+                .HasMaxLength(11)
+                .IsUnicode(false)
+                .HasColumnName("container_no");
+            entity.Property(e => e.ContainerVisitId).HasColumnName("container_visit_id");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_reefer_session__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.EquipmentTypeCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("equipment_type_code");
+            entity.Property(e => e.InGateTransactionId).HasColumnName("in_gate_transaction_id");
+            entity.Property(e => e.IsVoided).HasColumnName("is_voided");
+            entity.Property(e => e.LastChangedAt).HasColumnName("last_changed_at");
+            entity.Property(e => e.LastMessageId).HasColumnName("last_message_id");
+            entity.Property(e => e.LastMessageType)
+                .HasMaxLength(50)
+                .IsUnicode(false)
+                .HasColumnName("last_message_type");
+            entity.Property(e => e.PayloadJson).HasColumnName("payload_json");
+            entity.Property(e => e.PluggedInAt).HasColumnName("plugged_in_at");
+            entity.Property(e => e.PluggedInBy).HasColumnName("plugged_in_by");
+            entity.Property(e => e.PluggedOutAt).HasColumnName("plugged_out_at");
+            entity.Property(e => e.PluggedOutBy).HasColumnName("plugged_out_by");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_reefer_session__updated_at")
+                .HasColumnName("updated_at");
         });
 
         modelBuilder.Entity<Schedule>(entity =>

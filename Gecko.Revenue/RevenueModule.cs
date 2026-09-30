@@ -1,6 +1,7 @@
 using Gecko.Data;
 using Gecko.Revenue.Application;
 using Gecko.Revenue.Endpoints.Imports;
+using Gecko.Revenue.Endpoints.Reefer;
 using Gecko.Revenue.Endpoints.Tariffs;
 using Gecko.Revenue.Endpoints.Window;
 using Gecko.Revenue.Infrastructure.Persistence;
@@ -49,6 +50,7 @@ public static class RevenueModule
         services.AddScoped<Contracts.ITariffPricing, TariffPricer>();
 
         // Phase 6, clock 1 — the cash window (PLAN_BILLING §4.2).
+        services.AddScoped<ReeferPowerQuoter>();
         services.AddScoped<CashQuoter>();
         services.AddScoped<WindowService>();
         services.AddScoped<ReceiptDocument>();
@@ -57,6 +59,7 @@ public static class RevenueModule
         // What Revenue hears from TOS, off gecko_tos's outbox (ADR-007: it never reads gecko_tos).
         services.AddScoped<IOutboxHandler, BookingChangedHandler>();
         services.AddScoped<IOutboxHandler, GateEventHandler>();
+        services.AddScoped<IOutboxHandler, ReeferSessionHandler>();
 
         return services;
     }
@@ -69,7 +72,8 @@ public static class RevenueModule
             .MapPricingEndpoints()
             .MapLookupEndpoints()
             .MapImportEndpoints()
-            .MapWindowEndpoints();
+            .MapWindowEndpoints()
+            .MapReeferPowerEndpoints();
 
         return endpoints;
     }

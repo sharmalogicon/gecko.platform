@@ -529,7 +529,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             ChargeId = Guid.CreateVersion7(), TenantId = plan.TenantId, BranchId = plan.BranchId, Source = ChargeSource.Window,
             BookingId = plan.BookingId, OrderNo = plan.OrderNo, BookingContainerId = box.Box.BookingContainerId,
             ContainerNo = box.Box.ContainerNo, MovementCode = box.Quote!.MovementCode,
-            ContainerStayId = line.Kind == QuoteLine.Storage ? box.Quote.Stay?.ContainerStayId : null,
+            ContainerStayId = line.Kind is QuoteLine.Storage or QuoteLine.Reefer ? box.Quote.Stay?.ContainerStayId : null,
             ServiceFrom = line.ServiceFrom, ServiceTo = line.ServiceTo,
             ChargeCodeId = line.ChargeCodeId, ChargeCode = line.ChargeCode, ChargeName = line.ChargeName,
             BillTo = line.BillTo, PaymentTermCode = line.PaymentTermCode, PayerPartyCode = line.PayerPartyCode,
@@ -571,5 +571,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
     private static string Describe(QuoteLine line) =>
         line.Kind == QuoteLine.Storage && line.ServiceFrom is { } from && line.ServiceTo is { } to
             ? $"{line.ChargeName} {from:dd/MM} - {to:dd/MM} ({line.Quantity:0} chargeable days)"
-            : line.ChargeName;
+            : line.Kind == QuoteLine.Reefer
+                ? $"{line.ChargeName} ({line.Quantity:0} h plugged in)"
+                : line.ChargeName;
 }

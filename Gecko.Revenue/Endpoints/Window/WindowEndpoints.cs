@@ -26,6 +26,7 @@ namespace Gecko.Revenue.Endpoints.Window;
 ///   POST /window/receipts               take the money → RCT number → coupon
 ///   GET  /window/receipts/{id}          one receipt, as printed
 ///   GET  /window/receipts/{id}/receipt.pdf   the A4 receipt / tax invoice
+///   POST /window/receipts/{id}/void     undo a wrong receipt before the box moves (revenue.receipt.void)
 ///   POST /window/waive                  forgive one line, by name, with a reason
 ///
 /// A receipt is written in ONE transaction: the gap-free number, the PAID charges
@@ -60,6 +61,8 @@ internal static class WindowEndpoints
             .WithSummary("One receipt, as printed");
         window.MapGet("/receipts/{id:guid}/receipt.pdf", ReceiptPdfAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("The receipt as an A4 Thai full tax invoice (ใบเสร็จรับเงิน/ใบกำกับภาษี); a voided one prints with VOID");
+        window.MapPost("/receipts/{id:guid}/void", VoidReceiptAsync).RequireBranchPermission(RevenuePermissions.ReceiptVoid)
+            .WithSummary("Void a wrong receipt before the box has moved: it keeps its number, its charges are cancelled, its coupons are withdrawn");
         window.MapPost("/waive", WaiveAsync).RequireBranchPermission(RevenuePermissions.ChargeWaive)
             .WithSummary("Waive one quoted line, with a reason; if nothing is left to pay, the box is released");
 
@@ -99,13 +102,18 @@ internal static class WindowEndpoints
             b.Quote?.Total ?? 0, b.Note)).ToList();
 
         var lines = boxes.SelectMany(b => b.Quote?.Lines ?? []).ToList();
+        var unreplaced = await db.Receipts.AsNoTracking()
+            .Where(r => r.BookingId == plan.BookingId && r.Status == "VOIDED" && !db.Receipts.Any(n => n.ReplacesReceiptId == r.ReceiptId))
+            .OrderByDescending(r => r.VoidedAt)
+            .Select(r => new VoidedReceiptResponse(r.ReceiptId, r.ReceiptNo, r.VoidedAt, r.VoidReason, r.TotalAmount))
+            .ToListAsync(ct);
         return TypedResults.Ok(new WindowBookingResponse(
             plan.BookingId, plan.BranchId, plan.OrderNo, plan.Status, plan.OrderTypeCode,
             plan.CustomerPartyCode, plan.AgentPartyCode, plan.LineCode,
             boxes.Select(b => b.Quote?.PaidUntil).FirstOrDefault(d => d is not null),
             context.Branch.LocalDate(context.Now),
             responses, lines.Sum(l => l.Amount), lines.Sum(l => l.TaxAmount), lines.Sum(l => l.Total),
-            lines.Select(l => l.CurrencyCode).FirstOrDefault()));
+            lines.Select(l => l.CurrencyCode).FirstOrDefault(), unreplaced));
     }
 
     // ── the drawer ──────────────────────────────────────────────────────────
@@ -249,6 +257,17 @@ internal static class WindowEndpoints
         if (paid != total)
             return RevenueSupport.Invalid("payments", $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2}.");
 
+        if (request.ReplacesReceiptId is { } replacesId)
+        {
+            var replaced = await db.Receipts.AsNoTracking().SingleOrDefaultAsync(r => r.ReceiptId == replacesId, ct);
+            if (replaced is null || replaced.BookingId != plan.BookingId)
+                return RevenueSupport.Invalid("replacesReceiptId", $"Not a receipt of {plan.OrderNo}.");
+            if (replaced.Status != "VOIDED")
+                return RevenueSupport.Invalid("replacesReceiptId", $"{replaced.ReceiptNo} is not voided; only a voided receipt is replaced.");
+            if (await db.Receipts.AnyAsync(r => r.ReplacesReceiptId == replacesId, ct))
+                return RevenueSupport.Conflict($"{replaced.ReceiptNo} has already been replaced.");
+        }
+
         var payerName = request.Payer?.Name?.Trim();
         if (string.IsNullOrEmpty(payerName) && plan.CustomerPartyCode is { } customer)
             payerName = (await master.PartiesAsync([customer], ct)).GetValueOrDefault(customer)?.Name;
@@ -256,7 +275,7 @@ internal static class WindowEndpoints
         try
         {
             var (receipt, coupons) = await window.IssueReceiptAsync(context, shift, payable, request.Payments!,
-                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, ct);
+                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, request.ReplacesReceiptId, ct);
             return TypedResults.Created($"/api/revenue/window/receipts/{receipt.ReceiptId}",
                 (await document.ReadAsync(receipt.ReceiptId, ct,
                     coupons.Select(c => new CouponResponse(c.CouponRef, c.ContainerNo, c.MovementCode, c.ValidUntil)).ToList()))!);
@@ -288,6 +307,68 @@ internal static class WindowEndpoints
         return rendered is null
             ? TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." })
             : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
+    }
+
+    // ── voiding ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// INVOICING_PROPOSAL part A. A receipt keyed wrong (customer, box, amount) is
+    /// voided, not edited: it keeps its number and prints VOID, its charges become
+    /// CANCELLED (so the window quotes them again), and each coupon it issued is
+    /// withdrawn at the barrier. The customer then pays on a new receipt that names
+    /// this one. Refused once any of its charges is EARNED — the box went through on
+    /// it, the move happened, and the fix is a credit note, not a void.
+    ///
+    /// Known gap: a gate event reaches Revenue a few seconds after the barrier. A void
+    /// in that window goes through here, and TOS logs the coupon as spent-then-revoked.
+    /// </summary>
+    private static async Task<Results<Ok<ReceiptResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>> VoidReceiptAsync(
+        Guid id, VoidReceiptRequest request, RevenueDbContext db, ReceiptDocument document, ITenantContext caller,
+        ICallerPermissions permissions, TimeProvider clock, CancellationToken ct)
+    {
+        var receipt = await db.Receipts.AsNoTracking().SingleOrDefaultAsync(r => r.ReceiptId == id, ct);
+        if (receipt is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });
+        if (!permissions.HasAt(RevenuePermissions.ReceiptVoid, receipt.BranchId)) return TypedResults.Forbid();
+
+        var reason = request.Reason?.Trim() ?? "";
+        if (reason.Length < 5) return RevenueSupport.Invalid("reason", "Say what was wrong — it is kept on the receipt and printed with VOID.");
+        if (reason.Length > 300) return RevenueSupport.Invalid("reason", "At most 300 characters.");
+        if (receipt.Status == "VOIDED") return RevenueSupport.Conflict($"{receipt.ReceiptNo} is already voided.");
+
+        var charges = await db.Charges.Where(c => c.ReceiptId == id).ToListAsync(ct);
+        var moved = charges.Where(c => c.Status == ChargeStatus.Earned).Select(c => c.ContainerNo ?? c.MovementCode).Distinct().ToList();
+        if (moved.Count > 0)
+            return RevenueSupport.Conflict($"{receipt.ReceiptNo} cannot be voided: the box has already moved on it.",
+                $"{string.Join(", ", moved)} went through the gate on this receipt. The fix is a credit note, not a void.");
+
+        var now = clock.GetUtcNow();
+        var by = caller.UserId();
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
+        // Only the void columns may change on a receipt (15_cashier grants), and only once.
+        var voided = await db.Receipts.Where(r => r.ReceiptId == id && r.Status == "ISSUED")
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Status, "VOIDED").SetProperty(r => r.VoidedAt, now)
+                .SetProperty(r => r.VoidedBy, by).SetProperty(r => r.VoidReason, reason)
+                .SetProperty(r => r.UpdatedAt, now).SetProperty(r => r.UpdatedBy, by), ct);
+        if (voided == 0) return RevenueSupport.Conflict($"{receipt.ReceiptNo} was voided a moment ago.");
+
+        foreach (var charge in charges.Where(c => c.Status == ChargeStatus.Paid))
+        {
+            charge.Status = ChargeStatus.Cancelled;
+            charge.CancelledAt = now;
+            charge.CancelledBy = by;
+            charge.CancelReason = $"Receipt {receipt.ReceiptNo} voided: {reason}";
+            charge.UpdatedAt = now;
+        }
+        await db.SaveChangesAsync(ct);
+
+        foreach (var couponRef in charges.Select(c => c.CouponRef).OfType<string>().Distinct())
+            await RevenueOutbox.EnqueueAsync(db, receipt.TenantId, "RECEIPT", receipt.ReceiptId, RevenueOutbox.CouponRevoked,
+                new CouponRevokedPayload(null, couponRef, by, $"Receipt {receipt.ReceiptNo} voided: {reason}"), ct);
+        await transaction.CommitAsync(ct);
+
+        return TypedResults.Ok((await document.ReadAsync(id, ct))!);
     }
 
     // ── waiving ─────────────────────────────────────────────────────────────
@@ -408,7 +489,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
     }
 
     public async Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(WindowContext context, Shift shift, List<QuotedBox> payable,
-        IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, CancellationToken ct)
+        IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct)
     {
         var plan = context.Plan;
         var now = context.Now;
@@ -427,7 +508,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             PayerBranchNo = payer?.BranchNo?.Trim(), PayerAddress = payer?.Address?.Trim(),
             CurrencyCode = payable.Select(b => b.Quote!.CurrencyCode).First() ?? "THB",
             SubtotalAmount = payable.Sum(b => b.Quote!.Subtotal), TaxAmount = payable.Sum(b => b.Quote!.Tax),
-            Status = "ISSUED",
+            Status = "ISSUED", ReplacesReceiptId = replacesReceiptId,
         };
         receipt.TotalAmount = receipt.SubtotalAmount + receipt.TaxAmount;
         db.Receipts.Add(receipt);

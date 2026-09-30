@@ -4,10 +4,14 @@ namespace Gecko.Revenue.Endpoints.Window;
 
 /// <param name="PaidUntil">The storage date the quote was made to (null when no box carries storage).</param>
 /// <param name="Today">The depot's calendar day now (branch time zone) — the earliest "paid until" the window accepts.</param>
+/// <param name="VoidedReceipts">This booking's voided receipts that no receipt replaces yet — the ones a new payment may name.</param>
 public sealed record WindowBookingResponse(
     Guid BookingId, Guid BranchId, string OrderNo, string Status, string OrderTypeCode,
     string? CustomerCode, string? AgentCode, string? LineCode, DateOnly? PaidUntil, DateOnly Today,
-    IReadOnlyList<WindowBoxResponse> Boxes, decimal Subtotal, decimal Tax, decimal Total, string? CurrencyCode);
+    IReadOnlyList<WindowBoxResponse> Boxes, decimal Subtotal, decimal Tax, decimal Total, string? CurrencyCode,
+    IReadOnlyList<VoidedReceiptResponse>? VoidedReceipts = null);
+
+public sealed record VoidedReceiptResponse(Guid ReceiptId, string ReceiptNo, DateTimeOffset? VoidedAt, string? VoidReason, decimal Total);
 
 /// <param name="Note">Why nothing is due, when nothing is (not billable, nothing pending, already paid…).</param>
 public sealed record WindowBoxResponse(
@@ -54,9 +58,13 @@ public sealed record ShiftReceiptResponse(
 /// <param name="BookingContainerIds">The boxes being paid for; each is charged for its NEXT billable movement.</param>
 /// <param name="PaidUntil">For a gate-out: the last day of storage paid for (defaults to today). The coupon expires at the end of it.</param>
 /// <param name="ExpectedTotal">The total the cashier saw. Prices are recalculated here; a different answer is refused, never silently charged.</param>
+/// <param name="ReplacesReceiptId">Paying again after a void: the VOIDED receipt of the same booking this one replaces (printed on it). Each is replaced once.</param>
 public sealed record CreateReceiptRequest(
     Guid BookingId, IReadOnlyList<Guid> BookingContainerIds, DateOnly? PaidUntil,
-    PayerRequest? Payer, IReadOnlyList<PaymentRequest> Payments, decimal ExpectedTotal);
+    PayerRequest? Payer, IReadOnlyList<PaymentRequest> Payments, decimal ExpectedTotal, Guid? ReplacesReceiptId = null);
+
+/// <summary>Why the receipt is wrong — kept on it and printed with VOID.</summary>
+public sealed record VoidReceiptRequest(string Reason);
 
 /// <summary>What the tax invoice prints for the buyer. Defaults to the booking's customer.</summary>
 public sealed record PayerRequest(string? Name, string? TaxId, string? BranchNo, string? Address);
@@ -73,7 +81,8 @@ public sealed record ReceiptResponse(
     IReadOnlyList<CouponResponse> Coupons,
     Guid BranchId, string? BranchCode, string? PayerBranchNo, string? PayerAddress,
     Guid ShiftId, Guid CashierUserId, SellerResponse? Seller,
-    DateTimeOffset? VoidedAt, string? VoidReason);
+    DateTimeOffset? VoidedAt, string? VoidReason,
+    string? ReplacesReceiptNo = null, string? ReplacedByReceiptNo = null);
 
 /// <summary>
 /// The seller block of the tax invoice, exactly as MDM holds it. A null field is

@@ -30,17 +30,18 @@ public class RoleApiTests(ApiFactory api)
         }
 
         Assert.Equal(
-            ["revenue.cash.collect", "revenue.charge.view", "revenue.charge.waive", "revenue.import.manage", "revenue.tariff.approve", "revenue.tariff.manage", "revenue.tariff.view"],
+            ["revenue.cash.collect", "revenue.charge.view", "revenue.charge.waive", "revenue.import.manage", "revenue.receipt.void", "revenue.tariff.approve", "revenue.tariff.manage", "revenue.tariff.view"],
             await RevenuePermissionsOf("TENANT_OWNER"));
         Assert.Equal(
-            ["revenue.cash.collect", "revenue.charge.view", "revenue.charge.waive", "revenue.import.manage", "revenue.tariff.manage", "revenue.tariff.view"],
+            ["revenue.cash.collect", "revenue.charge.view", "revenue.charge.waive", "revenue.import.manage", "revenue.receipt.void", "revenue.tariff.manage", "revenue.tariff.view"],
             await RevenuePermissionsOf("ACCOUNTS"));
         // 18_cashier_permissions.sql: the gate clerk takes the money at the window
         // but may not forgive it — waiving is a supervisor's act. 22_charge_view_permission.sql:
         // the charge register and the receipts report are the owner's, ops manager's and
-        // accounts'; the clerk sees money only at the window.
+        // accounts'; the clerk sees money only at the window. 23_receipt_void_permission.sql:
+        // undoing a receipt is theirs too — the clerk takes money but does not undo it.
         Assert.Equal(["revenue.cash.collect", "revenue.tariff.view"], await RevenuePermissionsOf("GATE_CLERK"));
-        Assert.Equal(["revenue.charge.view", "revenue.charge.waive", "revenue.tariff.view"], await RevenuePermissionsOf("OPS_MANAGER"));
+        Assert.Equal(["revenue.charge.view", "revenue.charge.waive", "revenue.receipt.void", "revenue.tariff.view"], await RevenuePermissionsOf("OPS_MANAGER"));
         Assert.Empty(await RevenuePermissionsOf("EDI_COORDINATOR"));
 
         // Decision (a), 2026-09-17: accounts staff hold ACCOUNTS tenant-wide, because

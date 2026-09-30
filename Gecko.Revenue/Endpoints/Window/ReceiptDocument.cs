@@ -50,6 +50,12 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
         var branch = await calendar.BranchAsync(receipt.BranchId, ct);
         var seller = await master.InvoicingCompanyAsync(receipt.BranchId, ct);
 
+        // A void and its replacement name each other (cashier.receipt.replaces_receipt_id).
+        var replaces = receipt.ReplacesReceiptId is { } replacedId
+            ? await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == replacedId).Select(r => r.ReceiptNo).SingleOrDefaultAsync(ct)
+            : null;
+        var replacedBy = await db.Receipts.AsNoTracking().Where(r => r.ReplacesReceiptId == receiptId).Select(r => r.ReceiptNo).SingleOrDefaultAsync(ct);
+
         return new ReceiptResponse(receipt.ReceiptId, receipt.ReceiptNo,
             branch is null ? receipt.ReceiptAt : branch.Local(receipt.ReceiptAt),
             receipt.Status, receipt.OrderNo ?? "",
@@ -64,7 +70,8 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
             receipt.ShiftId, receipt.CashierUserId,
             seller is null ? null : new SellerResponse(seller.CompanyCode, seller.LegalNameEn, seller.LegalNameLocal,
                 seller.TaxId, seller.TaxBranchNo, seller.IsHeadOffice, seller.Address, seller.Phone, seller.Email),
-            receipt.VoidedAt is { } voided && branch is not null ? branch.Local(voided) : receipt.VoidedAt, receipt.VoidReason);
+            receipt.VoidedAt is { } voided && branch is not null ? branch.Local(voided) : receipt.VoidedAt, receipt.VoidReason,
+            replaces, replacedBy);
     }
 
     public async Task<Rendered?> RenderAsync(Guid receiptId, CancellationToken ct)
@@ -255,6 +262,10 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
                 if (voided)
                     body.Item().Text($"VOIDED {r.VoidedAt?.ToString("dd MMM yyyy HH:mm", CultureInfo.InvariantCulture)} — {r.VoidReason}").Italic()
                         .FontColor(Colors.Red.Darken2);
+                if (r.ReplacedByReceiptNo is { } by)
+                    body.Item().Text($"แทนที่ด้วย / Replaced by {by}").Italic();
+                if (r.ReplacesReceiptNo is { } replaced)
+                    body.Item().Text($"ออกแทนใบเสร็จเลขที่ / Replaces receipt {replaced} (voided)").Italic();
 
                 body.Item().PaddingTop(30).Row(sign =>
                 {

@@ -21,6 +21,9 @@ internal static class RevenuePermissions
 
     /// <summary>gecko_identity 22_charge_view_permission.sql — read the charge register and the unbilled lines. Branch-scoped through `bpm`.</summary>
     public const string ChargeView = "revenue.charge.view";
+
+    /// <summary>gecko_identity 23_receipt_void_permission.sql — void a wrong cash receipt before the box has moved.</summary>
+    public const string ReceiptVoid = "revenue.receipt.void";
 }
 
 internal static class RevenueSupport

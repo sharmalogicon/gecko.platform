@@ -86,7 +86,11 @@ internal sealed class CouponHandler(TosDbContext db, TimeProvider clock, ILogger
         var revoke = JsonSerializer.Deserialize<CouponRevoked>(message.PayloadJson, Payload)
                      ?? throw new InvalidOperationException($"Outbox message {message.MessageId} carries no revocation.");
 
-        var coupon = await db.GateAuthorizations.SingleOrDefaultAsync(a => a.SourceEventId == revoke.CouponId, ct);
+        // By id when Revenue has it; a voided receipt only knows the coupon's ref (unique per tenant).
+        var coupon = revoke.CouponId is { } id
+            ? await db.GateAuthorizations.SingleOrDefaultAsync(a => a.SourceEventId == id, ct)
+            : string.IsNullOrWhiteSpace(revoke.CouponRef) ? null
+            : await db.GateAuthorizations.SingleOrDefaultAsync(a => a.CouponRef == revoke.CouponRef, ct);
         if (coupon is null || coupon.RevokedAt is not null)
             return;
 
@@ -112,5 +116,5 @@ internal sealed class CouponHandler(TosDbContext db, TimeProvider clock, ILogger
         string CouponRef, string Channel, decimal? Amount, string? CurrencyCode,
         DateTimeOffset ValidFrom, DateTimeOffset ValidUntil, Guid? IssuedBy);
 
-    private sealed record CouponRevoked(Guid CouponId, Guid RevokedBy, string Reason);
+    private sealed record CouponRevoked(Guid? CouponId, string? CouponRef, Guid RevokedBy, string Reason);
 }

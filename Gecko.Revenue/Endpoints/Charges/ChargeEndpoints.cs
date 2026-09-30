@@ -7,6 +7,7 @@ using Gecko.SharedKernel;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.EntityFrameworkCore;
 
@@ -20,6 +21,8 @@ namespace Gecko.Revenue.Endpoints.Charges;
 ///                           status, source, payer, charge code, box, order, date.
 ///   GET /charges/unbilled   the credit lines not yet invoiced (status UNBILLED),
 ///                           totalled per payer (billing/unbilled).
+///   GET /charges/statement  one booking's statement (billing/statement): every
+///                           box with its charge lines, and the receipts that paid them.
 ///
 /// A cash depot's lines are PAID / EARNED / WAIVED; UNBILLED comes from credit
 /// accrual at the gate (PLAN_BILLING 6.3), so the unbilled read is empty until
@@ -38,6 +41,8 @@ internal static class ChargeEndpoints
             .WithSummary("The charge register: priced lines with their status, payer, box and price source");
         charges.MapGet("/unbilled", UnbilledAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Credit lines not yet invoiced (UNBILLED), totalled per payer");
+        charges.MapGet("/statement", StatementAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("One booking's statement: each box with its charge lines, and the receipts that paid them");
 
         return revenue;
     }
@@ -105,6 +110,75 @@ internal static class ChargeEndpoints
         return TypedResults.Ok(new UnbilledResponse(
             clock.GetUtcNow(), branchId, list.Sum(p => p.Lines), list.Sum(p => p.Amount), list.Sum(p => p.Tax), list.Sum(p => p.Total),
             list));
+    }
+
+    /// <summary>
+    /// INVOICING_PROPOSAL part D, replacing Vector's BookingStatement: read-only. A
+    /// discount is a tariff or a waiver, never an edit to a line, so nothing here
+    /// changes a price. Boxes come from Revenue's copy of the booking, including boxes
+    /// that have left it; a line whose box is unknown is listed under no box.
+    /// </summary>
+    private static async Task<Results<Ok<BookingStatementResponse>, NotFound<ProblemDetails>, ValidationProblem, ProblemHttpResult>> StatementAsync(
+        string? orderNo, RevenueDbContext db, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct)
+    {
+        var order = orderNo?.Trim();
+        if (string.IsNullOrEmpty(order)) return RevenueSupport.Invalid("orderNo", "Which booking? Its order number.");
+
+        var plan = await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.OrderNo == order, ct);
+        if (plan is null)
+            return TypedResults.NotFound(new ProblemDetails
+            {
+                Title = $"'{order}' is not a booking Revenue knows.",
+                Detail = "Revenue learns bookings from TOS. A booking made a moment ago may still be on its way.",
+            });
+        if (!scope.HasAt(RevenuePermissions.ChargeView, plan.BranchId))
+            return TypedResults.Problem(title: "Outside your branches", detail: "That booking is at a depot you do not cover.",
+                statusCode: StatusCodes.Status403Forbidden);
+
+        var boxes = await db.BookingPlanContainers.AsNoTracking().Where(b => b.BookingId == plan.BookingId)
+            .OrderBy(b => b.ContainerNo).ToListAsync(ct);
+        var lines = await db.Charges.AsNoTracking().Where(c => c.BookingId == plan.BookingId)
+            .OrderBy(c => c.CreatedAt).ThenBy(c => c.ChargeCode).ToListAsync(ct);
+        var receipts = await db.Receipts.AsNoTracking().Where(r => r.BookingId == plan.BookingId)
+            .OrderBy(r => r.ReceiptAt).ToListAsync(ct);
+        var receiptNo = receipts.ToDictionary(r => r.ReceiptId, r => r.ReceiptNo);
+
+        var names = await PayerNamesAsync(master, lines.Select(c => c.PayerPartyCode).Append(plan.CustomerPartyCode), ct);
+
+        StatementTotals Totals(IEnumerable<Charge> set)
+        {
+            var list = set.ToList();
+            decimal Sum(params string[] statuses) => list.Where(c => statuses.Contains(c.Status)).Sum(c => c.Amount + c.TaxAmount);
+            return new StatementTotals(Sum("PAID", "EARNED"), Sum("WAIVED"), Sum("UNBILLED"), Sum("INVOICED"), Sum("CANCELLED"));
+        }
+
+        StatementLineResponse Line(Charge c) => new(ToResponse(c, names),
+            c.ReceiptId is { } rid ? receiptNo.GetValueOrDefault(rid) : null);
+
+        var known = boxes.Select(b => b.BookingContainerId).ToHashSet();
+        var boxRows = boxes.Select(b =>
+        {
+            var mine = lines.Where(c => c.BookingContainerId == b.BookingContainerId).ToList();
+            return new StatementBoxResponse(b.BookingContainerId, b.ContainerNo, b.EquipmentTypeCode, b.IsCurrent, b.EndReason,
+                mine.Select(Line).ToList(), Totals(mine));
+        }).ToList();
+        var loose = lines.Where(c => c.BookingContainerId is not { } id || !known.Contains(id)).ToList();
+        if (loose.Count > 0)
+            boxRows.Add(new StatementBoxResponse(null, null, null, false, null, loose.Select(Line).ToList(), Totals(loose)));
+
+        var replacedBy = receipts.Where(r => r.ReplacesReceiptId is not null)
+            .ToDictionary(r => r.ReplacesReceiptId!.Value, r => r.ReceiptNo);
+
+        return TypedResults.Ok(new BookingStatementResponse(
+            plan.BookingId, plan.OrderNo, plan.BranchId, plan.Status, plan.OrderTypeCode,
+            plan.CustomerPartyCode, plan.CustomerPartyCode is { } cust ? names.GetValueOrDefault(cust) : null,
+            boxRows,
+            receipts.Select(r => new StatementReceiptResponse(
+                r.ReceiptId, r.ReceiptNo, r.ReceiptAt, r.Status, r.PayerName, r.CurrencyCode, r.SubtotalAmount, r.TaxAmount, r.TotalAmount,
+                r.VoidedAt, r.VoidReason,
+                r.ReplacesReceiptId is { } rep ? receiptNo.GetValueOrDefault(rep) : null,
+                replacedBy.GetValueOrDefault(r.ReceiptId))).ToList(),
+            Totals(lines)));
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -181,6 +255,27 @@ public sealed record ChargeResponse(
 public sealed record UnbilledPayerResponse(
     string? PayerCode, string? PayerName, string BillTo, string CurrencyCode,
     int Lines, int Boxes, decimal Amount, decimal Tax, decimal Total, DateTimeOffset Oldest, DateTimeOffset Newest);
+
+/// <summary>Money on a booking by where it is: paid (incl. earned), waived, unbilled, invoiced, cancelled — each with VAT.</summary>
+public sealed record StatementTotals(decimal Paid, decimal Waived, decimal Unbilled, decimal Invoiced, decimal Cancelled);
+
+/// <summary>A charge line, and the number of the receipt that paid it (a voided one included).</summary>
+public sealed record StatementLineResponse(ChargeResponse Charge, string? ReceiptNo);
+
+/// <summary><c>BookingContainerId</c> null = lines whose box Revenue does not know on this booking.</summary>
+public sealed record StatementBoxResponse(
+    Guid? BookingContainerId, string? ContainerNo, string? EquipmentTypeCode, bool IsCurrent, string? EndReason,
+    IReadOnlyList<StatementLineResponse> Lines, StatementTotals Totals);
+
+public sealed record StatementReceiptResponse(
+    Guid ReceiptId, string ReceiptNo, DateTimeOffset ReceiptAt, string Status, string PayerName, string CurrencyCode,
+    decimal Subtotal, decimal Tax, decimal Total, DateTimeOffset? VoidedAt, string? VoidReason,
+    string? ReplacesReceiptNo, string? ReplacedByReceiptNo);
+
+public sealed record BookingStatementResponse(
+    Guid BookingId, string OrderNo, Guid BranchId, string BookingStatus, string OrderTypeCode,
+    string? CustomerCode, string? CustomerName,
+    IReadOnlyList<StatementBoxResponse> Boxes, IReadOnlyList<StatementReceiptResponse> Receipts, StatementTotals Totals);
 
 /// <summary>Totals add across currencies only when there is one; the page shows them per payer.</summary>
 public sealed record UnbilledResponse(

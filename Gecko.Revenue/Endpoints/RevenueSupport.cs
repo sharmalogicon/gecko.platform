@@ -18,6 +18,9 @@ internal static class RevenuePermissions
 
     /// <summary>gecko_identity 18_cashier_permissions.sql — forgive a quoted line, with a reason.</summary>
     public const string ChargeWaive = "revenue.charge.waive";
+
+    /// <summary>gecko_identity 22_charge_view_permission.sql — read the charge register and the unbilled lines. Branch-scoped through `bpm`.</summary>
+    public const string ChargeView = "revenue.charge.view";
 }
 
 internal static class RevenueSupport

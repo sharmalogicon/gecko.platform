@@ -65,6 +65,24 @@ internal static class TestDatabase
     }
 
     /// <summary>
+    /// Removes the charge lines a test wrote straight into billing.charge (order
+    /// numbers starting ZZC-). Charges have no soft delete and gecko_app may not
+    /// DELETE, so this is the sysadmin door.
+    /// </summary>
+    public static async Task RemoveChargeTestRowsAsync(string orderNo)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM billing.charge WHERE order_no = @no AND order_no LIKE 'ZZC-%';
+            """;
+        command.Parameters.AddWithValue("@no", orderNo);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
     /// Soft-deletes a test tariff and everything under it, whatever its status.
     /// Test-only: production has no way to remove an approved price, by design.
     /// </summary>

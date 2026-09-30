@@ -1,6 +1,7 @@
 using Gecko.Data;
 using Gecko.Revenue.Application;
 using Gecko.Revenue.Endpoints.Charges;
+using Gecko.Revenue.Endpoints.Reports;
 using Gecko.Revenue.Endpoints.Imports;
 using Gecko.Revenue.Endpoints.Reefer;
 using Gecko.Revenue.Endpoints.Tariffs;
@@ -75,7 +76,8 @@ public static class RevenueModule
             .MapImportEndpoints()
             .MapWindowEndpoints()
             .MapReeferPowerEndpoints()
-            .MapChargeEndpoints();
+            .MapChargeEndpoints()
+            .MapReceiptReportEndpoints();
 
         return endpoints;
     }

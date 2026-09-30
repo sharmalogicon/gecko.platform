@@ -83,6 +83,27 @@ internal static class TestDatabase
     }
 
     /// <summary>
+    /// Removes a test cash drawer and its receipts (numbers starting ZZR-). Receipts
+    /// are append-only by grant and gecko_app may not DELETE, so this is the sysadmin door.
+    /// </summary>
+    public static async Task RemoveReceiptTestRowsAsync(Guid shiftId)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE p FROM cashier.receipt_payment p JOIN cashier.receipt r ON r.receipt_id = p.receipt_id
+             WHERE r.shift_id = @shift AND r.receipt_no LIKE 'ZZR-%';
+            DELETE FROM cashier.receipt WHERE shift_id = @shift AND receipt_no LIKE 'ZZR-%';
+            DELETE FROM cashier.shift WHERE shift_id = @shift
+               AND NOT EXISTS (SELECT 1 FROM cashier.receipt r WHERE r.shift_id = @shift);
+            """;
+        command.Parameters.AddWithValue("@shift", shiftId);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
     /// Soft-deletes a test tariff and everything under it, whatever its status.
     /// Test-only: production has no way to remove an approved price, by design.
     /// </summary>

@@ -10,6 +10,7 @@
     <ProjectReference Include="..\Gecko.Data\Gecko.Data.csproj" />
     <ProjectReference Include="..\Gecko.Revenue.Contracts\Gecko.Revenue.Contracts.csproj" />
     <ProjectReference Include="..\Gecko.MasterData.Contracts\Gecko.MasterData.Contracts.csproj" />
+    <ProjectReference Include="..\Gecko.Identity.Contracts\Gecko.Identity.Contracts.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -65,6 +65,7 @@ public static class IdentityModule
         services.AddSingleton<AccessTokenIssuer>();
         services.AddSingleton<TenantDbContextFactory>();
         services.AddScoped<ClaimsBuilder>();
+        services.AddScoped<Contracts.IUserDirectory, Application.Directory.UserDirectory>();
         services.AddScoped<AuthEventWriter>();
         services.AddScoped<SessionService>();
         services.AddScoped<LoginService>();

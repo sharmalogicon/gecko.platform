@@ -38,6 +38,34 @@ internal static class DashboardQueries
         GROUP BY CAST(l.local_at AS date), g.direction, g.full_empty, g.equipment_type_code
         """;
 
+    /// <summary>
+    /// The gate-movements report (/api/tos/reports/gate-moves): the same moves, at
+    /// the grain the report totals from — depot day × direction × movement × full/empty
+    /// × type × the booking's customer and line.
+    /// </summary>
+    public const string GateMovesSql = $"""
+        SELECT CAST(m.local_at AS date) AS Day, m.direction AS Direction, m.movement_code AS MovementCode,
+               m.full_empty AS FullEmpty, m.equipment_type_code AS EquipmentTypeCode,
+               b.customer_party_code AS CustomerCode, m.line_party_code AS LineCode, COUNT(*) AS Moves
+        FROM (
+            SELECT g.direction, g.movement_code, g.full_empty, g.equipment_type_code, g.line_party_code, g.booking_id, l.local_at
+            {Moves}
+        ) m
+        LEFT JOIN booking.booking b ON b.booking_id = m.booking_id
+        GROUP BY CAST(m.local_at AS date), m.direction, m.movement_code, m.full_empty, m.equipment_type_code,
+                 b.customer_party_code, m.line_party_code
+        """;
+
+    /// <summary>EIRs voided in the window — shown beside the moves, never counted as one.</summary>
+    public const string VoidedMovesSql = """
+        SELECT COUNT(*) AS Value
+        FROM gate.gate_transaction g
+        JOIN gate.truck_visit v ON v.truck_visit_id = g.truck_visit_id
+        WHERE g.branch_id = @branch AND g.status = 'VOIDED' AND g.deleted_at IS NULL
+          AND v.source <> 'MIGRATED'
+          AND g.transaction_at >= @from AND g.transaction_at < @to
+        """;
+
     public const string MonthlyMovesSql = $"""
         SELECT YEAR(l.local_at) AS Year, MONTH(l.local_at) AS Month, COUNT(*) AS Moves
         {Moves}
@@ -118,6 +146,8 @@ internal static class DashboardQueries
         """;
 
     public sealed record DailyMoves(DateOnly Day, string Direction, string FullEmpty, string? EquipmentTypeCode, int Moves);
+    public sealed record GateMoves(DateOnly Day, string Direction, string MovementCode, string FullEmpty, string? EquipmentTypeCode,
+        string? CustomerCode, string LineCode, int Moves);
     public sealed record MonthlyMoves(int Year, int Month, int Moves);
     public sealed record HourlyMoves(int Hour, int Moves);
     public sealed record LineMoves(string LineCode, int Moves);

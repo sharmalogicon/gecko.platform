@@ -36,6 +36,8 @@ public partial class TosDbContext : DbContext
 
     public virtual DbSet<MovementPlan> MovementPlans { get; set; }
 
+    public virtual DbSet<ReeferPowerSession> ReeferPowerSessions { get; set; }
+
     public virtual DbSet<Survey> Surveys { get; set; }
 
     public virtual DbSet<SurveyDamage> SurveyDamages { get; set; }
@@ -1063,6 +1065,77 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_movement_plan__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<ReeferPowerSession>(entity =>
+        {
+            entity.HasKey(e => e.ReeferPowerSessionId).HasName("pk_reefer_power_session");
+
+            entity
+                .ToTable("reefer_power_session", "yard")
+                .ToTable(tb => tb.IsTemporal(ttb =>
+                    {
+                        ttb.UseHistoryTable("yard_reefer_power_session", "history");
+                        ttb
+                            .HasPeriodStart("sys_valid_from")
+                            .HasColumnName("sys_valid_from");
+                        ttb
+                            .HasPeriodEnd("sys_valid_to")
+                            .HasColumnName("sys_valid_to");
+                    }));
+
+            entity.HasIndex(e => new { e.TenantId, e.BranchId, e.PluggedOutAt }, "ix_reefer_power_session__branch").HasFilter("([deleted_at] IS NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.CloseGateTransactionId }, "ix_reefer_power_session__gate_close").HasFilter("([close_gate_transaction_id] IS NOT NULL AND [deleted_at] IS NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.ContainerVisitId }, "ix_reefer_power_session__visit").HasFilter("([deleted_at] IS NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.ContainerVisitId }, "uq_reefer_power_session__open")
+                .IsUnique()
+                .HasFilter("([plugged_out_at] IS NULL AND [deleted_at] IS NULL)");
+
+            entity.Property(e => e.ReeferPowerSessionId)
+                .HasDefaultValueSql("(newsequentialid())", "df_reefer_power_session__id")
+                .HasColumnName("reefer_power_session_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.CloseGateTransactionId).HasColumnName("close_gate_transaction_id");
+            entity.Property(e => e.CloseReason)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("close_reason");
+            entity.Property(e => e.ContainerNo)
+                .HasMaxLength(11)
+                .IsUnicode(false)
+                .HasColumnName("container_no");
+            entity.Property(e => e.ContainerVisitId).HasColumnName("container_visit_id");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_reefer_power_session__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
+            entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
+            entity.Property(e => e.PlugPointCode)
+                .HasMaxLength(20)
+                .HasColumnName("plug_point_code");
+            entity.Property(e => e.PluggedInAt).HasColumnName("plugged_in_at");
+            entity.Property(e => e.PluggedInBy).HasColumnName("plugged_in_by");
+            entity.Property(e => e.PluggedOutAt).HasColumnName("plugged_out_at");
+            entity.Property(e => e.PluggedOutBy).HasColumnName("plugged_out_by");
+            entity.Property(e => e.Remarks)
+                .HasMaxLength(500)
+                .HasColumnName("remarks");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.SetPointC)
+                .HasColumnType("decimal(5, 1)")
+                .HasColumnName("set_point_c");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_reefer_power_session__updated_at")
                 .HasColumnName("updated_at");
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });

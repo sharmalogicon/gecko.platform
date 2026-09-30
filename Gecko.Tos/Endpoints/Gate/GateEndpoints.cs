@@ -1,6 +1,5 @@
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using Gecko.Data;
 using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
@@ -306,6 +305,10 @@ internal static class GateEndpoints
             yardRow.LastEventAt = at;
             containerVisitId = yardRow.ContainerVisitId;
             AddEvent(db, yardRow, "GATE_OUT", yardRow.FullEmpty, transaction.EirNo, at, caller.UserId(), transaction.GateTransactionId);
+
+            // A reefer still plugged in is unplugged by leaving (TIER3 §6): same
+            // transaction, and queued before ContainerGatedOut so Revenue sees it first.
+            await ReeferLog.CloseOnGateOutAsync(db, yardRow, transaction.GateTransactionId, at, caller.UserId(), now, ct);
         }
 
         // ── the assignment: the last step ends it (D-3) ─────────────────────
@@ -382,6 +385,11 @@ internal static class GateEndpoints
             AddEvent(db, closed, "CORRECTION", transaction.EirNo, null, transaction.VoidedAt!.Value, caller.UserId(), id);
         }
 
+        // A reefer that gate-out unplugged is plugged in again: the box never left.
+        var replugged = closed is null ? [] : await ReeferLog.ReopenOnVoidAsync(db, id, ct);
+        foreach (var session in replugged)
+            AddEvent(db, closed!, "CORRECTION", "PLUG_OUT", null, transaction.VoidedAt!.Value, caller.UserId(), session.ReeferPowerSessionId);
+
         // An assignment closed by that step re-opens with it.
         var assignment = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == transaction.BookingContainerId, ct);
         if (assignment is { EndReason: "COMPLETED" })
@@ -400,6 +408,8 @@ internal static class GateEndpoints
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await QueueVoidAsync(db, transaction, ct);
+        foreach (var session in replugged)
+            await ReeferLog.EnqueueAsync(db, session, closed!, ReeferLog.Corrected, transaction.VoidedAt!.Value, ct);
         await tx.CommitAsync(ct);
 
         return TypedResults.Ok(await ProjectAsync(db, id, null, false, ct));
@@ -574,17 +584,7 @@ internal static class GateEndpoints
 
     private static void AddEvent(TosDbContext db, ContainerVisit visit, string type, string? from, string? to,
         DateTimeOffset at, Guid? by, Guid? reference) =>
-        db.VisitEvents.Add(new VisitEvent
-        {
-            TenantId = visit.TenantId,
-            ContainerVisitId = visit.ContainerVisitId,
-            EventType = type,
-            FromValue = from,
-            ToValue = to,
-            EventAt = at,
-            EventBy = by,
-            ReferenceId = reference,
-        });
+        VisitJournal.Add(db, visit, type, from, to, at, by, reference);
 
     /// <summary>
     /// The gate event. Notification turns it into the LINE message; Revenue prices
@@ -649,12 +649,8 @@ internal static class GateEndpoints
             voidReason = transaction.VoidReason,
         }, ct);
 
-    private static async Task EnqueueAsync(TosDbContext db, GateTransaction transaction, string messageType, object payload, CancellationToken ct) =>
-        await db.Database.ExecuteSqlRawAsync(
-            "INSERT INTO outbox.message (tenant_id, aggregate_type, aggregate_id, message_type, payload_json) " +
-            "VALUES ({0}, 'GATE_TRANSACTION', {1}, {2}, {3})",
-            [transaction.TenantId, transaction.GateTransactionId, messageType, JsonSerializer.Serialize(payload)],
-            ct);
+    private static Task EnqueueAsync(TosDbContext db, GateTransaction transaction, string messageType, object payload, CancellationToken ct) =>
+        TosOutbox.EnqueueAsync(db, transaction.TenantId, "GATE_TRANSACTION", transaction.GateTransactionId, messageType, payload, ct);
 
     private static ProblemHttpResult Refused(BarrierView view) =>
         TypedResults.Problem(

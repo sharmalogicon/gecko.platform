@@ -32,6 +32,10 @@ internal static class TosPermissions
     /// who approves it being wrong.
     /// </summary>
     public const string GateOverride = "tos.gate.override";
+
+    /// <summary>The reefer plug log (gecko_identity 21_reefer_permissions.sql): see it; plug in / out, correct, void.</summary>
+    public const string ReeferView = "tos.reefer.view";
+    public const string ReeferManage = "tos.reefer.manage";
 }
 
 /// <summary>

@@ -122,6 +122,24 @@ internal static class TestDatabase
         return (reader.GetString(0), reader.GetString(1));
     }
 
+    /// <summary>Every outbox message queued for these aggregates, in queue order (message_id).</summary>
+    public static async Task<List<(long MessageId, Guid AggregateId, string MessageType, string PayloadJson)>> OutboxInOrderAsync(params Guid[] aggregateIds)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            SELECT message_id, aggregate_id, message_type, payload_json FROM outbox.message
+            WHERE aggregate_id IN ({string.Join(",", aggregateIds.Select((_, i) => $"@a{i}"))}) ORDER BY message_id;
+            """;
+        for (var i = 0; i < aggregateIds.Length; i++) command.Parameters.AddWithValue($"@a{i}", aggregateIds[i]);
+        var rows = new List<(long, Guid, string, string)>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add((reader.GetInt64(0), reader.GetGuid(1), reader.GetString(2), reader.GetString(3)));
+        return rows;
+    }
+
     /// <summary>
     /// Removes the gate rows a test wrote, for bookings carrying the prefix.
     ///
@@ -152,6 +170,10 @@ internal static class TestDatabase
 
             DELETE FROM gate.survey_damage WHERE survey_id IN (SELECT survey_id FROM gate.survey WHERE container_visit_id IN (SELECT id FROM @cv));
             DELETE FROM gate.survey            WHERE container_visit_id IN (SELECT id FROM @cv);
+            DECLARE @rs TABLE (id UNIQUEIDENTIFIER);
+            INSERT @rs SELECT reefer_power_session_id FROM yard.reefer_power_session WHERE container_visit_id IN (SELECT id FROM @cv);
+            DELETE FROM outbox.message         WHERE aggregate_type = 'REEFER_SESSION' AND aggregate_id IN (SELECT id FROM @rs);
+            DELETE FROM yard.reefer_power_session WHERE reefer_power_session_id IN (SELECT id FROM @rs);
             DELETE FROM yard.visit_event       WHERE container_visit_id IN (SELECT id FROM @cv);
             DELETE FROM yard.container_visit   WHERE container_visit_id IN (SELECT id FROM @cv);
             DELETE FROM gate.gate_authorization WHERE booking_id IN (SELECT id FROM @b);

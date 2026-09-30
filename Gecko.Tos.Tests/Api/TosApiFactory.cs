@@ -75,7 +75,8 @@ public class TosApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
                    + await db.CutoffExceptions.CountAsync(e => e.CreatedBy != null)
                    + await db.GateTransactions.CountAsync(g => g.CreatedBy != null)
                    + await db.TruckVisits.CountAsync(v => v.CreatedBy != null)
-                   + await db.ContainerVisits.CountAsync(v => v.CreatedBy != null);
+                   + await db.ContainerVisits.CountAsync(v => v.CreatedBy != null)
+                   + await db.ReeferPowerSessions.CountAsync(r => r.CreatedBy != null);
         }
         return total;
     }

@@ -5,6 +5,7 @@ using Gecko.Tos.Endpoints.Bookings;
 using Gecko.Tos.Endpoints.Dashboard;
 using Gecko.Tos.Endpoints.Gate;
 using Gecko.Tos.Endpoints.Holds;
+using Gecko.Tos.Endpoints.Reefer;
 using Gecko.Tos.Endpoints.Vessels;
 using Gecko.Tos.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Builder;
@@ -62,6 +63,7 @@ public static class TosModule
             .MapVesselCallEndpoints()
             .MapBookingEndpoints()
             .MapHoldEndpoints()
+            .MapReeferEndpoints()
             .MapGateEndpoints()
             .MapSurveyEndpoints()
             .MapAttachmentEndpoints()

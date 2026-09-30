@@ -66,6 +66,7 @@ public static class TosModule
             .MapReeferEndpoints()
             .MapGateEndpoints()
             .MapContainerStoryEndpoints()
+            .MapYardStockEndpoints()
             .MapSurveyEndpoints()
             .MapAttachmentEndpoints()
             .MapDashboardEndpoints();

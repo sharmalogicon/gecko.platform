@@ -111,6 +111,7 @@ public sealed class GateMovesReportApiTests(TosApiFactory api)
             Assert.Equal(before.Total.FullOut + 1, after.Total.FullOut);
             Assert.Equal(before.Total.Teu + 2m, after.Total.Teu);
             Assert.Equal(before.Voided + 1, after.Voided);
+            Assert.Equal(before.Migrated, after.Migrated);      // gate-recorded moves are never "migrated"
 
             Assert.Equal(after.Total.Moves, after.Days.Sum(d => d.Tally.Moves));
             Assert.Equal(after.Total.Moves, after.Movements.Sum(m => m.Moves));

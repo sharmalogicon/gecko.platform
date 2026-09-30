@@ -56,6 +56,7 @@ internal static class ReportEndpoints
         var window = new DashboardQueries.Window(branch, from.Value, to.Value);
         var moves = await DashboardQueries.RunAsync<DashboardQueries.GateMoves>(db, DashboardQueries.GateMovesSql, window, ct);
         var voided = await db.Database.SqlQueryRaw<int>(DashboardQueries.VoidedMovesSql, window.Parameters()).SingleAsync(ct);
+        var migrated = await db.Database.SqlQueryRaw<int>(DashboardQueries.MigratedMovesSql, window.Parameters()).SingleAsync(ct);
 
         var typeCodes = moves.Select(m => m.EquipmentTypeCode).OfType<string>().Distinct().ToList();
         var types = typeCodes.Count == 0
@@ -99,12 +100,16 @@ internal static class ReportEndpoints
             .ToList();
 
         return TypedResults.Ok(new GateMovesReportResponse(
-            branch.BranchId, branch.BranchCode, from.Value, to.Value, Tally(moves), voided,
+            branch.BranchId, branch.BranchCode, from.Value, to.Value, Tally(moves), voided, migrated,
             days, movements, By(m => m.CustomerCode, named: true), By(m => m.LineCode, named: true), By(m => m.EquipmentTypeCode, named: false)));
     }
 }
 
-/// <summary>Moves counted: all, in, out, and in/out split full / empty; TEU from MDM's equipment types.</summary>
+/// <summary>
+/// <c>Voided</c>: EIRs voided in the range. <c>Migrated</c>: EIRs a Vector migration wrote
+/// in the range (listed by the gate register, not counted as moves). Neither is in <c>Total</c>.
+/// </summary>
+/// <remarks>Moves counted: all, in, out, and in/out split full / empty; TEU from MDM's equipment types.</remarks>
 public sealed record GateMovesTally(int Moves, int In, int Out, int FullIn, int EmptyIn, int FullOut, int EmptyOut, decimal Teu);
 
 public sealed record GateMovesDayResponse(DateOnly Day, GateMovesTally Tally);
@@ -115,7 +120,7 @@ public sealed record GateMovesMovementResponse(string MovementCode, string Direc
 public sealed record GateMovesGroupResponse(string? Code, string? Name, GateMovesTally Tally);
 
 public sealed record GateMovesReportResponse(
-    Guid BranchId, string BranchCode, DateOnly From, DateOnly To, GateMovesTally Total, int Voided,
+    Guid BranchId, string BranchCode, DateOnly From, DateOnly To, GateMovesTally Total, int Voided, int Migrated,
     IReadOnlyList<GateMovesDayResponse> Days, IReadOnlyList<GateMovesMovementResponse> Movements,
     IReadOnlyList<GateMovesGroupResponse> Customers, IReadOnlyList<GateMovesGroupResponse> Lines,
     IReadOnlyList<GateMovesGroupResponse> Types);

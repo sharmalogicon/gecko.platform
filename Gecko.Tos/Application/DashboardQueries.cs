@@ -56,6 +56,19 @@ internal static class DashboardQueries
                  b.customer_party_code, m.line_party_code
         """;
 
+    /// <summary>
+    /// EIRs in the window that a Vector migration wrote (the gate-in of each box still in
+    /// the yard at cut-over) — the gate register lists them, the moves do not count them.
+    /// </summary>
+    public const string MigratedMovesSql = """
+        SELECT COUNT(*) AS Value
+        FROM gate.gate_transaction g
+        JOIN gate.truck_visit v ON v.truck_visit_id = g.truck_visit_id
+        WHERE g.branch_id = @branch AND g.status = 'COMPLETED' AND g.deleted_at IS NULL
+          AND v.source = 'MIGRATED'
+          AND g.transaction_at >= @from AND g.transaction_at < @to
+        """;
+
     /// <summary>EIRs voided in the window — shown beside the moves, never counted as one.</summary>
     public const string VoidedMovesSql = """
         SELECT COUNT(*) AS Value

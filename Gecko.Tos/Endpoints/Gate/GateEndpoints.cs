@@ -352,6 +352,10 @@ internal static class GateEndpoints
         if (transaction is null || !scope.HasAt(TosPermissions.GateOverride, transaction.BranchId)) return TypedResults.NotFound();
         if (transaction.Status == "VOIDED")
             return TosSupport.Conflict($"{transaction.EirNo} was already voided.", transaction.VoidReason);
+        // The rowVersion is optional (older callers send none); when sent it is
+        // applied, so a void of an EIR someone else changed meanwhile is a 409.
+        if (request.RowVersion is not null && !db.TrySetExpectedVersion(transaction, request.RowVersion))
+            return TosSupport.Invalid("rowVersion", "Send the rowVersion you received when reading the EIR.");
 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
@@ -420,7 +424,8 @@ internal static class GateEndpoints
     private static async Task<Results<Ok<PagedResult<GateTransactionSummaryResponse>>, ValidationProblem>> ListAsync(
         [AsParameters] ListQuery query, TosDbContext db, ICallerPermissions scope, CancellationToken ct,
         Guid? branchId = null, string? direction = null, string? status = null,
-        DateTimeOffset? from = null, DateTimeOffset? to = null, bool? lateOnly = null)
+        DateTimeOffset? from = null, DateTimeOffset? to = null, bool? lateOnly = null,
+        string? containerNo = null, string? truck = null, Guid? bookingId = null)
     {
         var rows =
             from t in db.GateTransactions.AsNoTracking()
@@ -438,6 +443,10 @@ internal static class GateEndpoints
         if (from is not null) rows = rows.Where(r => r.g.TransactionAt >= from);
         if (to is not null) rows = rows.Where(r => r.g.TransactionAt < to);
         if (lateOnly == true) rows = rows.Where(r => r.g.IsLate);
+        // The register's own filters, each narrowing on top of the free search.
+        if (ContainerNumber.Normalise(containerNo ?? "") is { Length: > 0 } boxNo) rows = rows.Where(r => r.g.ContainerNo == boxNo);
+        if (truck.Clean() is { } plate) rows = rows.Where(r => r.TruckPlate.Contains(plate));
+        if (bookingId is not null) rows = rows.Where(r => r.g.BookingId == bookingId);
         if (query.Search.Clean() is { } q)
         {
             var box = ContainerNumber.Normalise(q);
@@ -742,6 +751,8 @@ internal static class GateEndpoints
             g.CutoffExceptionId, g.LateOverrideReason, g.CheckDigitOverrideReason,
             g.GateAuthorizationId,
             g.TransactionAt, g.RecordedAt, g.Status,
-            visitId, completed, Convert.ToBase64String(g.RowVersion));
+            visitId, completed, Convert.ToBase64String(g.RowVersion),
+            g.TareWeightKg, g.TempObservedC, g.IsoCode, g.PositionText, g.SurveyId, g.Remarks,
+            g.VoidedAt, g.VoidedBy, g.VoidReason, g.ReplacesGateTransactionId);
     }
 }

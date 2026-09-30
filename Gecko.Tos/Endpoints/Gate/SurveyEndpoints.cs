@@ -83,9 +83,11 @@ internal static class SurveyEndpoints
 
     private static async Task<Results<Ok<PagedResult<SurveyResponse>>, ValidationProblem>> ListAsync(
         [AsParameters] ListQuery query, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope,
-        CancellationToken ct, string? containerNo = null, Guid? branchId = null, bool? damagedOnly = null)
+        CancellationToken ct, string? containerNo = null, Guid? branchId = null, bool? damagedOnly = null,
+        Guid? gateTransactionId = null)
     {
         var rows = db.Surveys.AsNoTracking();
+        if (gateTransactionId is not null) rows = rows.Where(s => s.GateTransactionId == gateTransactionId);
 
         if (ContainerNumber.Normalise(containerNo ?? "") is { Length: > 0 } box) rows = rows.Where(s => s.ContainerNo == box);
         if (branchId is not null) rows = rows.Where(s => s.BranchId == branchId);

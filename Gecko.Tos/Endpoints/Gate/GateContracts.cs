@@ -58,7 +58,13 @@ public sealed record GateTransactionResponse(
     Guid? CutoffExceptionId, string? LateOverrideReason, string? CheckDigitOverrideReason,
     Guid? GateAuthorizationId,
     DateTimeOffset TransactionAt, DateTimeOffset RecordedAt, string Status,
-    Guid? ContainerVisitId, bool BookingContainerCompleted, string RowVersion);
+    Guid? ContainerVisitId, bool BookingContainerCompleted, string RowVersion,
+    // What the register and the EIR detail show besides the move itself; the
+    // void fields stay null on a live EIR. Appended so existing readers are unaffected.
+    decimal? TareWeightKg = null, decimal? TempObservedC = null, string? IsoCode = null,
+    string? PositionText = null, Guid? SurveyId = null, string? Remarks = null,
+    DateTimeOffset? VoidedAt = null, Guid? VoidedBy = null, string? VoidReason = null,
+    Guid? ReplacesGateTransactionId = null);
 
 public sealed record GateSealResponse(string SealNo, string SealType, bool IsIntact, bool? MatchesDeclared);
 

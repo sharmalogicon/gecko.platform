@@ -525,6 +525,69 @@ public sealed class GateApiTests(TosApiFactory api)
     }
 
     /// <summary>
+    /// The EIR register: the list narrows by box, truck and booking; the one EIR
+    /// carries what the detail page shows; its survey is found by the EIR; and a
+    /// void that sends a rowVersion is refused when it is stale, then kept on record.
+    /// </summary>
+    [Fact]
+    public async Task The_EIR_register_filters_shows_the_detail_and_voids_with_a_row_version()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            var booking = await BookAsync(client, ImportDo(carrierRef, BoxA), ct);
+            var eir = await RecordAsync(client, GateIn(BoxA, truck: new { plate = "ZZ-7788" }), ct);
+
+            async Task<PagedResult<GateTransactionSummaryResponse>> ListAsync(string query) =>
+                (await client.GetFromJsonAsync<PagedResult<GateTransactionSummaryResponse>>($"{Gate}/transactions?{query}", ct))!;
+
+            Assert.Contains((await ListAsync($"containerNo={BoxA}")).Items, t => t.GateTransactionId == eir.GateTransactionId);
+            Assert.Contains((await ListAsync("truck=ZZ-778")).Items, t => t.GateTransactionId == eir.GateTransactionId);
+            Assert.Single((await ListAsync($"bookingId={booking.Booking.BookingId}")).Items);
+            Assert.DoesNotContain((await ListAsync($"containerNo={BoxA}&truck=NO-SUCH-PLATE")).Items, t => t.GateTransactionId == eir.GateTransactionId);
+
+            var one = (await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{eir.GateTransactionId}", ct))!;
+            Assert.Equal("A-03-2", one.PositionText);
+            Assert.Null(one.VoidedAt);
+
+            var survey = await client.PostAsJsonAsync($"{Gate}/surveys", new
+            {
+                containerNo = BoxA, surveyType = "GATE_IN", gateTransactionId = eir.GateTransactionId, surveyorName = "Gate",
+            }, ct);
+            Assert.Equal(HttpStatusCode.Created, survey.StatusCode);
+            var surveys = (await client.GetFromJsonAsync<PagedResult<SurveyResponse>>(
+                $"{Gate}/surveys?gateTransactionId={eir.GateTransactionId}", ct))!;
+            Assert.Equal(eir.GateTransactionId, Assert.Single(surveys.Items).GateTransactionId);
+
+            var garbled = await client.PostAsJsonAsync($"{Gate}/transactions/{eir.GateTransactionId}/void",
+                new { reason = "wrong box keyed", rowVersion = "not base64!" }, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, garbled.StatusCode);
+            Assert.Contains("rowVersion", await garbled.Content.ReadAsStringAsync(ct), StringComparison.Ordinal);
+
+            var stale = await client.PostAsJsonAsync($"{Gate}/transactions/{eir.GateTransactionId}/void",
+                new { reason = "wrong box keyed", rowVersion = "AAAAAAAAAAE=" }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+
+            var voided = await client.PostAsJsonAsync($"{Gate}/transactions/{eir.GateTransactionId}/void",
+                new { reason = "wrong box keyed", rowVersion = one.RowVersion }, ct);
+            Assert.Equal(HttpStatusCode.OK, voided.StatusCode);
+            var after = (await voided.Content.ReadFromJsonAsync<GateTransactionResponse>(ct))!;
+            Assert.Equal("VOIDED", after.Status);
+            Assert.Equal("wrong box keyed", after.VoidReason);
+            Assert.NotNull(after.VoidedAt);
+            Assert.Contains((await ListAsync($"containerNo={BoxA}&status=VOIDED")).Items, t => t.GateTransactionId == eir.GateTransactionId);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveHoldsAsync(BoxA);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    /// <summary>
     /// V-16: Vector's damage table has ONE row in 2.7 years. Here a survey is a
     /// record, the CEDEX code decides whether the box is serviceable, and the depot's
     /// configured hold arrives by itself — which is what stops a holed box leaving.

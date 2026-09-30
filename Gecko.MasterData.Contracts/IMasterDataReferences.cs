@@ -119,6 +119,29 @@ public interface IMasterDataReferences
     /// Null when no active yard records a capacity — "unknown", not zero.
     /// </summary>
     Task<int?> YardCapacityTeuAsync(Guid branchId, CancellationToken ct);
+
+    // ── Gate hours (TIER3_DESIGN_NOTES §1) ───────────────────────────────────
+
+    /// <summary>
+    /// Whether the depot's gate is open at <paramref name="at"/>, from its weekly
+    /// windows, its one-off dates and the tenant's public holidays, in the depot's
+    /// time zone. Null when the depot has no gate hours at all — the barrier then
+    /// says nothing, as before gate hours existed.
+    /// </summary>
+    Task<GateHoursStatus?> GateHoursStatusAsync(Guid branchId, DateTimeOffset at, CancellationToken ct);
+}
+
+/// <summary>
+/// The gate at one instant. <see cref="State"/> is OPEN, OUTSIDE_HOURS, HOLIDAY
+/// (a public holiday, or the afternoon of a half-day one) or CLOSED_DATE (a
+/// one-off closure). <see cref="Note"/> is the holiday's name or the closure's
+/// reason. Times carry the depot's own offset, so they print as local time.
+/// <see cref="NextOpensAt"/> is null when nothing opens in the next 14 days.
+/// </summary>
+public sealed record GateHoursStatus(
+    string State, string? Note, DateTimeOffset LocalAt, DateTimeOffset? OpenUntil, DateTimeOffset? NextOpensAt)
+{
+    public bool IsOpen => State == "OPEN";
 }
 
 /// <summary>

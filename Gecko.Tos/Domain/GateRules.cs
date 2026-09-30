@@ -8,6 +8,9 @@ public enum GateSeverity
     /// <summary>Worth saying, changes nothing.</summary>
     Info,
 
+    /// <summary>Allowed, and the clerk may go ahead, but must be told first (gate hours: outside opening hours).</summary>
+    Warn,
+
     /// <summary>Allowed, but only by someone who may override it, with a typed reason.</summary>
     Override,
 
@@ -118,6 +121,28 @@ public static class GateRules
             yield return new GateFinding("SEAL_REQUIRED",
                 $"{step.MovementCode} checks the seal. Record at least one seal number.",
                 GateSeverity.Block);
+    }
+
+    /// <summary>
+    /// Gate hours (TIER3_DESIGN_NOTES §1): a move while the depot's gate is shut is
+    /// a WARNING, never a refusal (owner decision 2026-09-30) — the clerk is told
+    /// when it opens next and may still proceed. A depot with no gate hours
+    /// (<paramref name="status"/> null) and an open gate say nothing.
+    /// </summary>
+    public static GateFinding? OutsideHours(GateHoursStatus? status)
+    {
+        if (status is null || status.IsOpen) return null;
+        var next = status.NextOpensAt is { } n
+            ? $" It opens next {n.ToString("ddd d MMM HH:mm", System.Globalization.CultureInfo.InvariantCulture)}."
+            : " No opening is set in the next 14 days.";
+        var why = status.State switch
+        {
+            "HOLIDAY" => $"Today is a public holiday ({status.Note}) and the gate is closed.",
+            "CLOSED_DATE" => $"The gate is closed today ({status.Note}).",
+            _ => $"The gate is outside its opening hours ({status.LocalAt.ToString("ddd HH:mm", System.Globalization.CultureInfo.InvariantCulture)}).",
+        };
+        return new GateFinding(status.State == "OUTSIDE_HOURS" ? "OUTSIDE_GATE_HOURS" : "GATE_CLOSED_DAY",
+            why + next + " The move may still go ahead.", GateSeverity.Warn);
     }
 
     /// <summary>The one decision, from every finding.</summary>

@@ -72,6 +72,10 @@ public partial class MasterDataDbContext : DbContext
 
     public virtual DbSet<ForwarderExtension> ForwarderExtensions { get; set; }
 
+    public virtual DbSet<GateHoursException> GateHoursExceptions { get; set; }
+
+    public virtual DbSet<GateHoursWindow> GateHoursWindows { get; set; }
+
     public virtual DbSet<HaulierExtension> HaulierExtensions { get; set; }
 
     public virtual DbSet<Hold> Holds { get; set; }
@@ -1925,6 +1929,106 @@ public partial class MasterDataDbContext : DbContext
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_forwarder_ext__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<GateHoursException>(entity =>
+        {
+            entity.HasKey(e => e.GateHoursExceptionId).HasName("pk_gate_hours_exception");
+
+            entity
+                .ToTable("gate_hours_exception", "org")
+                .ToTable(tb => tb.IsTemporal(ttb =>
+                    {
+                        ttb.UseHistoryTable("org_gate_hours_exception", "history");
+                        ttb
+                            .HasPeriodStart("sys_valid_from")
+                            .HasColumnName("sys_valid_from");
+                        ttb
+                            .HasPeriodEnd("sys_valid_to")
+                            .HasColumnName("sys_valid_to");
+                    }));
+
+            entity.HasIndex(e => new { e.TenantId, e.BranchId, e.ExceptionDate }, "uq_gate_hours_exception__date")
+                .IsUnique()
+                .HasFilter("([deleted_at] IS NULL)");
+
+            entity.Property(e => e.GateHoursExceptionId)
+                .HasDefaultValueSql("(newsequentialid())", "df_gate_hours_exception__id")
+                .HasColumnName("gate_hours_exception_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.ClosesAt)
+                .HasPrecision(0)
+                .HasColumnName("closes_at");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_hours_exception__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
+            entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
+            entity.Property(e => e.ExceptionDate).HasColumnName("exception_date");
+            entity.Property(e => e.IsClosed).HasColumnName("is_closed");
+            entity.Property(e => e.OpensAt)
+                .HasPrecision(0)
+                .HasColumnName("opens_at");
+            entity.Property(e => e.Reason)
+                .HasMaxLength(150)
+                .HasColumnName("reason");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_hours_exception__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<GateHoursWindow>(entity =>
+        {
+            entity.HasKey(e => e.GateHoursWindowId).HasName("pk_gate_hours_window");
+
+            entity
+                .ToTable("gate_hours_window", "org")
+                .ToTable(tb => tb.IsTemporal(ttb =>
+                    {
+                        ttb.UseHistoryTable("org_gate_hours_window", "history");
+                        ttb
+                            .HasPeriodStart("sys_valid_from")
+                            .HasColumnName("sys_valid_from");
+                        ttb
+                            .HasPeriodEnd("sys_valid_to")
+                            .HasColumnName("sys_valid_to");
+                    }));
+
+            entity.HasIndex(e => new { e.TenantId, e.BranchId, e.IsoWeekday }, "ix_gate_hours_window__branch").HasFilter("([deleted_at] IS NULL)");
+
+            entity.Property(e => e.GateHoursWindowId)
+                .HasDefaultValueSql("(newsequentialid())", "df_gate_hours_window__id")
+                .HasColumnName("gate_hours_window_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.ClosesAt)
+                .HasPrecision(0)
+                .HasColumnName("closes_at");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_hours_window__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
+            entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
+            entity.Property(e => e.IsoWeekday).HasColumnName("iso_weekday");
+            entity.Property(e => e.OpensAt)
+                .HasPrecision(0)
+                .HasColumnName("opens_at");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_hours_window__updated_at")
                 .HasColumnName("updated_at");
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });

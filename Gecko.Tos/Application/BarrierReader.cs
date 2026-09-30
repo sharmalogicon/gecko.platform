@@ -69,6 +69,10 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         if (GateRules.CheckDigit(containerNo, checkDigitValid, enforceDigit, ContainerNumber.CheckDigitOf(containerNo)) is { } digit)
             findings.Add(digit);
 
+        // Gate hours (TIER3 §1): a warning at the depot the barrier is AT, never a refusal.
+        if (GateRules.OutsideHours(await master.GateHoursStatusAsync(branchId, at, ct)) is { } closed)
+            findings.Add(closed);
+
         // ── 1. the active assignment ────────────────────────────────────────
         var assignment = await db.BookingContainers.AsNoTracking()
             .SingleOrDefaultAsync(x => x.ContainerNo == containerNo && x.EndedAt == null, ct);

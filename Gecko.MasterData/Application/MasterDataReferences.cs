@@ -362,4 +362,30 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             components.ToHashSet(StringComparer.OrdinalIgnoreCase),
             locations.ToHashSet(StringComparer.OrdinalIgnoreCase));
     }
+
+    public async Task<GateHoursStatus?> GateHoursStatusAsync(Guid branchId, DateTimeOffset at, CancellationToken ct)
+    {
+        var windows = await db.GateHoursWindows.AsNoTracking().Where(w => w.BranchId == branchId)
+            .Select(w => new GateHoursCalendar.Window(w.IsoWeekday, w.OpensAt, w.ClosesAt)).ToListAsync(ct);
+        if (windows.Count == 0) return null;
+
+        var zoneId = await db.BranchProfiles.AsNoTracking().Where(b => b.BranchId == branchId).Select(b => b.Timezone).FirstOrDefaultAsync(ct);
+        var zone = GateHoursCalendar.Zone(zoneId);
+        var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(at, zone).DateTime);
+        var from = today.AddDays(-1);
+        var to = today.AddDays(GateHoursCalendar.LookAheadDays);
+
+        var exceptions = (await db.GateHoursExceptions.AsNoTracking()
+                .Where(e => e.BranchId == branchId && e.ExceptionDate >= from && e.ExceptionDate <= to).ToListAsync(ct))
+            .ToDictionary(e => e.ExceptionDate, e => new GateHoursCalendar.DateException(e.ExceptionDate, e.IsClosed, e.OpensAt, e.ClosesAt, e.Reason));
+
+        // A depot's own holiday outranks the tenant-wide one on the same date.
+        var holidays = (await db.PublicHolidays.AsNoTracking()
+                .Where(h => h.HolidayDate >= from && h.HolidayDate <= to && (h.BranchId == null || h.BranchId == branchId)).ToListAsync(ct))
+            .OrderBy(h => h.BranchId is null ? 0 : 1)
+            .GroupBy(h => h.HolidayDate)
+            .ToDictionary(g => g.Key, g => g.Select(h => new GateHoursCalendar.HolidayDay(h.HolidayDate, h.NameEn, h.IsHalfDay)).Last());
+
+        return GateHoursCalendar.Resolve(at, zone, windows, exceptions, holidays);
+    }
 }

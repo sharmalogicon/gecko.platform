@@ -38,6 +38,8 @@ internal static class HoldEndpoints
             .WithSummary("Release a hold — needs the permission its release authority maps to")
             .WithDescription("DEPOT_FINANCE needs tos.hold.release.finance, LINE needs tos.hold.release.line, everything else tos.hold.release.operations. CUSTOMS and MNR holds also need the reference of the document you are acting on.");
 
+        holds.MapHoldBoardEndpoints();
+
         // The barrier's question, in the barrier's terms: give it a number, it says
         // what stops the box. Phase 5 answers this from an in-process path; the
         // endpoint exists now so the yard screen and the demo can ask it.
@@ -298,7 +300,7 @@ internal static class HoldEndpoints
         return Project(hold, definition, orderNo, branchId, branchCode);
     }
 
-    private static HoldResponse Project(ContainerHold h, HoldRef? d, string? orderNo, Guid? branchId, string? branchCode) => new(
+    internal static HoldResponse Project(ContainerHold h, HoldRef? d, string? orderNo, Guid? branchId, string? branchCode) => new(
         h.ContainerHoldId, h.ContainerNo, h.BookingId, orderNo, branchId, branchCode,
         h.HoldCode, d?.DescriptionEn, d?.HoldType, d?.BlockingScope, d?.ReleaseAuthority, d?.Priority, d?.DisplayColorHex,
         h.AppliedAt, h.AppliedBy, h.ApplyReason, h.ExternalRef, h.Source,

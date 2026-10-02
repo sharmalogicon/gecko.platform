@@ -598,13 +598,32 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             Assert.Contains(alone.Boxes.Single().Due, d => d.ChargeCode == "GATETRIP");
 
             shiftId = await OpenDrawerAsync(client, ct);
-            var paid = await client.PostAsJsonAsync($"{Window}/receipts", new
+            var receiptKey = Guid.NewGuid().ToString();
+            Task<HttpResponseMessage> PayAsync(decimal tendered)
             {
-                bookingId = booking.Booking.BookingId, bookingContainerIds = quote.Boxes.Select(b => b.BookingContainerId).ToArray(),
-                payments = new object[] { new { channel = "CASH", amount = 428.00m } }, expectedTotal = 428.00m,
-            }, ct);
+                var message = new HttpRequestMessage(HttpMethod.Post, $"{Window}/receipts")
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        bookingId = booking.Booking.BookingId, bookingContainerIds = quote.Boxes.Select(b => b.BookingContainerId).ToArray(),
+                        payments = new object[] { new { channel = "CASH", amount = 428.00m, tenderedAmount = tendered } }, expectedTotal = 428.00m,
+                    }),
+                };
+                message.Headers.Add("Idempotency-Key", receiptKey);
+                return client.SendAsync(message, ct);
+            }
+            var paid = await PayAsync(500m);
             Assert.True(paid.StatusCode == HttpStatusCode.Created, await paid.Content.ReadAsStringAsync(ct));
             var receipt = (await paid.Content.ReadFromJsonAsync<ReceiptResponse>(ct))!;
+
+            // Money is taken once: the same request again (a retry after a lost answer) returns THAT receipt...
+            var retried = await PayAsync(500m);
+            Assert.True(retried.StatusCode == HttpStatusCode.Created, await retried.Content.ReadAsStringAsync(ct));
+            Assert.Equal((receipt.ReceiptId, receipt.ReceiptNo), ((await retried.Content.ReadFromJsonAsync<ReceiptResponse>(ct)) is { } again ? (again.ReceiptId, again.ReceiptNo) : default));
+            // ...and the same key with a different request is refused.
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, (await PayAsync(1000m)).StatusCode);
+            var drawer = (await client.GetFromJsonAsync<ShiftResponse>($"{Window}/shifts/current?branchId={SctLcb01}", ct))!;
+            Assert.Equal((1, 428.00m), (drawer.Receipts, drawer.Expected.Single(e => e.Channel == "CASH").Amount));
             Assert.Equal(1, receipt.Lines.Count(l => l.ChargeCode == "GATETRIP"));
             Assert.Equal(2, receipt.Lines.Count(l => l.ChargeCode == "GATEFEE"));
 

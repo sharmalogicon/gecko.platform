@@ -51,6 +51,12 @@ public partial class Receipt
 
     public Guid? ReplacesReceiptId { get; set; }
 
+    /// <summary>gecko_revenue 21: the Idempotency-Key the request carried; unique per tenant.</summary>
+    public string? IdempotencyKey { get; set; }
+
+    /// <summary>gecko_revenue 21: SHA-256 of that request — the same key with another body is refused.</summary>
+    public byte[]? IdempotencyHash { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 
     public Guid? CreatedBy { get; set; }

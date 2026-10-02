@@ -40,7 +40,7 @@ public sealed class GateMovesReportApiTests(TosApiFactory api)
             orderTypeCode = "IMP CY/CY",
             lineCode = "MAEU",
             customerCode = "CUS-TAE",
-            carrierRef,
+            carrierRef = $"{carrierRef}-{box[^4..]}",   // one live booking per carrier reference; cleanup matches the prefix
             validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
             requirements = new object[] { new { equipmentTypeCode = type, qty = 1 } },
             containers = new object[] { new { containerNo = box } },

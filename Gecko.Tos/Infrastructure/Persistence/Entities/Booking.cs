@@ -15,6 +15,12 @@ public partial class Booking
 
     public string? CarrierRef { get; set; }
 
+    /// <summary>gecko_tos 19: the Idempotency-Key the creating request carried; unique per tenant.</summary>
+    public string? IdempotencyKey { get; set; }
+
+    /// <summary>gecko_tos 19: SHA-256 of that request — the same key with another body is refused.</summary>
+    public byte[]? IdempotencyHash { get; set; }
+
     public Guid OrderTypeId { get; set; }
 
     public string OrderTypeCode { get; set; } = null!;

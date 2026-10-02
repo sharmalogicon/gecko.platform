@@ -73,6 +73,148 @@ public sealed class BookingApiTests(TosApiFactory api)
     private static Task<HttpResponseMessage> AssignAsync(HttpClient client, Guid bookingId, CancellationToken ct, params object[] containers) =>
         client.PostAsJsonAsync($"{Bookings}/{bookingId}/containers", new { containers }, ct);
 
+    // ── amending the header (PUT /bookings/{id}) ────────────────────────────
+
+    /// <summary>
+    /// A booking is raised before the voyage is known: create minimal, amend as the
+    /// facts arrive. The PUT replaces the WHOLE header (a field left out is cleared),
+    /// takes the rowVersion (stale = 409), and refuses what may no longer change.
+    /// </summary>
+    [Fact]
+    public async Task The_header_is_amended_as_a_whole_with_a_row_version_and_some_of_it_can_no_longer_change()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var root = NewRef()[..14];
+        var (carrierRef, corrected) = ($"{root}-A", $"{root}-B");
+        try
+        {
+            var booking = (await CreateAsync(client, ImportDo(carrierRef), ct)).Booking;
+            Assert.Null(booking.HaulierCode);
+            Assert.Null(booking.PodPortCode);
+
+            Task<HttpResponseMessage> Put(object body) => client.PutAsJsonAsync($"{Bookings}/{booking.BookingId}", body, ct);
+            object Header(string? rowVersion, string? haulierCode = null, string? podPortCode = null, string? remarks = null,
+                Guid? branchId = null, string orderTypeCode = "IMP CY/CY", string lineCode = "MAEU", object[]? requirements = null) => new
+            {
+                branchId = branchId ?? SctLcb01, orderTypeCode, lineCode, customerCode = "CUS-TAE", carrierRef = corrected,
+                haulierCode, podPortCode, polPortCode = podPortCode is null ? null : "THLCH", customerRef = "PO-7781", remarks,
+                validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(20)), requirements, rowVersion,
+            };
+
+            // ── facts arrive: the haulier, the ports, a corrected carrier reference
+            var amended = Read<BookingDetailResponse>(await ExpectAsync(
+                await Put(Header(booking.RowVersion, "HAU-SHT", "SGSIN", "Customer rang: collect before Friday")), HttpStatusCode.OK, ct)).Booking;
+            Assert.Equal((corrected, "HAU-SHT", "THLCH", "SGSIN", "PO-7781", "Customer rang: collect before Friday"),
+                (amended.CarrierRef, amended.HaulierCode, amended.PolPortCode, amended.PodPortCode, amended.CustomerRef, amended.Remarks));
+            Assert.Equal(DateOnly.FromDateTime(DateTime.UtcNow.AddDays(20)), amended.ValidTo);
+            Assert.Equal(booking.OrderNo, amended.OrderNo);                 // the number never changes
+            Assert.NotEqual(booking.RowVersion, amended.RowVersion);
+
+            // ── the version read before that amend is stale now; none at all is a 400
+            Assert.Equal(HttpStatusCode.Conflict, (await Put(Header(booking.RowVersion, "HAU-LCH"))).StatusCode);
+            Assert.Contains("rowVersion", await ExpectAsync(await Put(Header(null, "HAU-LCH")), HttpStatusCode.BadRequest, ct));
+
+            // ── it replaces the whole header: what is left out is cleared
+            var cleared = Read<BookingDetailResponse>(await ExpectAsync(await Put(Header(amended.RowVersion)), HttpStatusCode.OK, ct)).Booking;
+            Assert.Equal((null, null, null, null), (cleared.HaulierCode, cleared.PolPortCode, cleared.PodPortCode, cleared.Remarks));
+            Assert.Equal("PO-7781", cleared.CustomerRef);
+
+            // ── what a PUT may not do, each named on its field
+            Assert.Contains("podPortCode", await ExpectAsync(await Put(Header(cleared.RowVersion, podPortCode: "ZZNOPE")), HttpStatusCode.BadRequest, ct));
+            Assert.Contains("branchId", await ExpectAsync(await Put(Header(cleared.RowVersion, branchId: TestDatabase.SctBkk01)), HttpStatusCode.BadRequest, ct));
+            Assert.Contains("requirements", await ExpectAsync(
+                await Put(Header(cleared.RowVersion, requirements: [new { equipmentTypeCode = "20GP", qty = 1 }])), HttpStatusCode.BadRequest, ct));
+
+            // ── once a box is on the booking, its order type and its line are fixed
+            await ExpectAsync(await AssignAsync(client, booking.BookingId, ct, new { containerNo = UnknownBox() }), HttpStatusCode.OK, ct);
+            var withBox = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{booking.BookingId}", ct))!.Booking;
+            Assert.Contains("orderTypeCode", await ExpectAsync(await Put(Header(withBox.RowVersion, orderTypeCode: "IMP CFS")), HttpStatusCode.BadRequest, ct));
+            Assert.Contains("lineCode", await ExpectAsync(await Put(Header(withBox.RowVersion, lineCode: "HLCU")), HttpStatusCode.BadRequest, ct));
+            // ...and everything else still is not.
+            var late = Read<BookingDetailResponse>(await ExpectAsync(await Put(Header(withBox.RowVersion, "HAU-LCH")), HttpStatusCode.OK, ct)).Booking;
+            Assert.Equal("HAU-LCH", late.HaulierCode);
+
+            // ── a booking that is no longer OPEN is not amended
+            await ExpectAsync(await client.PostAsJsonAsync($"{Bookings}/{booking.BookingId}/cancel",
+                new { reason = "Customer cancelled the delivery order", rowVersion = late.RowVersion }, ct), HttpStatusCode.OK, ct);
+            var gone = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{booking.BookingId}", ct))!.Booking;
+            Assert.Equal(HttpStatusCode.Conflict, (await Put(Header(gone.RowVersion, "HAU-SHT"))).StatusCode);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(root); }
+    }
+
+    // ── a booking is created once ───────────────────────────────────────────
+
+    private static Task<HttpResponseMessage> PostWithKeyAsync(HttpClient client, string key, object body, CancellationToken ct)
+    {
+        var message = new HttpRequestMessage(HttpMethod.Post, Bookings) { Content = JsonContent.Create(body) };
+        message.Headers.Add("Idempotency-Key", key);
+        return client.SendAsync(message, ct);
+    }
+
+    [Fact]
+    public async Task The_same_idempotency_key_creates_one_booking_and_a_carrier_reference_is_on_one_live_booking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var root = NewRef()[..13];
+        try
+        {
+            // ── no carrier reference (most gate bookings): only the key can tell a repeat from a new booking
+            object NoRef(int qty) => new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE",
+                customerRef = root,   // kept on the row so the test can find and remove what it made
+                requirements = new object[] { new { equipmentTypeCode = "20GP", qty } },
+            };
+            var key = Guid.NewGuid().ToString();
+            var first = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, key, NoRef(1), ct), HttpStatusCode.Created, ct));
+            var second = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, key, NoRef(1), ct), HttpStatusCode.Created, ct));
+            var third = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, key, NoRef(1), ct), HttpStatusCode.Created, ct));
+            Assert.Equal((first.Booking.BookingId, first.Booking.OrderNo), (second.Booking.BookingId, second.Booking.OrderNo));
+            Assert.Equal(first.Booking.OrderNo, third.Booking.OrderNo);
+
+            // The same key with a different body is a client bug, not a booking.
+            Assert.Contains("different request", await ExpectAsync(await PostWithKeyAsync(client, key, NoRef(2), ct), HttpStatusCode.UnprocessableEntity, ct));
+            // Another key is another booking; no key at all behaves as it always did.
+            var other = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, Guid.NewGuid().ToString(), NoRef(1), ct), HttpStatusCode.Created, ct));
+            Assert.NotEqual(first.Booking.OrderNo, other.Booking.OrderNo);
+            Assert.Contains("Idempotency-Key", await ExpectAsync(await PostWithKeyAsync(client, new string('k', 101), NoRef(1), ct), HttpStatusCode.BadRequest, ct));
+
+            // ── a carrier reference names ONE live booking at a depot
+            var reference = $"{root}-R";
+            var original = await CreateAsync(client, ImportDo(reference), ct);
+            var duplicate = await ExpectAsync(await client.PostAsJsonAsync(Bookings, ImportDo(reference.ToLowerInvariant()), ct), HttpStatusCode.Conflict, ct);
+            using (var problem = JsonDocument.Parse(duplicate))
+            {
+                Assert.Equal(original.Booking.OrderNo, problem.RootElement.GetProperty("existingOrderNo").GetString());
+                Assert.Contains(original.Booking.OrderNo, problem.RootElement.GetProperty("title").GetString());
+            }
+            // Amending another booking onto that reference is refused the same way; keeping its own is not.
+            var amend = new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", customerRef = root,
+                carrierRef = reference, rowVersion = first.Booking.RowVersion,
+            };
+            await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{first.Booking.BookingId}", amend, ct), HttpStatusCode.Conflict, ct);
+            await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{original.Booking.BookingId}",
+                new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", carrierRef = reference, remarks = "same reference, kept", rowVersion = original.Booking.RowVersion }, ct),
+                HttpStatusCode.OK, ct);
+
+            // A cancelled booking frees its reference.
+            var current = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{original.Booking.BookingId}", ct))!.Booking;
+            await ExpectAsync(await client.PostAsJsonAsync($"{Bookings}/{original.Booking.BookingId}/cancel",
+                new { reason = "Raised by mistake", rowVersion = current.RowVersion }, ct), HttpStatusCode.OK, ct);
+            await CreateAsync(client, ImportDo(reference), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveBookingsAsync(root);
+            await TestDatabase.RemoveBookingsByCustomerRefAsync(root);
+        }
+    }
+
     // ── the fixture ─────────────────────────────────────────────────────────
 
     [Fact]

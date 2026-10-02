@@ -144,8 +144,15 @@ internal static class BookingEndpoints
 
     private static async Task<Results<CreatedAtRoute<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
         SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock, ITenantContext caller,
-        ICallerPermissions scope, CancellationToken ct)
+        ICallerPermissions scope, HttpContext http, CancellationToken ct)
     {
+        // A repeated request (double-click, retry after a lost answer) carries the same
+        // Idempotency-Key: it gets the booking the first one made, never a second.
+        var (key, badKey) = Idempotency.KeyOf(http.Request);
+        if (badKey is not null) return TosSupport.Invalid(Idempotency.Header, badKey);
+        var hash = key is null ? null : Idempotency.HashOf(request);
+        if (key is not null && await ReplayAsync(db, clock, master, key, hash!, ct) is { } replay) return replay;
+
         var errors = new Dictionary<string, List<string>>();
         var header = await ResolveHeaderAsync(db, master, clock, request, errors, ct);
 
@@ -158,6 +165,7 @@ internal static class BookingEndpoints
         if (items.Count == 0) errors.Add("requirements", "A booking needs at least one requirement line — what equipment, how many.");
         var requirements = await ResolveRequirementsAsync(master, items, errors, ct);
         if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
+        if (await CarrierRefTakenAsync(db, header.Branch.BranchId, request.CarrierRef, null, ct) is { } taken) return taken;
 
         var tenantId = caller.TenantId();
         await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -169,10 +177,20 @@ internal static class BookingEndpoints
             OrderNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.Booking, header.Branch.BranchId, header.Branch.BranchCode, clock.LocalNow(header.Branch), ct),
             Status = BookingRules.Open,
             Source = "MANUAL",
+            IdempotencyKey = key,
+            IdempotencyHash = hash,
         };
         ApplyHeader(booking, request, header);
         db.Bookings.Add(booking);
-        await db.SaveChangesAsync(ct);
+        try { await db.SaveChangesAsync(ct); }
+        catch (DbUpdateException e) when (key is not null && e.InnerException?.Message.Contains("uq_booking__idempotency_key") == true)
+        {
+            // The same key arrived twice at once and the other request won: answer with its booking.
+            await tx.RollbackAsync(ct);
+            db.ChangeTracker.Clear();
+            return await ReplayAsync(db, clock, master, key, hash!, ct)
+                   ?? TosSupport.Conflict($"A request with {Idempotency.Header} {key} is still being processed.", "Repeat it in a moment.");
+        }
 
         short lineNo = 0;
         var created = new List<EquipmentRequirement>();
@@ -200,6 +218,44 @@ internal static class BookingEndpoints
         return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
     }
 
+    /// <summary>
+    /// The booking an earlier request with this key created, answered as that request
+    /// was (201, the booking as it stands now) — or a 422 when the key came back with
+    /// a different body. Null when the key is new.
+    /// </summary>
+    private static async Task<Results<CreatedAtRoute<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>?> ReplayAsync(
+        TosDbContext db, BranchClock clock, IMasterDataReferences master, string key, byte[] hash, CancellationToken ct)
+    {
+        var made = await db.Bookings.AsNoTracking().Where(b => b.IdempotencyKey == key)
+            .Select(b => new { b.BookingId, b.IdempotencyHash }).SingleOrDefaultAsync(ct);
+        if (made is null) return null;
+        if (!Idempotency.SameRequest(made.IdempotencyHash, hash)) return Idempotency.DifferentRequest(key);
+        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, made.BookingId, ct))!, "GetBooking", new { id = made.BookingId });
+    }
+
+    /// <summary>
+    /// One live booking per carrier reference at a depot: a line's booking number or D/O
+    /// number names ONE release. A second booking on it is a duplicate however it was
+    /// raised, so it is a 409 that names the booking already there. A CANCELLED
+    /// booking frees its reference.
+    /// </summary>
+    private static async Task<ProblemHttpResult?> CarrierRefTakenAsync(
+        TosDbContext db, Guid branchId, string? carrierRef, Guid? exceptBookingId, CancellationToken ct)
+    {
+        if (carrierRef.Clean() is not { } reference) return null;
+        var existing = await db.Bookings.AsNoTracking()
+            .Where(b => b.BranchId == branchId && b.CarrierRef == reference && b.Status != BookingRules.Cancelled && b.BookingId != exceptBookingId)
+            .OrderBy(b => b.CreatedAt).Select(b => new { b.BookingId, b.OrderNo, b.Status }).FirstOrDefaultAsync(ct);
+        return existing is null ? null : TypedResults.Problem(
+            title: $"That booking already exists: {existing.OrderNo}.",
+            detail: $"Carrier reference {reference} is already on {existing.OrderNo} ({existing.Status}) at this depot. Open that booking instead of raising another.",
+            statusCode: StatusCodes.Status409Conflict,
+            extensions: new Dictionary<string, object?>
+            {
+                ["existingOrderNo"] = existing.OrderNo, ["existingBookingId"] = existing.BookingId, ["carrierRef"] = reference,
+            });
+    }
+
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
         Guid id, SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
         ICallerPermissions scope, CancellationToken ct)
@@ -224,6 +280,7 @@ internal static class BookingEndpoints
 
         var header = await ResolveHeaderAsync(db, master, clock, request, errors, ct);
         if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
+        if (await CarrierRefTakenAsync(db, booking.BranchId, request.CarrierRef, booking.BookingId, ct) is { } taken) return taken;
 
         ApplyHeader(booking, request, header);
         await using var tx = await db.Database.BeginTransactionAsync(ct);

@@ -288,8 +288,22 @@ internal static class WindowEndpoints
 
     private static async Task<Results<Created<ReceiptResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>> CreateReceiptAsync(
         CreateReceiptRequest request, RevenueDbContext db, WindowService window, ReceiptDocument document, IMasterDataReferences master,
-        ITenantContext caller, ICallerPermissions permissions, CancellationToken ct)
+        ITenantContext caller, ICallerPermissions permissions, HttpContext http, CancellationToken ct)
     {
+        // Money is taken once: a repeated request with the same Idempotency-Key gets the receipt the first one issued.
+        var (key, badKey) = Idempotency.KeyOf(http.Request);
+        if (badKey is not null) return RevenueSupport.Invalid(Idempotency.Header, badKey);
+        var hash = key is null ? null : Idempotency.HashOf(request);
+        async Task<Results<Created<ReceiptResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>?> ReplayAsync()
+        {
+            var issued = await db.Receipts.AsNoTracking().Where(r => r.IdempotencyKey == key)
+                .Select(r => new { r.ReceiptId, r.IdempotencyHash }).SingleOrDefaultAsync(ct);
+            if (issued is null) return null;
+            if (!Idempotency.SameRequest(issued.IdempotencyHash, hash!)) return Idempotency.DifferentRequest(key!);
+            return TypedResults.Created($"/api/revenue/window/receipts/{issued.ReceiptId}", (await document.ReadAsync(issued.ReceiptId, ct))!);
+        }
+        if (key is not null && await ReplayAsync() is { } replay) return replay;
+
         var errors = new Dictionary<string, List<string>>();
         if (request.BookingContainerIds is not { Count: > 0 }) errors.Add("bookingContainerIds", "Name at least one box.");
         if (request.Payments is not { Count: > 0 }) errors.Add("payments", "How was it paid?");
@@ -370,10 +384,17 @@ internal static class WindowEndpoints
         try
         {
             var (receipt, coupons) = await window.IssueReceiptAsync(context, shift, payable, request.Payments!,
-                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, request.ReplacesReceiptId, ct, withheld);
+                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, request.ReplacesReceiptId, ct, withheld, key, hash);
             return TypedResults.Created($"/api/revenue/window/receipts/{receipt.ReceiptId}",
                 (await document.ReadAsync(receipt.ReceiptId, ct,
                     coupons.Select(c => new CouponResponse(c.CouponRef, c.ContainerNo, c.MovementCode, c.ValidUntil)).ToList()))!);
+        }
+        catch (DbUpdateException e) when (key is not null && e.InnerException?.Message.Contains("uq_receipt__idempotency_key") == true)
+        {
+            // The same key arrived twice at once and the other request won: answer with its receipt.
+            db.ChangeTracker.Clear();
+            return await ReplayAsync()
+                   ?? RevenueSupport.Conflict($"A request with {Idempotency.Header} {key} is still being processed.", "Repeat it in a moment.");
         }
         catch (DbUpdateException)
         {
@@ -674,7 +695,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
 
     public async Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(WindowContext context, Shift shift, List<QuotedBox> payable,
         IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct,
-        decimal withheld = 0m)
+        decimal withheld = 0m, string? idempotencyKey = null, byte[]? idempotencyHash = null)
     {
         var plan = context.Plan;
         var now = context.Now;
@@ -695,6 +716,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             SubtotalAmount = payable.Sum(b => b.Quote!.Subtotal), TaxAmount = payable.Sum(b => b.Quote!.Tax),
             Status = "ISSUED", ReplacesReceiptId = replacesReceiptId,
             WithholdingTaxRate = withheld > 0 ? WithholdingTax.Rate : null, WithholdingTaxAmount = withheld,
+            IdempotencyKey = idempotencyKey, IdempotencyHash = idempotencyHash,
         };
         receipt.TotalAmount = receipt.SubtotalAmount + receipt.TaxAmount;
         db.Receipts.Add(receipt);

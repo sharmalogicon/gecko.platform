@@ -1297,6 +1297,14 @@ public partial class RevenueDbContext : DbContext
                 .IsUnicode(false)
                 .HasColumnName("receipt_no");
             entity.Property(e => e.ReplacesReceiptId).HasColumnName("replaces_receipt_id");
+            entity.Property(e => e.IdempotencyKey)
+                .HasMaxLength(100)
+                .IsUnicode(false)
+                .HasColumnName("idempotency_key");
+            entity.Property(e => e.IdempotencyHash)
+                .HasMaxLength(32)
+                .IsFixedLength()
+                .HasColumnName("idempotency_hash");
             entity.Property(e => e.RowVersion)
                 .IsRowVersion()
                 .IsConcurrencyToken()

@@ -107,6 +107,30 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>
+    /// For test bookings raised WITHOUT a carrier reference: they are marked with a
+    /// customer_ref instead, given a throwaway carrier_ref here, and removed the usual way.
+    /// </summary>
+    public static async Task RemoveBookingsByCustomerRefAsync(string customerRef)
+    {
+        var tag = $"ZZDEL-{Guid.NewGuid():N}"[..20];
+        await using (var connection = new SqlConnection(AdminConnection))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+                UPDATE booking.booking SET carrier_ref = @tag + RIGHT(CONVERT(VARCHAR(36), booking_id), 12)
+                 WHERE customer_ref = @ref AND carrier_ref IS NULL AND deleted_at IS NULL;
+                """;
+            command.Parameters.AddWithValue("@tag", tag);
+            command.Parameters.AddWithValue("@ref", customerRef);
+            await command.ExecuteNonQueryAsync();
+        }
+        await RemoveCashWindowAsync(tag, null);
+        await RemoveBookingsAsync(tag);
+    }
+
     /// <summary>Soft-deletes test holds (by container number). Test-only — a hold is released, never erased.</summary>
     public static async Task RemoveHoldsAsync(params string[] containerNos)
     {

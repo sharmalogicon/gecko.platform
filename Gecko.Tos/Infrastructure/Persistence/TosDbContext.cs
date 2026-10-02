@@ -174,6 +174,14 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(40)
                 .IsUnicode(false)
                 .HasColumnName("carrier_ref");
+            entity.Property(e => e.IdempotencyKey)
+                .HasMaxLength(100)
+                .IsUnicode(false)
+                .HasColumnName("idempotency_key");
+            entity.Property(e => e.IdempotencyHash)
+                .HasMaxLength(32)
+                .IsFixedLength()
+                .HasColumnName("idempotency_hash");
             entity.Property(e => e.CloseReason)
                 .HasMaxLength(500)
                 .HasColumnName("close_reason");

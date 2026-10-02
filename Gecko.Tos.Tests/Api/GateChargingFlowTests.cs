@@ -607,6 +607,21 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             var receipt = (await paid.Content.ReadFromJsonAsync<ReceiptResponse>(ct))!;
             Assert.Equal(1, receipt.Lines.Count(l => l.ChargeCode == "GATETRIP"));
             Assert.Equal(2, receipt.Lines.Count(l => l.ChargeCode == "GATEFEE"));
+
+            // ── the visit's mode is DERIVED from its moves: two drop-offs, then the same truck takes one away
+            async Task<TruckVisitResponse> VisitAsync() => (await client.GetFromJsonAsync<TruckVisitResponse>($"{Gate}/visits/{first.TruckVisitId}", ct))!;
+            Assert.Equal("DROPOFF", (await VisitAsync()).PickupDropoffMode);
+            var taken = await PickUpAsync(client, boxes[0], ct, first.TruckVisitId);
+            var visit = await VisitAsync();
+            Assert.Equal("PICKUP_DROPOFF", visit.PickupDropoffMode);
+            var listed = (await client.GetFromJsonAsync<Gecko.Data.PagedResult<TruckVisitResponse>>($"{Gate}/visits?search={visit.VisitNo}", ct))!;
+            Assert.Equal("PICKUP_DROPOFF", Assert.Single(listed.Items).PickupDropoffMode);
+
+            // A voided move never happened: the visit is a drop-off again.
+            var voided = await client.PostAsJsonAsync($"{Gate}/transactions/{taken.GateTransactionId}/void",
+                new { reason = "took the wrong box", rowVersion = taken.RowVersion }, ct);
+            Assert.True(voided.IsSuccessStatusCode, await voided.Content.ReadAsStringAsync(ct));
+            Assert.Equal("DROPOFF", (await VisitAsync()).PickupDropoffMode);
         }
         finally { await CleanAsync(carrierRef, shiftId); }
     }

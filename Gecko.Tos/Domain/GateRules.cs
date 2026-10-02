@@ -232,6 +232,20 @@ public static class GateRules
             [PickUpContainer] = Out,
         };
 
+    /// <summary>
+    /// What the TRUCK did on a visit, in the PICKUP_DROPOFF_MODE vocabulary (gecko_master 12),
+    /// DERIVED from its recorded moves and never stored or declared: the trip type is the
+    /// move's, the mode is the visit's, and a second statement of it would be a second truth.
+    /// Only moves that stand count (a voided EIR never happened).
+    /// </summary>
+    public static string VisitMode(int movesIn, int movesOut) => (movesIn > 0, movesOut > 0) switch
+    {
+        (true, true) => "PICKUP_DROPOFF",
+        (true, false) => "DROPOFF",
+        (false, true) => "PICKUP",
+        _ => "NONE",
+    };
+
     /// <summary>A trip type that says the opposite of the direction is a contradiction, not a hint.</summary>
     public static string? TripTypeContradiction(string tripType, string direction) =>
         TripTypeDirections.TryGetValue(tripType, out var expected) && expected != direction

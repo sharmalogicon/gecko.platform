@@ -31,6 +31,15 @@ public sealed class GateTripTypeRuleTests
     }
 
     [Fact]
+    public void A_visits_mode_is_what_its_moves_add_up_to()
+    {
+        Assert.Equal("DROPOFF", GateRules.VisitMode(movesIn: 2, movesOut: 0));
+        Assert.Equal("PICKUP", GateRules.VisitMode(movesIn: 0, movesOut: 1));
+        Assert.Equal("PICKUP_DROPOFF", GateRules.VisitMode(movesIn: 1, movesOut: 1));
+        Assert.Equal("NONE", GateRules.VisitMode(movesIn: 0, movesOut: 0));
+    }
+
+    [Fact]
     public void A_pick_up_needs_nothing_extra()
     {
         Assert.Empty(GateRules.MissingForTrip(GateRules.PickUpContainer, GateRules.Full, isExport: true, null, null, null, null, 0));

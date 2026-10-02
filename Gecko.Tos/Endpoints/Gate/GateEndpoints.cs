@@ -585,8 +585,18 @@ internal static class GateEndpoints
 
         var page = await rows.OrderByDescending(v => v.ArrivedAt).ToPagedAsync(query.Page, query.PageSize, ct);
 
+        // The page's moves that stand, counted per visit and direction: the visit's mode is derived from them.
+        var ids = page.Items.Select(v => v.TruckVisitId).ToList();
+        var moves = await db.GateTransactions.AsNoTracking()
+            .Where(g => ids.Contains(g.TruckVisitId) && g.Status == "COMPLETED")
+            .GroupBy(g => new { g.TruckVisitId, g.Direction })
+            .Select(g => new { g.Key.TruckVisitId, g.Key.Direction, Count = g.Count() })
+            .ToListAsync(ct);
+        int Moves(Guid visitId, string way) => moves.Where(m => m.TruckVisitId == visitId && m.Direction == way).Sum(m => m.Count);
+
         return TypedResults.Ok(new PagedResult<TruckVisitResponse>(
-            page.Items.Select(v => Project(v, [])).ToList(), page.Page, page.PageSize, page.TotalCount));
+            page.Items.Select(v => Project(v, [], GateRules.VisitMode(Moves(v.TruckVisitId, GateRules.In), Moves(v.TruckVisitId, GateRules.Out)))).ToList(),
+            page.Page, page.PageSize, page.TotalCount));
     }
 
     private static async Task<Results<Ok<TruckVisitResponse>, NotFound>> GetVisitAsync(
@@ -604,8 +614,12 @@ internal static class GateEndpoints
                 t.ContainerNo, b.OrderNo, t.LinePartyCode, visit.TruckPlate,
                 t.TransactionAt, t.IsLate, t.Status)).ToListAsync(ct);
 
-        return TypedResults.Ok(Project(visit, boxes));
+        return TypedResults.Ok(Project(visit, boxes, ModeOf(boxes)));
     }
+
+    private static string ModeOf(IReadOnlyList<GateTransactionSummaryResponse> boxes) => GateRules.VisitMode(
+        boxes.Count(b => b.Status == "COMPLETED" && b.Direction == GateRules.In),
+        boxes.Count(b => b.Status == "COMPLETED" && b.Direction == GateRules.Out));
 
     private static async Task<Results<Ok<TruckVisitResponse>, NotFound, ValidationProblem, ProblemHttpResult>> DepartAsync(
         Guid id, DepartTruckRequest? request, TosDbContext db, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
@@ -621,7 +635,9 @@ internal static class GateEndpoints
         visit.GateOutAt = departedAt;
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
-        return TypedResults.Ok(Project(visit, []));
+        var ways = await db.GateTransactions.AsNoTracking()
+            .Where(g => g.TruckVisitId == id && g.Status == "COMPLETED").Select(g => g.Direction).ToListAsync(ct);
+        return TypedResults.Ok(Project(visit, [], GateRules.VisitMode(ways.Count(w => w == GateRules.In), ways.Count(w => w == GateRules.Out))));
     }
 
     private static async Task<Results<Ok<PagedResult<YardContainerResponse>>, ValidationProblem>> InYardAsync(
@@ -781,11 +797,11 @@ internal static class GateEndpoints
                 ["findings"] = findings.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList(),
             });
 
-    private static TruckVisitResponse Project(TruckVisit v, IReadOnlyList<GateTransactionSummaryResponse> boxes) => new(
+    private static TruckVisitResponse Project(TruckVisit v, IReadOnlyList<GateTransactionSummaryResponse> boxes, string? mode = null) => new(
         v.TruckVisitId, v.VisitNo, v.BranchId, v.TruckPlate, v.TrailerPlate, v.HaulierPartyCode, v.DriverName, v.LaneCode,
         v.ArrivedAt, v.GateInAt, v.GateOutAt, v.DwellMinutes,
         v.GateOutAt is not null ? "DEPARTED" : v.GateInAt is not null ? "ON_SITE" : "ARRIVED",
-        v.Source, boxes, v.TruckCategoryCode);
+        v.Source, boxes, v.TruckCategoryCode, mode);
 
     private static async Task<GatePreflightResponse> ProjectAsync(TosDbContext db, BarrierView view, CancellationToken ct)
     {

@@ -438,6 +438,13 @@ internal static class BookingEndpoints
             where numbers.Contains(x.ContainerNo) && x.EndedAt == null
             select new { x.ContainerNo, b.OrderNo, x.BookingId }).ToListAsync(ct);
 
+        // Where each box stands now, for the checks a handover mode switches on (Vector BookingEntry.cs:626-655).
+        var inYard = items.Any(i => i.HandoverMode.Clean() is not null)
+            ? await db.ContainerVisits.AsNoTracking()
+                .Where(v => numbers.Contains(v.ContainerNo) && v.GateOutTransactionId == null && v.BranchId == booking.BranchId)
+                .Select(v => new { v.ContainerNo, v.FullEmpty }).ToListAsync(ct)
+            : [];
+
         var used = await UsedPerLineAsync(db, booking.BookingId, ct);
         var adding = new Dictionary<Guid, int>();
         var toAdd = new List<(BookingContainer Box, IReadOnlyList<OrderTypeStepRef> Steps)>();
@@ -491,6 +498,16 @@ internal static class BookingEndpoints
             if (item.DeclaredSealNo?.Length > 20) errors.Add($"{key}.declaredSealNo", "At most 20 characters.");
             if (item.DeclaredVgmKg is <= 0) errors.Add($"{key}.declaredVgmKg", "A VGM is a positive weight; leave it out if unknown.");
 
+            var mode = item.HandoverMode.Clean();
+            if (mode is not null)
+            {
+                if (BookingRules.HandoverModeProblem(booking.DirectionCode, mode) is { } wrongList)
+                    errors.Add($"{key}.handoverMode", wrongList);
+                else if (BookingRules.HandoverRefusal(booking.DirectionCode, mode, inYard.Any(v => v.ContainerNo == no),
+                             inYard.FirstOrDefault(v => v.ContainerNo == no)?.FullEmpty) is { } refused)
+                    errors.Add($"{key}.containerNo", $"{no} {refused}");
+            }
+
             toAdd.Add((new BookingContainer
             {
                 TenantId = booking.TenantId,
@@ -503,6 +520,7 @@ internal static class BookingEndpoints
                 AssignmentSource = source,
                 DeclaredSealNo = item.DeclaredSealNo.Clean(),
                 DeclaredVgmKg = item.DeclaredVgmKg,
+                HandoverModeCode = mode,
             }, steps));
         }
 
@@ -806,7 +824,8 @@ internal static class BookingEndpoints
                 x.BookingContainerId, x.EquipmentRequirementId, lineNoOf.GetValueOrDefault(x.EquipmentRequirementId), x.ContainerNo,
                 x.ContainerId is not null, x.IsCheckDigitValid, x.AssignmentSource, x.DeclaredSealNo, x.DeclaredVgmKg,
                 x.AssignedAt, x.EndedAt, x.EndReason,
-                steps[x.BookingContainerId].Select(m => new StepResponse(m.MovementPlanId, m.SequenceNo, m.MovementCode, m.IsRequired, m.Status, m.GateTransactionId, m.SkipReason)).ToList()
+                steps[x.BookingContainerId].Select(m => new StepResponse(m.MovementPlanId, m.SequenceNo, m.MovementCode, m.IsRequired, m.Status, m.GateTransactionId, m.SkipReason)).ToList(),
+                x.HandoverModeCode
             )).ToList());
     }
 }

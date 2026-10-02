@@ -29,6 +29,9 @@ public partial class BookingContainer
 
     public decimal? DeclaredVgmKg { get; set; }
 
+    /// <summary>gecko_tos 18: Vector's P/U Mode / D/O Mode / repo mode — who collects or delivers the box. Null = not said.</summary>
+    public string? HandoverModeCode { get; set; }
+
     public DateTimeOffset? EndedAt { get; set; }
 
     public Guid? EndedBy { get; set; }

@@ -40,7 +40,9 @@ public sealed record StepResponse(Guid MovementPlanId, short SequenceNo, string 
 public sealed record BookingContainerResponse(
     Guid BookingContainerId, Guid EquipmentRequirementId, short LineNo, string ContainerNo, bool InRegistry, bool IsCheckDigitValid,
     string Source, string? DeclaredSealNo, decimal? DeclaredVgmKg, DateTimeOffset AssignedAt,
-    DateTimeOffset? EndedAt, string? EndReason, IReadOnlyList<StepResponse> Steps);
+    DateTimeOffset? EndedAt, string? EndReason, IReadOnlyList<StepResponse> Steps,
+    // Vector's P/U Mode / D/O Mode / repo mode: who collects or delivers this box. Null = not said.
+    string? HandoverMode = null);
 
 public sealed record BookingDetailResponse(
     BookingResponse Booking,
@@ -106,7 +108,10 @@ public sealed record AssignContainerItem(
     string ContainerNo,
     short? LineNo = null,
     string? DeclaredSealNo = null,
-    decimal? DeclaredVgmKg = null);
+    decimal? DeclaredVgmKg = null,
+    // IMPORT: DO_OWN | DO_OTHER | DO_ONLY | DO_CUS · EXPORT: PU_OWN | PU_OTHER | PU_ONLY | PU_PORT · other: REPO_OWN | REPO_OTHER.
+    // Optional. When sent, Vector's booking checks apply (BookingRules.HandoverRefusal).
+    [property: MaxLength(20)] string? HandoverMode = null);
 
 public sealed record AssignContainersRequest(
     [property: Required, MinLength(1)] IReadOnlyList<AssignContainerItem> Containers,

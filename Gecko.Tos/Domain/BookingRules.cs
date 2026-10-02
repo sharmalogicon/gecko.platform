@@ -52,6 +52,53 @@ public static class BookingRules
         return null;
     }
 
+    // ── who picks up / drops off the box (Vector P/U Mode / D/O Mode, BookingEntry.cs) ──
+
+    /// <summary>
+    /// Vector's lookups, by booking direction (BookingEntry.cs:436-441): DropOffMode for an
+    /// IMPORT, PickupMode for an EXPORT, RepoMode for everything else. The SQL CHECK
+    /// ck_booking_container__handover_mode (gecko_tos 18) pins the same ten codes.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string[]> HandoverModes = new Dictionary<string, string[]>
+    {
+        ["IMPORT"] = ["DO_OWN", "DO_OTHER", "DO_ONLY", "DO_CUS"],
+        ["EXPORT"] = ["PU_OWN", "PU_OTHER", "PU_ONLY", "PU_PORT"],
+        ["REPO"] = ["REPO_OWN", "REPO_OTHER"],
+    };
+
+    /// <summary>Which of Vector's three lists a booking's direction selects.</summary>
+    public static string HandoverFamily(string? directionCode) =>
+        directionCode?.Contains("IMPORT", StringComparison.OrdinalIgnoreCase) == true ? "IMPORT"
+        : directionCode?.Contains("EXPORT", StringComparison.OrdinalIgnoreCase) == true ? "EXPORT"
+        : "REPO";
+
+    /// <summary>A mode from another booking type's list (a D/O mode on an export) is a contradiction, not a choice.</summary>
+    public static string? HandoverModeProblem(string? directionCode, string mode)
+    {
+        var family = HandoverFamily(directionCode);
+        return HandoverModes[family].Contains(mode, StringComparer.Ordinal)
+            ? null
+            : $"'{mode}' is not a mode of this booking. Use one of: {string.Join(", ", HandoverModes[family])}.";
+    }
+
+    /// <summary>
+    /// Vector's booking checks, with the two modes that relax them (BookingEntry.cs:626-655):
+    /// an EXPORT box must be in this yard and EMPTY — unless it is picked up elsewhere
+    /// (PU_OTHER); an IMPORT box must not already be in this yard — unless the customer
+    /// drops it off (DO_CUS). They apply only when a mode is SAID: a box assigned with
+    /// no mode is judged as before this field existed.
+    /// </summary>
+    /// <param name="inYardHere">The box has an open stay at the booking's depot.</param>
+    /// <param name="fullEmptyInYard">FULL / EMPTY of that stay; null when it is not here.</param>
+    public static string? HandoverRefusal(string? directionCode, string mode, bool inYardHere, string? fullEmptyInYard) =>
+        (HandoverFamily(directionCode), mode, inYardHere) switch
+        {
+            ("EXPORT", not "PU_OTHER", false) => "is not in this yard. An export box is picked up from the yard — use PU_OTHER if it is collected elsewhere.",
+            ("EXPORT", not "PU_OTHER", true) when fullEmptyInYard != "EMPTY" => "is not EMPTY in the yard. Only an empty box is released to an export booking.",
+            ("IMPORT", not "DO_CUS", true) => "is already in this yard. An import box arrives on its booking — use DO_CUS if the customer drops it off.",
+            _ => null,
+        };
+
     /// <summary>Q10: a quantity may not drop below the boxes already on the line.</summary>
     public static string? CannotSetQty(int newQty, int usedOnLine) =>
         newQty < usedOnLine

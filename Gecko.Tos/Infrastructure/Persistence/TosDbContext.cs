@@ -330,6 +330,10 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.DeclaredVgmKg)
                 .HasColumnType("decimal(10, 2)")
                 .HasColumnName("declared_vgm_kg");
+            entity.Property(e => e.HandoverModeCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("handover_mode_code");
             entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
             entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
             entity.Property(e => e.EndReason)

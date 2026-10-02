@@ -168,4 +168,7 @@ public sealed record TruckVisitResponse(
     string? HaulierCode, string? DriverName, string? LaneCode,
     DateTimeOffset ArrivedAt, DateTimeOffset? GateInAt, DateTimeOffset? GateOutAt, int? DwellMinutes,
     string Status, string Source, IReadOnlyList<GateTransactionSummaryResponse> Transactions,
-    string? TruckCategoryCode = null);
+    string? TruckCategoryCode = null,
+    // What the truck did, DERIVED from its completed (not voided) moves — a PICKUP_DROPOFF_MODE code:
+    // DROPOFF (in only), PICKUP (out only), PICKUP_DROPOFF (both), NONE (no move stands). Never an input.
+    string? PickupDropoffMode = null);

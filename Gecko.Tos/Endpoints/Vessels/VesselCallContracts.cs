@@ -18,7 +18,9 @@ public sealed record VesselCallResponse(
     DateTimeOffset Eta, DateTimeOffset? Etb, DateTimeOffset Etd,
     DateTimeOffset? Ata, DateTimeOffset? Atb, DateTimeOffset? Atd,
     string Status, bool IsCancelled, DateTimeOffset? CancelledAt, string? CancelReason,
-    string Source, string? Remarks, string RowVersion);
+    string Source, string? Remarks, string RowVersion,
+    // A FULL EXPORT box may not gate out before this (Vector LadenReleaseDate); null = no restriction.
+    DateTimeOffset? LadenReleaseAt = null);
 
 public sealed record VesselCallLineResponse(
     Guid VesselCallLineId, string LineCode, string? AgentCode, string? VoyageIn, string? VoyageOut, string? ServiceCode);
@@ -54,7 +56,9 @@ public sealed record SaveVesselCallRequest(
     [property: MaxLength(500)] string? Remarks = null,
     IReadOnlyList<VesselCallLineItem>? Lines = null,
     IReadOnlyList<VesselCallCutoffItem>? Cutoffs = null,
-    string? RowVersion = null);
+    string? RowVersion = null,
+    // Header field like Etb: what is sent is what is stored (null = no laden release date).
+    DateTimeOffset? LadenReleaseAt = null);
 
 public sealed record VesselCallLineItem(
     string LineCode,

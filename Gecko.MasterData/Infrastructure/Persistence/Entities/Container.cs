@@ -41,6 +41,9 @@ public partial class Container
 
     public string? ReeferUnitModel { get; set; }
 
+    /// <summary>gecko_master 25: comma-separated port codes the box is designated to; null = any port.</summary>
+    public string? FixedPortCodes { get; set; }
+
     public string Status { get; set; } = null!;
 
     public DateTimeOffset? StatusChangedAt { get; set; }

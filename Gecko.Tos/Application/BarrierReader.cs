@@ -82,9 +82,14 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         var active = await db.VwActiveHolds.AsNoTracking().Where(h => h.ContainerNo == containerNo).ToListAsync(ct);
         var holdDefinitions = await master.HoldsAsync(active.Select(h => h.HoldCode), ct);
         var holds = active.Select(h => (Hold: h, Definition: holdDefinitions.GetValueOrDefault(h.HoldCode))).ToList();
-        foreach (var (hold, definition) in holds)
-            if (GateRules.HoldBlocks(hold.HoldCode, definition?.BlockingScope, definition?.DescriptionEn, direction) is { } blocked)
-                findings.Add(blocked);
+        // Judged once the step is known (a movement that releases damaged boxes lets
+        // the damage hold through), but said here, where the clerk expects them.
+        var holdsAt = findings.Count;
+        void JudgeHolds(bool movementReleasesDamaged) =>
+            findings.InsertRange(holdsAt, holds
+                .Select(h => GateRules.HoldBlocks(h.Hold.HoldCode, h.Definition?.BlockingScope, h.Definition?.DescriptionEn, direction,
+                    h.Definition?.AutoApplyOnEvent, movementReleasesDamaged))
+                .OfType<GateFinding>());
 
         // ── 5. the yard ─────────────────────────────────────────────────────
         var openVisit = await db.ContainerVisits.AsNoTracking()
@@ -94,6 +99,7 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
 
         if (assignment is null)
         {
+            JudgeHolds(movementReleasesDamaged: false);
             // Q1: the ad-hoc gate is not a refusal — it is a WALK_IN booking the
             // clerk creates first. The barrier says so rather than just "no".
             findings.Add(new GateFinding("NO_ASSIGNMENT",
@@ -156,6 +162,8 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             toSkip.Add(candidate);
         }
 
+        JudgeHolds(stepRules?.AllowDamagedRelease ?? false);
+
         if (step is null && !findings.Any(f => f.Code == "STEP_OUT_OF_ORDER"))
             findings.Add(new GateFinding("NO_PENDING_STEP",
                 pending.Count == 0
@@ -173,6 +181,25 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             // marks every import in the country late.
             var isFull = string.Equals(stepRules.FullEmpty, GateRules.Full, StringComparison.Ordinal);
             var isExport = booking.DirectionCode.Contains("EXPORT", StringComparison.OrdinalIgnoreCase);
+
+            // ── 7. the gate-out release gates (Vector GateOut.cs:1139-1171) ──
+            if (direction == GateRules.Out)
+            {
+                if (isExport && GateRules.FixedPort(containerNo, registry?.FixedPortCodes, booking.OrderNo, booking.PodPortCode) is { } wrongPort)
+                    findings.Add(wrongPort);
+
+                if (openVisit is not null && GateRules.BeforePreviousMove(containerNo, at, openVisit.LastEventAt) is { } early)
+                    findings.Add(early);
+
+                if (isFull && isExport && booking.VesselCallId is { } sailingOn)
+                {
+                    var call = await db.VesselCalls.AsNoTracking().Where(c => c.VesselCallId == sailingOn)
+                        .Select(c => new { c.CallRef, c.LadenReleaseAt }).SingleOrDefaultAsync(ct);
+                    if (GateRules.BeforeLadenRelease(containerNo, call?.CallRef, at, call?.LadenReleaseAt) is { } held)
+                        findings.Add(held);
+                }
+            }
+
             if (direction == GateRules.In && isFull && isExport && booking.VesselCallId is { } callId)
             {
                 var kind = CutoffKindFor(booking, requirement);

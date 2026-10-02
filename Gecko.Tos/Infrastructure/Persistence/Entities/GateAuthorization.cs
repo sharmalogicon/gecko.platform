@@ -54,4 +54,10 @@ public partial class GateAuthorization
     public Guid? DeletedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    /// <summary>gecko_tos 16: the TRUCK_CATEGORY the window priced this move with.</summary>
+    public string? TruckCategoryCode { get; set; }
+
+    /// <summary>gecko_tos 16: the haulier whose charge terms the window priced with.</summary>
+    public string? HaulierPartyCode { get; set; }
 }

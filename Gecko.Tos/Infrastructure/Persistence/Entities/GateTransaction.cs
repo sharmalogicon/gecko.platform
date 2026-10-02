@@ -124,4 +124,26 @@ public partial class GateTransaction
     public Guid? DeletedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    public string? TripTypeCode { get; set; }
+
+    public string? MaterialCode { get; set; }
+
+    public decimal? MaxGrossWeightKg { get; set; }
+
+    public decimal? CargoWeightKg { get; set; }
+
+    public string? VentSetting { get; set; }
+
+    public decimal? HumidityPct { get; set; }
+
+    public string? GensetNo { get; set; }
+
+    public string? ClipOnNo { get; set; }
+
+    public string? CustomsPermitNo { get; set; }
+
+    public string? PaperlessCode { get; set; }
+
+    public string? NextLocationCode { get; set; }
 }

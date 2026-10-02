@@ -54,4 +54,6 @@ public partial class TruckVisit
     public Guid? DeletedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    public string? TruckCategoryCode { get; set; }
 }

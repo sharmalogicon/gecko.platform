@@ -138,4 +138,8 @@ public partial class Charge
     public Guid? UpdatedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    public Guid? TruckVisitId { get; set; }
+
+    public bool IsTripCharge { get; set; }
 }

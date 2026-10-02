@@ -48,6 +48,9 @@ public interface IMasterDataReferences
     /// <summary>An INT tenant setting, resolved branch → tenant → declared default.</summary>
     Task<int> GetIntSettingAsync(string settingKey, Guid? branchId, int fallback, CancellationToken ct);
 
+    /// <summary>A STRING / JSON tenant setting as stored, resolved branch → tenant → declared default (null when none).</summary>
+    Task<string?> GetStringSettingAsync(string settingKey, Guid? branchId, CancellationToken ct);
+
     // ── TOS (gecko_tos PLAN P-3) ─────────────────────────────────────────────
     // Vessel calls point at a vessel, a port and a terminal. Holds, conditions,
     // grades and order-type plans arrive with the TOS batches that need them.
@@ -100,6 +103,14 @@ public interface IMasterDataReferences
     /// is null. Who pays and how is the tariff's decision — this is only the menu.
     /// </summary>
     Task<IReadOnlyList<OrderTypeChargeRef>> OrderTypeChargesAsync(string orderTypeCode, CancellationToken ct);
+
+    /// <summary>
+    /// A haulier's own payment terms for one order type (gecko_master 22, Vector
+    /// Master.HaulierChargeTerm): matched on (MovementCode, ChargeCode), a term
+    /// REPLACES the charge line's own CASH / CREDIT (gate-in-vector-parity.md §3.3,
+    /// GateIn.cs:1316 / 1508). Empty when the haulier has none — the line keeps its term.
+    /// </summary>
+    Task<IReadOnlyList<HaulierChargeTermRef>> HaulierChargeTermsAsync(string haulierCode, string orderTypeCode, CancellationToken ct);
 
     /// <summary>The bill-to × term variants of these charge codes, each with its tax (the cash receipt is a tax invoice).</summary>
     Task<IReadOnlyList<ChargeVariantRef>> ChargeVariantsAsync(IEnumerable<string> chargeCodes, CancellationToken ct);
@@ -162,6 +173,9 @@ public sealed record OrderTypeChargeRef(
     Guid ChargeCodeId, string ChargeCode, string? MovementCode, string BillTo, string? PaymentTermCode,
     bool IsDefault, bool IsOptional, bool IsValueAddedService, bool RaiseAtGateIn, decimal? DefaultQty);
 
+/// <param name="PaymentTermCode">CASH or CREDIT.</param>
+public sealed record HaulierChargeTermRef(string HaulierCode, string OrderTypeCode, string MovementCode, string ChargeCode, string PaymentTermCode);
+
 /// <param name="ChargeCategory">For STORAGE: EMPTY or LADEN — which stays it applies to.</param>
 public sealed record ChargeVariantRef(
     Guid ChargeCodeId, string ChargeCode, string DescriptionEn, string? DescriptionLocal,
@@ -214,7 +228,9 @@ public sealed record OrderTypeStepRef(
     string Direction, string FullEmpty, bool RequiresSurvey, bool ChangesYardPosition);
 
 /// <summary><see cref="EquipmentTypeCode"/> is null when the registry row was entered without a type.</summary>
-public sealed record ContainerRef(Guid ContainerId, string ContainerNo, string? EquipmentTypeCode, string Status, bool IsCheckDigitValid);
+/// <param name="FixedPortCodes">The ports the box is designated to (gecko_master 25); empty = any port.</param>
+public sealed record ContainerRef(Guid ContainerId, string ContainerNo, string? EquipmentTypeCode, string Status, bool IsCheckDigitValid,
+    IReadOnlyList<string>? FixedPortCodes = null);
 
 /// <summary>
 /// <see cref="BlockingScope"/> is ALL / RELEASE / LOAD / GATE_IN / GATE_OUT and
@@ -233,6 +249,15 @@ public static class RevenueSettingKeys
 {
     /// <summary>gecko_master 16_revenue_settings.sql — relaxes tariff maker-checker.</summary>
     public const string TariffSelfApprovalAllowed = "revenue.tariff_self_approval_allowed";
+
+    /// <summary>gecko_master 23 — the TRUCK_CATEGORY a gate move is priced with when none is named (KORAKIT: 18_WHEEL).</summary>
+    public const string DefaultTruckCategory = "gate.default_truck_category";
+
+    /// <summary>gecko_master 23 — JSON array of order types charged the PER_TRIP gate charge only (Vector "LOAD ONLY GATE-CHARGE FOR").</summary>
+    public const string GateChargeOnlyOrderTypes = "gate.gate_charge_only_order_types";
+
+    /// <summary>gecko_master 12 — the cash window may offer withholding tax on a receipt (default true).</summary>
+    public const string WithholdingTaxEnabled = "billing.withholding_tax_enabled";
 }
 
 /// <summary>gecko_master 17_tos_prerequisites.sql.</summary>

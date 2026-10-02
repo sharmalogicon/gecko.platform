@@ -172,6 +172,41 @@ public sealed class VesselCallApiTests(TosApiFactory api)
     }
 
     [Fact]
+    public async Task The_laden_release_date_is_a_header_field_of_the_call()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var callRef = NewRef();
+        var voyage = NewVoyage();
+        try
+        {
+            var release = Etd.AddHours(-72);
+            var created = await client.PostAsJsonAsync(Calls, new
+            {
+                callRef, vesselCode = Vessel, portCode = "THLCH", operatorVoyageOut = voyage,
+                eta = Etd.AddHours(-30), etd = Etd, ladenReleaseAt = release,
+                lines = new object[] { new { lineCode = "MAEU", voyageOut = voyage + "M" } },
+            }, ct);
+            var call = Read<VesselCallDetailResponse>(await ExpectAsync(created, HttpStatusCode.Created, ct)).Call;
+            Assert.Equal(release, call.LadenReleaseAt);
+
+            // The header PUT stores what it is sent: a new date, then none.
+            object Header(DateTimeOffset? ladenReleaseAt, string rowVersion) => new
+            {
+                callRef, vesselCode = Vessel, portCode = "THLCH", operatorVoyageOut = voyage,
+                eta = Etd.AddHours(-30), etd = Etd, ladenReleaseAt, rowVersion,
+            };
+            var later = Read<VesselCallDetailResponse>(await ExpectAsync(
+                await client.PutAsJsonAsync($"{Calls}/{call.VesselCallId}", Header(release.AddHours(6), call.RowVersion), ct), HttpStatusCode.OK, ct)).Call;
+            Assert.Equal(release.AddHours(6), later.LadenReleaseAt);
+            var none = Read<VesselCallDetailResponse>(await ExpectAsync(
+                await client.PutAsJsonAsync($"{Calls}/{call.VesselCallId}", Header(null, later.RowVersion), ct), HttpStatusCode.OK, ct)).Call;
+            Assert.Null(none.LadenReleaseAt);
+        }
+        finally { await TestDatabase.RemoveCallAsync(callRef); }
+    }
+
+    [Fact]
     public async Task Vectors_schedule_defects_are_refused_on_create()
     {
         var ct = TestContext.Current.CancellationToken;

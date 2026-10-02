@@ -34,7 +34,10 @@ public sealed record PartyDetailResponse(
     IReadOnlyList<PartyContactResponse> Contacts,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string RowVersion,
     string? RegistrationNo = null,
-    IReadOnlyList<PartyDuplicateResponse>? Duplicates = null);
+    IReadOnlyList<PartyDuplicateResponse>? Duplicates = null,
+    // A CUSTOMER's long-standing threshold (Vector Customer.NumberOfLongStandingDays): boxes idle longer than
+    // this many days are "long-standing". Recorded only — nothing enforces it at the gate (owner 2026-10-01).
+    short? LongStandingDays = null);
 
 /// <summary>
 /// The contract fields are NameEn … Roles. Address2 / City / State / Postcode /
@@ -42,7 +45,8 @@ public sealed record PartyDetailResponse(
 /// extras: on PUT a null extra means "leave as it is" (send "" to clear), so a
 /// client that only knows the contract fields cannot wipe them by accident.
 /// DefaultCurrency is an ISO 4217 code from lookup.currency; on POST it defaults
-/// to the tenant company's currency, else THB.
+/// to the tenant company's currency, else THB. LongStandingDays is a CUSTOMER's
+/// own extra: null leaves it, 0 clears it.
 /// </summary>
 public sealed record SavePartyRequest(
     [property: Required, MaxLength(255)] string NameEn,
@@ -63,7 +67,8 @@ public sealed record SavePartyRequest(
     [property: MaxLength(500)] string? Website = null,
     [property: MaxLength(1000)] string? Remarks = null,
     [property: MaxLength(100)] string? RegistrationNo = null,
-    [property: RegularExpression("^[A-Za-z]{3}$", ErrorMessage = "A currency is a 3-letter ISO 4217 code.")] string? DefaultCurrency = null);
+    [property: RegularExpression("^[A-Za-z]{3}$", ErrorMessage = "A currency is a 3-letter ISO 4217 code.")] string? DefaultCurrency = null,
+    [property: Range(0, 3650)] short? LongStandingDays = null);
 
 /// <summary>
 /// Parties — customers, shipping lines, forwarders, hauliers — one row in
@@ -201,8 +206,15 @@ internal static class PartyEndpoints
             p.ShortName, p.CountryCode, p.DefaultCurrency,
             p.PrimaryAddress1, p.PrimaryAddress2, p.PrimaryCity, p.PrimaryState, p.PrimaryPostcode,
             p.PrimaryPhone, p.PrimaryEmail, p.PrimaryWebsite, p.Remarks,
-            aliases, contacts, p.CreatedAt, p.UpdatedAt, Convert.ToBase64String(p.RowVersion), p.RegistrationNo, duplicates);
+            aliases, contacts, p.CreatedAt, p.UpdatedAt, Convert.ToBase64String(p.RowVersion), p.RegistrationNo, duplicates,
+            await db.CustomerExtensions.AsNoTracking().Where(e => e.PartyId == p.PartyId)
+                .Select(e => e.LongStandingThresholdDays).SingleOrDefaultAsync(ct));
     }
+
+    /// <summary>The customer role row being saved (added or restored in this unit of work, or already stored).</summary>
+    private static async Task<CustomerExtension?> CustomerRowAsync(MasterDataDbContext db, Guid partyId, CancellationToken ct) =>
+        db.CustomerExtensions.Local.FirstOrDefault(e => e.PartyId == partyId && e.DeletedAt is null)
+        ?? await db.CustomerExtensions.SingleOrDefaultAsync(e => e.PartyId == partyId, ct);
 
     private static async Task<Results<CreatedAtRoute<PartyDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
         SavePartyRequest request, MasterDataDbContext db, ITenantContext caller, CancellationToken ct)
@@ -211,7 +223,12 @@ internal static class PartyEndpoints
         if (badRole is not null) return MasterDataSupport.InvalidReference("roles", badRole);
         if (roles.Count == 0) roles = ["CUSTOMER"];
 
-        var registered = await RegisterAsync(db, caller, request, roles, withRoles: null, ct);
+        if (request.LongStandingDays is not null && !roles.Contains("CUSTOMER"))
+            return MasterDataSupport.InvalidReference("longStandingDays", "Only a customer has long-standing days.");
+        var registered = await RegisterAsync(db, caller, request, roles,
+            withRoles: request.LongStandingDays is { } days
+                ? p => db.CustomerExtensions.Local.Single(e => e.PartyId == p.PartyId).LongStandingThresholdDays = days == 0 ? null : days
+                : null, ct);
         if (registered.Invalid is { } invalid) return invalid;
         if (registered.Problem is { } problem) return problem;
 
@@ -314,6 +331,12 @@ internal static class PartyEndpoints
             && await ShippingLineEndpoints.AgentCodesAsync(db, party.PartyId, ct) is { Count: > 0 } agents)
             return MasterDataSupport.InvalidReference("roles", ShippingLineEndpoints.PrincipalMessage(agents));
         if (roles.Count > 0) await SetRolesAsync(db, party, roles, caller.TenantId(), removeOthers: true, ct);
+        if (request.LongStandingDays is { } days)
+        {
+            if (await CustomerRowAsync(db, party.PartyId, ct) is not { } customer)
+                return MasterDataSupport.InvalidReference("longStandingDays", "Only a customer has long-standing days.");
+            customer.LongStandingThresholdDays = days == 0 ? null : days;
+        }
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
         var saved = await db.Parties.AsNoTracking().SingleAsync(p => p.PartyId == party.PartyId, ct);

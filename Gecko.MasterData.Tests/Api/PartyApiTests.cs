@@ -304,6 +304,50 @@ public sealed class PartyApiTests(MasterDataApiFactory api)
     }
 
     [Fact]
+    public async Task A_customers_long_standing_days_are_recorded_kept_cleared_and_refused_on_a_non_customer()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var admin = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var accounts = await api.ClientForAsync(SctAccounts);
+        string? code = null;
+        try
+        {
+            var created = await admin.PostAsJsonAsync(Base, new { nameEn = "Test Long Standing Co., Ltd.", taxId = NewTaxId(), longStandingDays = 30 }, ct);
+            Assert.True(created.StatusCode == HttpStatusCode.Created, await created.Content.ReadAsStringAsync(ct));
+            var party = (await created.Content.ReadFromJsonAsync<Detail>(ct))!;
+            code = party.PartyCode;
+            Assert.Equal((short?)30, party.LongStandingDays);
+
+            // A PUT that does not mention it leaves it; a new value replaces it; 0 clears it.
+            async Task<Detail> PutAsync(object body)
+            {
+                var response = await accounts.PutAsJsonAsync($"{Base}/{code}", body, ct);
+                Assert.True(response.StatusCode == HttpStatusCode.OK, await response.Content.ReadAsStringAsync(ct));
+                return (await response.Content.ReadFromJsonAsync<Detail>(ct))!;
+            }
+            var kept = await PutAsync(new { nameEn = party.NameEn, taxId = party.TaxId, rowVersion = party.RowVersion });
+            Assert.Equal((short?)30, kept.LongStandingDays);
+            var changed = await PutAsync(new { nameEn = party.NameEn, taxId = party.TaxId, longStandingDays = 45, rowVersion = kept.RowVersion });
+            Assert.Equal((short?)45, changed.LongStandingDays);
+            Assert.Equal((short?)45, (await admin.GetFromJsonAsync<Detail>($"{Base}/{code}", ct))!.LongStandingDays);
+            var cleared = await PutAsync(new { nameEn = party.NameEn, taxId = party.TaxId, longStandingDays = 0, rowVersion = changed.RowVersion });
+            Assert.Null(cleared.LongStandingDays);
+
+            // Negative is refused, and so is a party that is not a customer.
+            var negative = await accounts.PutAsJsonAsync($"{Base}/{code}",
+                new { nameEn = party.NameEn, taxId = party.TaxId, longStandingDays = -1, rowVersion = cleared.RowVersion }, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, negative.StatusCode);
+            var haulier = await admin.PostAsJsonAsync(Base, new { nameEn = "Test Long Standing Haulage", roles = new[] { "HAULIER" }, longStandingDays = 30 }, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, haulier.StatusCode);
+            Assert.Contains("longStandingDays", await haulier.Content.ReadAsStringAsync(ct));
+        }
+        finally
+        {
+            if (code is not null) await DeleteAsync(admin, code, ct);
+        }
+    }
+
+    [Fact]
     public async Task Another_tenant_cannot_see_or_touch_the_party()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -359,5 +403,6 @@ public sealed class PartyApiTests(MasterDataApiFactory api)
         Guid PartyId, string PartyCode, string NameEn, string? NameLocal, string? TaxId, string? BranchNo,
         bool IsActive, List<string> Roles, string CountryCode, string? Address, string? Phone, string? Email,
         List<Alias> Aliases, List<Contact> Contacts, string RowVersion,
-        string? DefaultCurrency = null, string? Website = null, string? Remarks = null, string? RegistrationNo = null);
+        string? DefaultCurrency = null, string? Website = null, string? Remarks = null, string? RegistrationNo = null,
+        short? LongStandingDays = null);
 }

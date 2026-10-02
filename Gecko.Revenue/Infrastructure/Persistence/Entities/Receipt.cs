@@ -60,4 +60,10 @@ public partial class Receipt
     public Guid? UpdatedBy { get; set; }
 
     public byte[] RowVersion { get; set; } = null!;
+
+    /// <summary>gecko_revenue 20: the withholding tax % the clerk applied; null = none.</summary>
+    public decimal? WithholdingTaxRate { get; set; }
+
+    /// <summary>gecko_revenue 20: what the payer withheld. The receipt's total is unchanged; the drawer received total − this.</summary>
+    public decimal WithholdingTaxAmount { get; set; }
 }

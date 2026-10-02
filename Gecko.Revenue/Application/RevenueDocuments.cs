@@ -56,16 +56,19 @@ internal static class RevenueOutbox
 }
 
 /// <summary>
-/// The coupon as TOS reads it (Gecko.Tos CouponHandler.CouponIssued). CouponId is
-/// both the row id and the idempotency key there.
-/// </summary>
-/// <summary>
 /// Take a coupon back (a voided receipt). Revenue keeps the coupon's REF on its
 /// charges, not the id TOS stored, so TOS finds it by ref — unique per tenant.
 /// </summary>
 internal sealed record CouponRevokedPayload(Guid? CouponId, string CouponRef, Guid RevokedBy, string Reason);
 
+/// <summary>
+/// The coupon as TOS reads it (Gecko.Tos CouponHandler.CouponIssued). CouponId is
+/// both the row id and the idempotency key there.
+/// </summary>
+/// <param name="TruckCategoryCode">The truck category the move was priced with; the gate warns when the truck differs (§7.4).</param>
+/// <param name="HaulierCode">The haulier whose charge terms applied; the gate says so when the truck's differs (§7.5).</param>
 internal sealed record CouponIssuedPayload(
     Guid CouponId, Guid BranchId, Guid BookingId, string? ContainerNo, string MovementCode,
     string CouponRef, string Channel, decimal? Amount, string? CurrencyCode,
-    DateTimeOffset ValidFrom, DateTimeOffset ValidUntil, Guid? IssuedBy);
+    DateTimeOffset ValidFrom, DateTimeOffset ValidUntil, Guid? IssuedBy,
+    string? TruckCategoryCode = null, string? HaulierCode = null);

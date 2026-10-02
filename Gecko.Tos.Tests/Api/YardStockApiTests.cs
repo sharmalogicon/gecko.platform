@@ -60,6 +60,7 @@ public sealed class YardStockApiTests(TosApiFactory api)
             branchId = branchId ?? SctLcb01,
             containerNo = box,
             direction = "IN",
+            tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
             truck = new { plate = "70-4321", driverName = "Somchai P." },
             grossWeightKg = 24100m,
             weightSource = "WEIGHBRIDGE",

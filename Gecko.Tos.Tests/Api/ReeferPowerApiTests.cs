@@ -65,6 +65,7 @@ public sealed class ReeferPowerApiTests(TosApiFactory api)
             branchId = branchId ?? SctLcb01,
             containerNo = box,
             direction,
+            tripType = direction == "IN" ? "DROP_OFF_CONT" : "PICK_UP_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
             truck = new { plate = "70-4321", driverName = "Somchai P.", driverLicence = "1234567890123" },
             grossWeightKg = 24100m,
             weightSource = "WEIGHBRIDGE",

@@ -47,6 +47,8 @@ internal static class WindowEndpoints
 
         window.MapGet("/bookings", QuoteAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("What a booking's boxes owe for their next movement — cash lines, storage to a date, what is already paid");
+        window.MapGet("/quote-visit", QuoteVisitAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
+            .WithSummary("What one truck visit was charged — per box and charge line, cash paid now against credit billed later");
         window.MapPost("/shifts", OpenShiftAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("Open my cash drawer at a branch");
         window.MapGet("/shifts/current", CurrentShiftAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
@@ -71,8 +73,12 @@ internal static class WindowEndpoints
 
     // ── the quote ───────────────────────────────────────────────────────────
 
+    /// <param name="bookingContainerIds">Optional: the boxes going on ONE truck (the PER_TRIP gate charge is quoted once for them). None = every box.</param>
+    /// <param name="vas">Gate VAS charge codes ticked by the clerk (value-added, raised at gate-in), offered on an empty drop-off or a pick-up.</param>
     private static async Task<Results<Ok<WindowBookingResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>> QuoteAsync(
-        string? orderNo, DateOnly? paidUntil, RevenueDbContext db, WindowService window, ICallerPermissions permissions, CancellationToken ct)
+        string? orderNo, DateOnly? paidUntil, RevenueDbContext db, WindowService window, ICallerPermissions permissions, CancellationToken ct,
+        string? truckCategoryCode = null, string? haulierCode = null, string[]? vas = null, Guid[]? bookingContainerIds = null,
+        string[]? sameTruckAs = null)
     {
         if (string.IsNullOrWhiteSpace(orderNo)) return RevenueSupport.Invalid("orderNo", "Required.");
 
@@ -85,7 +91,16 @@ internal static class WindowEndpoints
         if (paidUntil is { } until && until < context.Branch.LocalDate(context.Now))
             return RevenueSupport.Invalid("paidUntil", "Storage cannot be paid up to a day that has already gone.");
 
-        var boxes = await window.QuoteBoxesAsync(context, null, paidUntil, ct);
+        var (terms, invalid) = await window.GateTermsAsync(context, truckCategoryCode, haulierCode, vas, ct);
+        if (invalid is not null) return invalid;
+        var (carriedBy, notABooking, payOtherFirst) = await window.TruckCarrierAsync(context, terms, sameTruckAs, ct);
+        if (notABooking is not null) return notABooking;
+        if (payOtherFirst is not null) return payOtherFirst;
+        var only = bookingContainerIds is { Length: > 0 } ids ? ids.ToHashSet() : null;
+        var boxes = await window.QuoteBoxesAsync(context, only, paidUntil, ct, terms, carriedBy);
+        if (only is not null && only.Any(id => boxes.All(b => b.Box.BookingContainerId != id)))
+            return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", only.Where(id => boxes.All(b => b.Box.BookingContainerId != id)))}.");
+        if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
         var settled = await db.Charges.AsNoTracking()
             .Where(c => c.BookingId == plan.BookingId && c.Source == ChargeSource.Window && c.Status != ChargeStatus.Cancelled)
             .ToListAsync(ct);
@@ -98,10 +113,14 @@ internal static class WindowEndpoints
             settled.Where(c => c.BookingContainerId == b.Box.BookingContainerId)
                 .Select(c => new SettledChargeResponse(c.ChargeId, c.ChargeCode, c.Status, c.Amount + c.TaxAmount, c.CouponRef, c.ServiceTo, c.WaiveReason))
                 .ToList(),
-            (b.Quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount)).ToList(),
-            b.Quote?.Total ?? 0, b.Note)).ToList();
+            (b.Quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
+                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" ? t.Trail.FirstOrDefault() : null)).ToList(),
+            b.Quote?.Total ?? 0, b.Note,
+            (b.Quote?.BilledLater ?? []).Select(ToResponse).ToList(),
+            b.Rules is { } r && CashQuoter.OffersVas(r))).ToList();
 
         var lines = boxes.SelectMany(b => b.Quote?.Lines ?? []).ToList();
+        var later = boxes.SelectMany(b => b.Quote?.BilledLater ?? []).ToList();
         var unreplaced = await db.Receipts.AsNoTracking()
             .Where(r => r.BookingId == plan.BookingId && r.Status == "VOIDED" && !db.Receipts.Any(n => n.ReplacesReceiptId == r.ReceiptId))
             .OrderByDescending(r => r.VoidedAt)
@@ -113,7 +132,66 @@ internal static class WindowEndpoints
             boxes.Select(b => b.Quote?.PaidUntil).FirstOrDefault(d => d is not null),
             context.Branch.LocalDate(context.Now),
             responses, lines.Sum(l => l.Amount), lines.Sum(l => l.TaxAmount), lines.Sum(l => l.Total),
-            lines.Select(l => l.CurrencyCode).FirstOrDefault(), unreplaced));
+            lines.Select(l => l.CurrencyCode).FirstOrDefault(), unreplaced,
+            terms.TruckCategoryCode, terms.HaulierCode,
+            new BilledLaterResponse(later.Sum(l => l.Amount), later.Sum(l => l.TaxAmount), later.Sum(l => l.Total),
+                later.Select(l => l.CurrencyCode).FirstOrDefault()),
+            carriedBy,
+            await window.WithholdingOfferedAsync(plan.BranchId, lines.Sum(l => l.Total), ct)
+                ? new WithholdingTaxResponse(WithholdingTax.Rate, WithholdingTax.Amount(lines.Sum(l => l.Amount)),
+                    lines.Sum(l => l.Total) - WithholdingTax.Amount(lines.Sum(l => l.Amount)))
+                : null));
+    }
+
+    // ── a truck visit, priced ───────────────────────────────────────────────
+
+    /// <summary>
+    /// gate-in-vector-parity §6.2. Cash is paid at the window BEFORE the barrier and
+    /// the truck visit only exists once the first box is gated (GATE_CHARGING_DESIGN
+    /// §1), so this is not a second pricing path: it reads the charges the one
+    /// resolver already wrote, keyed on the visit the gate event put on them — the
+    /// cash lines the visit's moves earned, and the credit lines accrued at the gate.
+    /// A visit nothing was charged on (or whose gate event is still on its way) is a 404.
+    /// </summary>
+    private static async Task<Results<Ok<VisitQuoteResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem>> QuoteVisitAsync(
+        Guid? truckVisitId, RevenueDbContext db, ICallerPermissions permissions, CancellationToken ct)
+    {
+        if (truckVisitId is not { } visitId) return RevenueSupport.Invalid("truckVisitId", "Required.");
+
+        var charges = await db.Charges.AsNoTracking()
+            .Where(c => c.TruckVisitId == visitId && c.Status != ChargeStatus.Cancelled)
+            .OrderBy(c => c.ContainerNo).ThenBy(c => c.PaymentTermCode).ThenBy(c => c.ChargeCode)
+            .ToListAsync(ct);
+        if (charges.Count == 0)
+            return TypedResults.NotFound(new ProblemDetails
+            {
+                Title = "Nothing is charged on that truck visit.",
+                Detail = "Revenue learns a visit from its gate events. One recorded a moment ago may still be on its way; one whose moves cost nothing has no lines.",
+            });
+        var branchId = charges[0].BranchId;
+        if (!permissions.HasAt(RevenuePermissions.CashCollect, branchId)) return TypedResults.Forbid();
+
+        var receiptIds = charges.Select(c => c.ReceiptId).OfType<Guid>().Distinct().ToList();
+        var receiptNo = await db.Receipts.AsNoTracking().Where(r => receiptIds.Contains(r.ReceiptId))
+            .ToDictionaryAsync(r => r.ReceiptId, r => r.ReceiptNo, ct);
+
+        static VisitMoneyResponse Money(IEnumerable<Charge> lines)
+        {
+            var list = lines.ToList();
+            return new VisitMoneyResponse(list.Sum(c => c.Amount), list.Sum(c => c.TaxAmount), list.Sum(c => c.Amount + c.TaxAmount));
+        }
+
+        var boxes = charges.GroupBy(c => (c.ContainerNo, c.GateTransactionId))
+            .Select(g => new VisitQuoteBoxResponse(g.Key.ContainerNo, g.First().OrderNo, g.First().MovementCode, g.First().EirNo, g.Key.GateTransactionId,
+                g.Select(c => new VisitQuoteLineResponse(
+                    c.ChargeCode, c.ChargeName, c.UnitRate, c.Quantity, c.TaxRate, c.Amount, c.TaxAmount, c.Amount + c.TaxAmount,
+                    c.PaymentTermCode, c.BillTo, c.PayerPartyCode, c.Status, c.BillingUnitCode, c.IsTripCharge,
+                    c.ReceiptId is { } rid ? receiptNo.GetValueOrDefault(rid) : null)).ToList()))
+            .ToList();
+
+        return TypedResults.Ok(new VisitQuoteResponse(visitId, branchId, boxes,
+            Money(charges.Where(c => c.PaymentTermCode == "CASH")), Money(charges.Where(c => c.PaymentTermCode != "CASH")),
+            charges.Select(c => c.CurrencyCode).FirstOrDefault()));
     }
 
     // ── the drawer ──────────────────────────────────────────────────────────
@@ -240,9 +318,15 @@ internal static class WindowEndpoints
         if (request.PaidUntil is { } until && until < context.Branch.LocalDate(context.Now))
             return RevenueSupport.Invalid("paidUntil", "Storage cannot be paid up to a day that has already gone.");
 
-        var boxes = await window.QuoteBoxesAsync(context, request.BookingContainerIds!.ToHashSet(), request.PaidUntil, ct);
+        var (terms, invalid) = await window.GateTermsAsync(context, request.TruckCategoryCode, request.HaulierCode, request.Vas, ct);
+        if (invalid is not null) return invalid;
+        var (carriedBy, notABooking, payOtherFirst) = await window.TruckCarrierAsync(context, terms, request.SameTruckAs, ct);
+        if (notABooking is not null) return notABooking;
+        if (payOtherFirst is not null) return payOtherFirst;
+        var boxes = await window.QuoteBoxesAsync(context, request.BookingContainerIds!.ToHashSet(), request.PaidUntil, ct, terms, carriedBy);
         var missing = request.BookingContainerIds!.Where(id => boxes.All(b => b.Box.BookingContainerId != id)).ToList();
         if (missing.Count > 0) return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", missing)}.");
+        if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
         var payable = boxes.Where(b => b.Quote is { Lines.Count: > 0 }).ToList();
         var idle = boxes.Except(payable).ToList();
         if (idle.Count > 0)
@@ -253,9 +337,20 @@ internal static class WindowEndpoints
         if (total != request.ExpectedTotal)
             return RevenueSupport.Conflict("The price changed.",
                 $"The window shows ฿{request.ExpectedTotal:N2}; it is now ฿{total:N2}. Re-open the booking and confirm the new amount.");
+        // Withholding tax is the clerk's choice, and only on a receipt over the threshold (Vector GateIn.cs:2118).
+        var withheld = 0m;
+        if (request.WithholdingTax)
+        {
+            if (!await window.WithholdingOfferedAsync(plan.BranchId, total, ct))
+                return RevenueSupport.Invalid("withholdingTax",
+                    $"Withholding tax may be applied only on a receipt over ฿{WithholdingTax.Threshold:N0}; this one is ฿{total:N2}.");
+            withheld = WithholdingTax.Amount(payable.Sum(b => b.Quote!.Subtotal));
+        }
         var paid = request.Payments!.Sum(p => p.Amount);
-        if (paid != total)
-            return RevenueSupport.Invalid("payments", $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2}.");
+        if (paid != total - withheld)
+            return RevenueSupport.Invalid("payments", withheld > 0
+                ? $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2} less ฿{withheld:N2} withholding tax = ฿{total - withheld:N2}."
+                : $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2}.");
 
         if (request.ReplacesReceiptId is { } replacesId)
         {
@@ -275,7 +370,7 @@ internal static class WindowEndpoints
         try
         {
             var (receipt, coupons) = await window.IssueReceiptAsync(context, shift, payable, request.Payments!,
-                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, request.ReplacesReceiptId, ct);
+                string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, request.Payer, me, request.ReplacesReceiptId, ct, withheld);
             return TypedResults.Created($"/api/revenue/window/receipts/{receipt.ReceiptId}",
                 (await document.ReadAsync(receipt.ReceiptId, ct,
                     coupons.Select(c => new CouponResponse(c.CouponRef, c.ContainerNo, c.MovementCode, c.ValidUntil)).ToList()))!);
@@ -409,7 +504,8 @@ internal static class WindowEndpoints
 
     private static QuoteLineResponse ToResponse(QuoteLine l) =>
         new(l.Kind, l.ChargeCode, l.ChargeName, l.BillTo, l.PayerPartyCode, l.Quantity, l.UnitRate, l.Amount,
-            l.TaxCode, l.TaxRate, l.TaxAmount, l.Total, l.ServiceFrom, l.ServiceTo, l.Price.ScheduleNo);
+            l.TaxCode, l.TaxRate, l.TaxAmount, l.Total, l.ServiceFrom, l.ServiceTo, l.Price.ScheduleNo,
+            l.PaymentTermCode, l.BillingUnitCode, l.ByHaulierTerm);
 
     private static NotFound<ProblemDetails> NotKnown(string what) =>
         TypedResults.NotFound(new ProblemDetails
@@ -463,7 +559,90 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         return new WindowContext(plan, branch, orderType, calendar.Now);
     }
 
-    public async Task<List<QuotedBox>> QuoteBoxesAsync(WindowContext context, IReadOnlySet<Guid>? only, DateOnly? paidUntil, CancellationToken ct)
+    /// <summary>
+    /// The truck's terms for a quote or a receipt (§2 step 1), checked: a truck
+    /// category of the tenant's TRUCK_CATEGORY list, a known haulier, and VAS codes
+    /// the order type raises at the gate. Defaults filled (§7.4).
+    /// </summary>
+    public async Task<(GateTerms Terms, ValidationProblem? Invalid)> GateTermsAsync(WindowContext context,
+        string? truckCategoryCode, string? haulierCode, IReadOnlyCollection<string>? vas, CancellationToken ct)
+    {
+        var truck = truckCategoryCode?.Trim().ToUpperInvariant();
+        if (!string.IsNullOrEmpty(truck)
+            && !(await master.CodeListValuesAsync(CashQuoter.TruckCategoryList, [truck], ct)).Contains(truck))
+            return (GateTerms.None, RevenueSupport.Invalid("truckCategoryCode", $"'{truck}' is not a truck category of this tenant."));
+
+        var haulier = haulierCode?.Trim().ToUpperInvariant();
+        if (!string.IsNullOrEmpty(haulier) && (await master.PartiesAsync([haulier], ct)).GetValueOrDefault(haulier) is not { IsActive: true })
+            return (GateTerms.None, RevenueSupport.Invalid("haulierCode", $"'{haulier}' is not an active party of this tenant."));
+
+        var ticked = (vas ?? []).Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v.Trim().ToUpperInvariant()).Distinct().ToList();
+        if (ticked.Count > 0)
+        {
+            var offered = (await master.OrderTypeChargesAsync(context.Plan.OrderTypeCode, ct))
+                .Where(c => c.IsValueAddedService && c.RaiseAtGateIn).Select(c => c.ChargeCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unknown = ticked.Where(v => !offered.Contains(v)).ToList();
+            if (unknown.Count > 0)
+                return (GateTerms.None, RevenueSupport.Invalid("vas",
+                    $"{string.Join(", ", unknown)}: not a gate VAS of {context.Plan.OrderTypeCode}."));
+        }
+
+        var terms = await quoter.ResolveAsync(new GateTerms(truck, haulier, ticked), context.Plan, ct);
+        return (terms, null);
+    }
+
+    /// <summary>The clerk may apply withholding tax: the cash total is over the threshold and the tenant has not switched it off.</summary>
+    public async Task<bool> WithholdingOfferedAsync(Guid branchId, decimal totalWithVat, CancellationToken ct) =>
+        WithholdingTax.MayApply(totalWithVat)
+        && await master.GetBoolSettingAsync(RevenueSettingKeys.WithholdingTaxEnabled, branchId, true, ct);
+
+    /// <summary>VAS ticked, but none of the boxes is an empty drop-off or a pick-up (§3 f): a 400, not a silent drop.</summary>
+    public static ValidationProblem? VasNotOffered(GateTerms terms, IReadOnlyList<QuotedBox> boxes) =>
+        terms.Vas is { Count: > 0 } && !boxes.Any(b => b.Rules is { IsBillable: true } r && CashQuoter.OffersVas(r))
+            ? RevenueSupport.Invalid("vas", "Gate VAS is offered on an empty drop-off or a pick-up only; none of these boxes is one.")
+            : null;
+
+    /// <summary>
+    /// Two bookings on ONE truck (owner 2026-10-01: the gate charge is collected once,
+    /// at the window). The clerk names the truck's other booking(s); if one of them
+    /// carries the truck's PER_TRIP gate charge — paid at the window and not yet
+    /// through the gate, or billed later on credit — this booking is quoted without
+    /// one, and its trail says which box carries it. One still to be paid in cash is
+    /// a 409: take that booking's payment first, or the truck would pay for neither.
+    /// A booking with no gate charge of its own changes nothing.
+    /// </summary>
+    public async Task<(string? Carrier, ValidationProblem? Invalid, ProblemHttpResult? Conflict)> TruckCarrierAsync(
+        WindowContext context, GateTerms terms, IEnumerable<string>? sameTruckAs, CancellationToken ct)
+    {
+        var orderNos = (sameTruckAs ?? []).Where(o => !string.IsNullOrWhiteSpace(o)).Select(o => o.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var orderNo in orderNos)
+        {
+            if (string.Equals(orderNo, context.Plan.OrderNo, StringComparison.OrdinalIgnoreCase))
+                return (null, RevenueSupport.Invalid("sameTruckAs", $"{orderNo} is this booking. Name the truck's OTHER booking."), null);
+            var other = await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.OrderNo == orderNo, ct);
+            if (other is null || other.BranchId != context.Plan.BranchId)
+                return (null, RevenueSupport.Invalid("sameTruckAs", $"'{orderNo}' is not a booking of this depot the cash window knows."), null);
+
+            var paid = await db.Charges.AsNoTracking()
+                .Where(c => c.BookingId == other.BookingId && c.Source == ChargeSource.Window && c.IsTripCharge && c.Status == ChargeStatus.Paid)
+                .OrderBy(c => c.ContainerNo).FirstOrDefaultAsync(ct);
+            if (paid is not null) return ($"{paid.ContainerNo ?? "a box"} on {other.OrderNo}", null, null);
+
+            if (await ContextAsync(other, ct) is not { } otherContext) continue;
+            // One truck, one category and one haulier: the other booking is quoted with this quote's.
+            var boxes = await QuoteBoxesAsync(otherContext, null, null, ct, terms with { Vas = null, TripChargeCarriedBy = null });
+            if (boxes.FirstOrDefault(b => b.Quote is { } q && q.BilledLater.Any(l => l.IsPerTrip)) is { } onCredit)
+                return ($"{onCredit.Box.ContainerNo ?? "a box"} on {other.OrderNo}", null, null);
+            if (boxes.Any(b => b.Quote is { } q && q.Lines.Any(l => l.IsPerTrip)))
+                return (null, null, RevenueSupport.Conflict($"Take {other.OrderNo}'s payment first.",
+                    $"{other.OrderNo} carries this truck's gate charge and it is not paid yet. Once it is, {context.Plan.OrderNo} is quoted without one."));
+        }
+        return (null, null, null);
+    }
+
+    /// <param name="carriedBy">A box of ANOTHER booking on the same truck that already carries its gate charge (<see cref="TruckCarrierAsync"/>).</param>
+    public async Task<List<QuotedBox>> QuoteBoxesAsync(WindowContext context, IReadOnlySet<Guid>? only, DateOnly? paidUntil, CancellationToken ct,
+        GateTerms? terms = null, string? carriedBy = null)
     {
         var boxes = await db.BookingPlanContainers.AsNoTracking()
             .Where(b => b.BookingId == context.Plan.BookingId && b.IsCurrent)
@@ -472,6 +651,9 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         if (only is not null) boxes = boxes.Where(b => only.Contains(b.BookingContainerId)).ToList();
 
         var result = new List<QuotedBox>();
+        // The boxes quoted together go on ONE truck: its PER_TRIP gate charge is
+        // carried by the first box that has one; the others say so in their trail (§7.1, §7.3).
+        var carrier = carriedBy;
         foreach (var box in boxes)
         {
             if (box.EndReason is not null) { result.Add(new QuotedBox(box, null, null, null, $"Left the booking ({box.EndReason}).")); continue; }
@@ -479,7 +661,9 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             if (rules is null) { result.Add(new QuotedBox(box, step, null, null, $"{step.MovementCode} is not a step of {context.Plan.OrderTypeCode} in MDM.")); continue; }
             if (!rules.IsBillable) { result.Add(new QuotedBox(box, step, rules, null, $"{step.MovementCode} is not billable.")); continue; }
 
-            var quote = await quoter.QuoteAsync(context.Plan, box, rules, context.Branch, paidUntil, context.Now, ct);
+            var quote = await quoter.QuoteAsync(context.Plan, box, rules, context.Branch, paidUntil, context.Now, ct,
+                (terms ?? GateTerms.None) with { TripChargeCarriedBy = carrier });
+            if (carrier is null && quote.CarriesTripCharge) carrier = box.ContainerNo ?? $"box {box.BookingContainerId}";
             result.Add(new QuotedBox(box, step, rules, quote,
                 quote.Lines.Count > 0 ? null
                 : quote.Tried.Any(t => t.Outcome == "SETTLED") ? $"{step.MovementCode} is already paid."
@@ -489,7 +673,8 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
     }
 
     public async Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(WindowContext context, Shift shift, List<QuotedBox> payable,
-        IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct)
+        IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct,
+        decimal withheld = 0m)
     {
         var plan = context.Plan;
         var now = context.Now;
@@ -509,6 +694,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             CurrencyCode = payable.Select(b => b.Quote!.CurrencyCode).First() ?? "THB",
             SubtotalAmount = payable.Sum(b => b.Quote!.Subtotal), TaxAmount = payable.Sum(b => b.Quote!.Tax),
             Status = "ISSUED", ReplacesReceiptId = replacesReceiptId,
+            WithholdingTaxRate = withheld > 0 ? WithholdingTax.Rate : null, WithholdingTaxAmount = withheld,
         };
         receipt.TotalAmount = receipt.SubtotalAmount + receipt.TaxAmount;
         db.Receipts.Add(receipt);
@@ -542,7 +728,8 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
                 CouponId: Guid.CreateVersion7(), BranchId: plan.BranchId, BookingId: plan.BookingId, ContainerNo: box.Box.ContainerNo,
                 MovementCode: quote.MovementCode, CouponRef: couponRef,
                 Channel: channels.Count == 1 ? channels[0] : "MIXED", Amount: quote.Total, CurrencyCode: receipt.CurrencyCode,
-                ValidFrom: now, ValidUntil: ValidUntil(context, quote), IssuedBy: cashier));
+                ValidFrom: now, ValidUntil: ValidUntil(context, quote), IssuedBy: cashier,
+                TruckCategoryCode: quote.Terms?.TruckCategoryCode, HaulierCode: quote.Terms?.HaulierCode));
         }
 
         foreach (var p in payments)
@@ -582,7 +769,8 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
                 CouponId: Guid.CreateVersion7(), BranchId: context.Plan.BranchId, BookingId: context.Plan.BookingId,
                 ContainerNo: box.Box.ContainerNo, MovementCode: box.Quote.MovementCode,
                 CouponRef: $"WAIVE-{context.Plan.OrderNo}-{charge.ChargeId.ToString("N")[..6].ToUpperInvariant()}",
-                Channel: "WAIVED", Amount: null, CurrencyCode: null, ValidFrom: now, ValidUntil: ValidUntil(context, box.Quote), IssuedBy: by);
+                Channel: "WAIVED", Amount: null, CurrencyCode: null, ValidFrom: now, ValidUntil: ValidUntil(context, box.Quote), IssuedBy: by,
+                TruckCategoryCode: box.Quote.Terms?.TruckCategoryCode, HaulierCode: box.Quote.Terms?.HaulierCode);
             charge.CouponRef = payload.CouponRef;
             await db.SaveChangesAsync(ct);
             await RevenueOutbox.EnqueueAsync(db, context.Plan.TenantId, "CHARGE", charge.ChargeId, RevenueOutbox.CouponIssued, payload, ct);
@@ -602,28 +790,10 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             ? context.Branch.EndOfDay(until)
             : context.Plan.ValidTo is { } to && to > context.Now ? to : context.Now.AddDays(30);
 
-    private static Charge NewCharge(BookingPlan plan, QuotedBox box, QuoteLine line, string status, DateTimeOffset now)
-    {
-        var p = line.Price;
-        return new Charge
-        {
-            ChargeId = Guid.CreateVersion7(), TenantId = plan.TenantId, BranchId = plan.BranchId, Source = ChargeSource.Window,
-            BookingId = plan.BookingId, OrderNo = plan.OrderNo, BookingContainerId = box.Box.BookingContainerId,
-            ContainerNo = box.Box.ContainerNo, MovementCode = box.Quote!.MovementCode,
-            ContainerStayId = line.Kind is QuoteLine.Storage or QuoteLine.Reefer ? box.Quote.Stay?.ContainerStayId : null,
-            ServiceFrom = line.ServiceFrom, ServiceTo = line.ServiceTo,
-            ChargeCodeId = line.ChargeCodeId, ChargeCode = line.ChargeCode, ChargeName = line.ChargeName,
-            BillTo = line.BillTo, PaymentTermCode = line.PaymentTermCode, PayerPartyCode = line.PayerPartyCode,
-            Quantity = line.Quantity, UnitRate = line.UnitRate, Amount = line.Amount, CurrencyCode = line.CurrencyCode,
-            TaxCode = line.TaxCode, TaxRate = line.TaxRate, TaxAmount = line.TaxAmount,
-            PricedForDate = p.PricedForDate, ScheduleId = p.ScheduleId, ScheduleNo = p.ScheduleNo, ScheduleVersionNo = p.VersionNo,
-            ScheduleType = p.ScheduleType, ScopeRank = p.ScopeRank, TosRateId = p.TosRateId, RateRowVersion = p.RateRowVersion,
-            Specificity = p.Specificity, PricingMethod = p.PricingMethod, BillingUnitCode = p.BillingUnitCode,
-            PricesIncludeTax = p.PricesIncludeTax, BaseRate = p.BaseRate, FreeUnits = p.FreeUnits,
-            ChargeableQuantity = p.ChargeableQuantity, ResolvedAt = p.ResolvedAt, PriceSnapshotJson = JsonSerializer.Serialize(p),
-            Status = status, CreatedAt = now, UpdatedAt = now,
-        };
-    }
+    private static Charge NewCharge(BookingPlan plan, QuotedBox box, QuoteLine line, string status, DateTimeOffset now) =>
+        CashQuoter.ChargeFrom(plan, box.Box, box.Quote!.MovementCode,
+            line.Kind is QuoteLine.Storage or QuoteLine.Reefer ? box.Quote.Stay?.ContainerStayId : null,
+            line, ChargeSource.Window, status, now);
 
     /// <summary>The movement's pricing record (§4.1): what was tried, kept once per box × movement for the cash clock.</summary>
     private async Task RecordPricingAsync(BookingPlan plan, QuotedBox box, DateTimeOffset now, CancellationToken ct)

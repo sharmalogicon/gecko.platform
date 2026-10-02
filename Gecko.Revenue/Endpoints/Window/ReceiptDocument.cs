@@ -71,7 +71,8 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
             seller is null ? null : new SellerResponse(seller.CompanyCode, seller.LegalNameEn, seller.LegalNameLocal,
                 seller.TaxId, seller.TaxBranchNo, seller.IsHeadOffice, seller.Address, seller.Phone, seller.Email),
             receipt.VoidedAt is { } voided && branch is not null ? branch.Local(voided) : receipt.VoidedAt, receipt.VoidReason,
-            replaces, replacedBy);
+            replaces, replacedBy,
+            receipt.WithholdingTaxRate, receipt.WithholdingTaxAmount, receipt.TotalAmount - receipt.WithholdingTaxAmount);
     }
 
     public async Task<Rendered?> RenderAsync(Guid receiptId, CancellationToken ct)
@@ -96,6 +97,7 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
         "PER_DAY" => "day",
         "PER_HOUR" => "hour",
         "PER_TEU" => "TEU",
+        "PER_TRIP" => "truck trip",
         _ => code.StartsWith("PER_", StringComparison.Ordinal) ? code[4..].ToLowerInvariant() : code.ToLowerInvariant(),
     };
 
@@ -256,6 +258,11 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
                         Line($"ภาษีมูลค่าเพิ่ม / {vatLabel}", r.Tax);
                         c.Item().PaddingVertical(2).LineHorizontal(1);
                         Line("รวมทั้งสิ้น / Total", r.Total, strong: true);
+                        if (r.WithholdingTaxAmount > 0)
+                        {
+                            Line($"หัก ภาษี ณ ที่จ่าย / Withholding tax {r.WithholdingTaxRate?.ToString("0.##", CultureInfo.InvariantCulture)}%", -r.WithholdingTaxAmount);
+                            Line("ยอดชำระสุทธิ / Net paid", r.NettAmount, strong: true);
+                        }
                     });
                 });
 

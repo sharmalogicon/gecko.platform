@@ -383,6 +383,9 @@ internal static class OrderTypeEndpoints
             db.OrderTypeMovements.Remove(m);
         foreach (var c in await db.OrderTypeCharges.Where(c => c.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
             db.OrderTypeCharges.Remove(c);
+        // A haulier's term for this order type's charges goes with them (gecko_master 22).
+        foreach (var t in await db.HaulierChargeTerms.Where(t => t.OrderTypeId == orderType.OrderTypeId).ToListAsync(ct))
+            db.HaulierChargeTerms.Remove(t);
         db.OrderTypes.Remove(orderType);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 

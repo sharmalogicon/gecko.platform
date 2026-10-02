@@ -42,6 +42,28 @@ internal static class TestDatabase
         return new TosDbContext(options);
     }
 
+    /// <summary>
+    /// The process ids of OTHER hosts draining the local outboxes (a `dotnet run`
+    /// Gecko.Api left open). Such a host takes a test's gate event off the shared
+    /// queue and handles it with whatever build it was started on — the flow tests
+    /// then wait 30 s for a charge that the other build never wrote.
+    /// </summary>
+    public static async Task<List<int>> OtherDispatchersAsync()
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT host_process_id FROM sys.dm_exec_sessions
+             WHERE program_name = 'Gecko.Api.Outbox' AND host_process_id <> @me;
+            """;
+        command.Parameters.AddWithValue("@me", Environment.ProcessId);
+        var pids = new List<int>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) pids.Add(reader.GetInt32(0));
+        return pids;
+    }
+
     /// <summary>Soft-deletes a test call and its lines and cut-offs. Test-only.</summary>
     public static async Task RemoveCallAsync(string callRef)
     {
@@ -234,6 +256,112 @@ internal static class TestDatabase
         command.Parameters.AddWithValue("@tenant", Sct);
         command.Parameters.AddWithValue("@value", value is null ? DBNull.Value : value.Value ? "true" : "false");
         await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Sets (a value) or removes (null) one SCT tenant setting row in gecko_master —
+    /// tenant-wide when <paramref name="branchId"/> is null. Test-only, fixture tenant only.
+    /// </summary>
+    public static async Task SetSctSettingAsync(string key, Guid? branchId, string? value)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gecko_master.config.tenant_setting
+             WHERE tenant_id = @tenant AND setting_key = @key
+               AND ((@branch IS NULL AND branch_id IS NULL) OR branch_id = @branch);
+            IF @value IS NOT NULL
+                INSERT INTO gecko_master.config.tenant_setting (tenant_id, branch_id, setting_key, setting_value)
+                VALUES (@tenant, @branch, @key, @value);
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@key", key);
+        command.Parameters.AddWithValue("@branch", branchId is { } b ? b : DBNull.Value);
+        command.Parameters.AddWithValue("@value", value is null ? DBNull.Value : value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Soft-deletes SCT haulier charge terms of one order type (gecko_master 22), as the API's DELETE does. Test-only.</summary>
+    public static async Task RemoveHaulierTermsAsync(string orderTypeCode)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE gecko_master.commercial.haulier_charge_term SET deleted_at = SYSUTCDATETIME() AT TIME ZONE 'UTC'
+             WHERE tenant_id = @tenant AND order_type_code = @orderType AND deleted_at IS NULL;
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@orderType", orderTypeCode);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public sealed record ChargeRow(string Source, string Status, string ChargeCode, string? ContainerNo, string PaymentTermCode,
+        decimal Amount, decimal TaxAmount, Guid? GateTransactionId, Guid? TruckVisitId, bool IsTripCharge, string? CancelReason);
+
+    /// <summary>Revenue's billing.charge rows for the test's bookings (sysadmin read).</summary>
+    public static async Task<List<ChargeRow>> ChargesAsync(string carrierRefPrefix)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            SELECT c.source, c.status, c.charge_code, c.container_no, c.payment_term_code, c.amount, c.tax_amount,
+                   c.gate_transaction_id, c.truck_visit_id, c.is_trip_charge, c.cancel_reason
+            FROM gecko_revenue.billing.charge c
+            WHERE c.booking_id IN (SELECT booking_id FROM booking.booking WHERE carrier_ref LIKE @prefix + '%');
+            """;
+        command.Parameters.AddWithValue("@prefix", carrierRefPrefix);
+        var rows = new List<ChargeRow>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            rows.Add(new ChargeRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetString(4), reader.GetDecimal(5), reader.GetDecimal(6), reader.IsDBNull(7) ? null : reader.GetGuid(7),
+                reader.IsDBNull(8) ? null : reader.GetGuid(8), reader.GetBoolean(9), reader.IsDBNull(10) ? null : reader.GetString(10)));
+        return rows;
+    }
+
+    /// <summary>
+    /// Replays one TOS gate message into Revenue as a redelivery would after a lost
+    /// lease: its inbox row goes, and the outbox row is pending again. Returns the
+    /// message id. Test-only.
+    /// </summary>
+    public static async Task<long> ReplayAsync(Guid gateTransactionId, string messageType)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DECLARE @id BIGINT = (SELECT TOP (1) message_id FROM outbox.message
+                                  WHERE aggregate_id = @gate AND message_type = @type ORDER BY message_id DESC);
+            DELETE FROM gecko_revenue.billing.inbox WHERE source_context = 'TOS' AND message_id = @id;
+            UPDATE outbox.message SET processed_at = NULL, failed_at = NULL, locked_until = NULL, locked_by = NULL,
+                   attempt_count = 0, available_at = SYSUTCDATETIME() AT TIME ZONE 'UTC'
+             WHERE message_id = @id;
+            SELECT @id;
+            """;
+        command.Parameters.AddWithValue("@gate", gateTransactionId);
+        command.Parameters.AddWithValue("@type", messageType);
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    /// <summary>Whether Revenue has handled a TOS message (billing.inbox).</summary>
+    public static async Task<bool> RevenueHandledAsync(long messageId)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            SELECT COUNT(*) FROM gecko_revenue.billing.inbox WHERE source_context = 'TOS' AND message_id = @id;
+            """;
+        command.Parameters.AddWithValue("@id", messageId);
+        return (int)(await command.ExecuteScalarAsync())! > 0;
     }
 
     /// <summary>

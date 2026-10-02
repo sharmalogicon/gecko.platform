@@ -60,6 +60,7 @@ public sealed class GateApiTests(TosApiFactory api)
         branchId = SctLcb01,
         containerNo,
         direction = "IN",
+        tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
         truckVisitId,
         truck = truckVisitId is null ? truck ?? new { plate = "70-1234", driverName = "Somchai P.", driverLicence = "1234567890123" } : null,
         grossWeightKg = 22150m,
@@ -324,6 +325,7 @@ public sealed class GateApiTests(TosApiFactory api)
                 branchId = SctLcb01,
                 containerNo = BoxA,
                 direction = "OUT",
+                tripType = "PICK_UP_CONT",
                 truck = new { plate = "70-5678", driverName = "Anucha S." },
                 seals = new object[] { new { sealNo = "ZZ-SEAL-002", sealType = "LINE", isIntact = true } },
             }, ct);
@@ -488,6 +490,8 @@ public sealed class GateApiTests(TosApiFactory api)
             var eir = await RecordAsync(client, new
             {
                 branchId = SctLcb01, containerNo = BoxC, direction = "IN",
+                tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
+                seals = new object[] { new { sealNo = "ZZ-LATE-1", sealType = "LINE", isIntact = true } },
                 truck = new { plate = "70-9012" },
                 lateOverrideReason = "Line agreed by phone; vessel still alongside",
             }, ct);
@@ -592,6 +596,130 @@ public sealed class GateApiTests(TosApiFactory api)
     /// record, the CEDEX code decides whether the box is serviceable, and the depot's
     /// configured hold arrives by itself — which is what stops a holed box leaving.
     /// </summary>
+    // ── Vector Gate In parity (gate-in-vector-parity.md §5) ─────────────────
+
+    private static async Task ExpectFieldAsync(HttpResponseMessage response, string field, CancellationToken ct)
+    {
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.True(response.StatusCode == HttpStatusCode.BadRequest, $"expected 400 on {field}, got {(int)response.StatusCode}: {body}");
+        using var doc = JsonDocument.Parse(body);
+        Assert.True(doc.RootElement.GetProperty("errors").TryGetProperty(field, out _), $"expected an error on '{field}': {body}");
+    }
+
+    /// <summary>A drop-off as the Vector form sends it: trip type, truck category and the capture fields.</summary>
+    private static object DropOff(string containerNo, string tripType = "DROP_OFF_CONT", string direction = "IN",
+        string truckCategory = "18_WHEEL", decimal? maxGrossWeightKg = 30480m, decimal? cargoWeightKg = 18000m,
+        decimal? tareWeightKg = 2200m, bool withSeals = true) => new
+    {
+        branchId = SctLcb01,
+        containerNo,
+        direction,
+        truck = new { plate = "70-9012", driverName = "Prasert K.", truckCategoryCode = truckCategory, haulierCode = "HAU-LCH" },
+        grossWeightKg = 22150m,
+        tareWeightKg,
+        seals = withSeals ? new object[]
+        {
+            new { sealNo = $"ZZA-{containerNo[^4..]}", sealType = "AGENT", isIntact = true },
+            new { sealNo = $"ZZC-{containerNo[^4..]}", sealType = "CUSTOMER", isIntact = true },
+        } : [],
+        tripType,
+        materialCode = "STL",
+        maxGrossWeightKg,
+        cargoWeightKg,
+        ventSetting = "25",
+        humidityPct = 60.5m,
+        gensetNo = "GS-001",
+        clipOnNo = "CO-001",
+        customsPermitNo = "A0011234567",
+        paperlessCode = "PL-0001",
+        nextLocationCode = "LCB",
+    };
+
+    [Fact]
+    public async Task A_drop_off_stores_the_Vector_capture_fields_and_returns_them_on_the_EIR_and_the_visit()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            await BookAsync(client, ImportDo(carrierRef, BoxA), ct);
+
+            var eir = await RecordAsync(client, DropOff(BoxA), ct);
+            void Captured(GateTransactionResponse e)
+            {
+                Assert.Equal(("18_WHEEL", "DROP_OFF_CONT", "STL"), (e.TruckCategoryCode, e.TripType, e.MaterialCode));
+                Assert.Equal((30480m, 18000m, 60.5m), (e.MaxGrossWeightKg!.Value, e.CargoWeightKg!.Value, e.HumidityPct!.Value));
+                Assert.Equal(("25", "GS-001", "CO-001"), (e.VentSetting, e.GensetNo, e.ClipOnNo));
+                Assert.Equal(("A0011234567", "PL-0001", "LCB"), (e.CustomsPermitNo, e.PaperlessCode, e.NextLocationCode));
+                Assert.Equal(["AGENT", "CUSTOMER"], e.Seals.Select(s => s.SealType).Order());
+            }
+            Captured(eir);
+
+            // S2: the gate event carries the truck facts Revenue prices the credit side with.
+            var (messageType, payloadJson) = await TestDatabase.OutboxAsync(eir.GateTransactionId);
+            Assert.Equal("ContainerGatedIn", messageType);
+            using (var payload = JsonDocument.Parse(payloadJson))
+            {
+                var p = payload.RootElement;
+                Assert.Equal(eir.TruckVisitId, p.GetProperty("truckVisitId").GetGuid());
+                Assert.False(string.IsNullOrEmpty(p.GetProperty("visitNo").GetString()));
+                Assert.Equal(0, p.GetProperty("visitBoxIndex").GetInt32());
+                Assert.Equal(("18_WHEEL", "DROP_OFF_CONT", "HAU-LCH"), (p.GetProperty("truckCategoryCode").GetString(),
+                    p.GetProperty("tripTypeCode").GetString(), p.GetProperty("visitHaulierPartyCode").GetString()));
+            }
+            Captured((await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{eir.GateTransactionId}", ct))!);
+            Assert.Equal("18_WHEEL", (await client.GetFromJsonAsync<TruckVisitResponse>($"{Gate}/visits/{eir.TruckVisitId}", ct))!.TruckCategoryCode);
+
+            // The trip type is required on every move (owner 2026-10-01): the old body is a 400 on it.
+            object Outbound(string? tripType) => new
+            {
+                branchId = SctLcb01, containerNo = BoxA, direction = "OUT", tripType,
+                truck = new { plate = "70-5678" },
+                seals = new object[] { new { sealNo = "ZZ-SEAL-9", sealType = "LINE", isIntact = true } },
+            };
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Gate}/transactions", Outbound(null), ct), "tripType", ct);
+
+            // A pick-up needs nothing beyond the trip type, and simply has none of the drop-off fields.
+            var outbound = await RecordAsync(client, Outbound("PICK_UP_CONT"), ct);
+            Assert.Equal("PICK_UP_CONT", outbound.TripType);
+            Assert.Null(outbound.TruckCategoryCode);
+            Assert.Null(outbound.MaxGrossWeightKg);
+        }
+        finally { await TestDatabase.RemoveGateAsync(carrierRef); await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    [Fact]
+    public async Task An_unknown_truck_category_or_trip_type_and_a_trip_against_the_direction_are_400s_on_the_field()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            await BookAsync(client, ImportDo(carrierRef, BoxA), ct);
+            var url = $"{Gate}/transactions";
+
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, truckCategory: "3_WHEEL"), ct), "truck.truckCategoryCode", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tripType: "DROP-OFF CARGO"), ct), "tripType", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tripType: "PICK_UP_CONT"), ct), "tripType", ct);
+
+            // Vector's matrix (GateIn.cs:146): a FULL drop-off needs max gross AND cargo weight.
+            var missing = await client.PostAsJsonAsync(url, DropOff(BoxA, maxGrossWeightKg: null, cargoWeightKg: null), ct);
+            await ExpectFieldAsync(missing, "maxGrossWeightKg", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, cargoWeightKg: null), ct), "cargoWeightKg", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tareWeightKg: null), ct), "tareWeightKg", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, withSeals: false), ct), "seals", ct);
+
+            // None of the refusals left anything behind: the box gates in cleanly afterwards.
+            Assert.Equal("ALLOWED", (await PreflightAsync(client, BoxA, "IN", ct)).Decision);
+            await using var db = TestDatabase.ForTenant(TestDatabase.Sct);
+            Assert.Equal(0, await db.GateTransactions.CountAsync(g => g.ContainerNo == BoxA && g.Status == "COMPLETED"
+                && db.Bookings.Any(b => b.BookingId == g.BookingId && b.CarrierRef == carrierRef), ct));
+        }
+        finally { await TestDatabase.RemoveGateAsync(carrierRef); await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
     [Fact]
     public async Task A_survey_with_a_damage_that_makes_the_box_unserviceable_holds_it_by_itself()
     {
@@ -629,11 +757,16 @@ public sealed class GateApiTests(TosApiFactory api)
             // The depot set DAMAGE to auto-apply on SURVEY_DAMAGED, so it did.
             Assert.Contains("DAMAGE", survey.HoldsApplied);
 
-            // And the hold is a real hold: it stops the box being released.
+            // The hold is real and shown at the barrier. IMP CY/CY's FULL_OUT is a movement the
+            // depot flagged "release damaged boxes" (MDM allow_damaged_release), and DAMAGE is the
+            // damage hold — so, as in Vector (GateOut.cs:1099, 1272; owner 2026-10-01), it is
+            // said and does not stop the customer's box leaving. Any other hold (CSC_EXP too), or
+            // this one on an unflagged movement, still refuses (GateOutReleaseRuleTests).
             var leaving = await PreflightAsync(client, BoxB, "OUT", ct);
-            Assert.Equal("BLOCKED", leaving.Decision);
-            Assert.Contains(leaving.Findings, f => f.Code == "HOLD");
-            Assert.True(Assert.Single(leaving.Holds, h => h.HoldCode == "DAMAGE").BlocksThisMove);
+            Assert.DoesNotContain(leaving.Findings, f => f.Code == "HOLD");
+            Assert.Equal("INFO", Assert.Single(leaving.Findings, f => f.Code == "HOLD_RELEASED_BY_MOVEMENT").Severity);
+            Assert.True(leaving.NextStep!.AllowDamagedRelease);
+            Assert.False(Assert.Single(leaving.Holds, h => h.HoldCode == "DAMAGE").BlocksThisMove);
 
             // A second survey of the same move is refused: that is a RE_SURVEY.
             var twice = await client.PostAsJsonAsync($"{Gate}/surveys", new

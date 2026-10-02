@@ -23,7 +23,13 @@ public sealed record ContainerResponse(
     decimal? TareWeightKg, decimal? MaxGrossKg,
     string? ReeferUnitMake, string? ReeferUnitModel,
     string Status, DateTimeOffset? StatusChangedAt, bool IsCheckDigitValid,
-    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string RowVersion);
+    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string RowVersion,
+    [property: System.Text.Json.Serialization.JsonIgnore] string? FixedPortList = null)
+{
+    /// <summary>The ports this box is designated to (Vector ContainerFixPortList); empty = any port. Enforced on an export gate-out.</summary>
+    public IReadOnlyList<string> FixedPortCodes =>
+        (FixedPortList ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}
 
 /// <summary>
 /// What a gate asks about a number it has just scanned. Deliberately answers for
@@ -54,7 +60,8 @@ public sealed record CreateContainerRequest(
     [property: Range(1, 50000)] decimal? TareWeightKg = null,
     [property: Range(1, 100000)] decimal? MaxGrossKg = null,
     [property: MaxLength(40)] string? ReeferUnitMake = null,
-    [property: MaxLength(40)] string? ReeferUnitModel = null);
+    [property: MaxLength(40)] string? ReeferUnitModel = null,
+    IReadOnlyList<string>? FixedPortCodes = null);
 
 public sealed record UpdateContainerRequest(
     [property: Required] string RowVersion,
@@ -75,7 +82,9 @@ public sealed record UpdateContainerRequest(
     [property: Range(1, 50000)] decimal? TareWeightKg = null,
     [property: Range(1, 100000)] decimal? MaxGrossKg = null,
     [property: MaxLength(40)] string? ReeferUnitMake = null,
-    [property: MaxLength(40)] string? ReeferUnitModel = null);
+    [property: MaxLength(40)] string? ReeferUnitModel = null,
+    // Like every field of this PUT, what is sent is what is stored: none = the box may go to any port.
+    IReadOnlyList<string>? FixedPortCodes = null);
 
 /// <summary>
 /// The container REGISTRY — what a box is. Where it is standing right now, what
@@ -224,6 +233,9 @@ internal static class ContainerEndpoints
                 request.EquipmentTypeId, request.IsoCode, request.OwnerPartyId, request.LessorPartyId, ct) is { } problem)
             return problem;
 
+        var (fixedPorts, portProblem) = await FixedPortsAsync(db, request.FixedPortCodes, ct);
+        if (portProblem is not null) return portProblem;
+
         if (await db.Containers.AnyAsync(c => c.ContainerNo == number, ct))
             return MasterDataSupport.Conflict($"Container '{number}' is already in the registry.");
 
@@ -246,6 +258,7 @@ internal static class ContainerEndpoints
             MaxGrossKg = request.MaxGrossKg,
             ReeferUnitMake = request.ReeferUnitMake,
             ReeferUnitModel = request.ReeferUnitModel,
+            FixedPortCodes = fixedPorts,
             Status = "IN_SERVICE",
             StatusChangedAt = DateTimeOffset.UtcNow,
             // Recorded even when the tenant does not enforce it, so a depot that
@@ -275,6 +288,9 @@ internal static class ContainerEndpoints
         if (await ValidateReferencesAsync(db, settings, number, container.IsCheckDigitValid, request.OwnershipType,
                 request.EquipmentTypeId, request.IsoCode, request.OwnerPartyId, request.LessorPartyId, ct) is { } problem)
             return problem;
+        var (fixedPorts, portProblem) = await FixedPortsAsync(db, request.FixedPortCodes, ct);
+        if (portProblem is not null) return portProblem;
+        container.FixedPortCodes = fixedPorts;
 
         // status_changed_at is the answer to "when did this box leave the fleet",
         // so it only moves when the status actually moves.
@@ -382,6 +398,27 @@ internal static class ContainerEndpoints
         return null;
     }
 
+    /// <summary>
+    /// The fixed-port list as stored: known port codes, upper-cased, de-duplicated,
+    /// comma-separated; null when there are none. An unknown code is a 400 on the field.
+    /// </summary>
+    private static async Task<(string? Stored, ValidationProblem? Problem)> FixedPortsAsync(
+        MasterDataDbContext db, IReadOnlyList<string>? codes, CancellationToken ct)
+    {
+        var wanted = (codes ?? []).Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim().ToUpperInvariant()).Distinct().ToList();
+        if (wanted.Count == 0) return (null, null);
+
+        var known = await db.Ports.AsNoTracking().Where(p => wanted.Contains(p.PortCode)).Select(p => p.PortCode).ToListAsync(ct);
+        var unknown = wanted.Except(known, StringComparer.OrdinalIgnoreCase).ToList();
+        if (unknown.Count > 0)
+            return (null, MasterDataSupport.InvalidReference("fixedPortCodes", $"Unknown port(s): {string.Join(", ", unknown)}."));
+
+        var stored = string.Join(",", wanted);
+        return stored.Length > 400
+            ? (null, MasterDataSupport.InvalidReference("fixedPortCodes", "Too many ports for one container."))
+            : (stored, null);
+    }
+
     private static IQueryable<ContainerResponse> Project(MasterDataDbContext db, IQueryable<Container> containers) =>
         from c in containers
         join t in db.EquipmentTypes on c.EquipmentTypeId equals t.EquipmentTypeId into types
@@ -399,5 +436,5 @@ internal static class ContainerEndpoints
             c.CscPlateRef, c.AcepRef, c.NextExaminationDate,
             c.TareWeightKg, c.MaxGrossKg, c.ReeferUnitMake, c.ReeferUnitModel,
             c.Status, c.StatusChangedAt, c.IsCheckDigitValid,
-            c.CreatedAt, c.UpdatedAt, Convert.ToBase64String(c.RowVersion));
+            c.CreatedAt, c.UpdatedAt, Convert.ToBase64String(c.RowVersion), c.FixedPortCodes);
 }

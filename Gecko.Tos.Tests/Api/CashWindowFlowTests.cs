@@ -58,6 +58,7 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
             var eirIn = await client.PostAsJsonAsync($"{Gate}/transactions", new
             {
                 branchId = SctLcb01, containerNo = Box, direction = "IN",
+                tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
                 truck = new { plate = "70-4321", driverName = "Somsak K." },
                 grossWeightKg = 21000m, weightSource = "WEIGHBRIDGE",
                 seals = new object[] { new { sealNo = "ZZ-CASH-01", sealType = "LINE", isIntact = true } },
@@ -143,7 +144,7 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
 
             var eirOut = await client.PostAsJsonAsync($"{Gate}/transactions", new
             {
-                branchId = SctLcb01, containerNo = Box, direction = "OUT",
+                branchId = SctLcb01, containerNo = Box, direction = "OUT", tripType = "PICK_UP_CONT",
                 truck = new { plate = "70-8765", driverName = "Prasert W." },
                 seals = new object[] { new { sealNo = "ZZ-CASH-01", sealType = "LINE", isIntact = true } },
             }, ct);

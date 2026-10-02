@@ -64,7 +64,17 @@ public sealed record GateTransactionResponse(
     decimal? TareWeightKg = null, decimal? TempObservedC = null, string? IsoCode = null,
     string? PositionText = null, Guid? SurveyId = null, string? Remarks = null,
     DateTimeOffset? VoidedAt = null, Guid? VoidedBy = null, string? VoidReason = null,
-    Guid? ReplacesGateTransactionId = null);
+    Guid? ReplacesGateTransactionId = null,
+    // Vector Gate In parity (gate-in-vector-parity.md §5). Appended, so existing readers are unaffected.
+    string? TruckCategoryCode = null, string? TripType = null,
+    string? MaterialCode = null,
+    decimal? MaxGrossWeightKg = null, decimal? CargoWeightKg = null,
+    string? VentSetting = null, decimal? HumidityPct = null,
+    string? GensetNo = null, string? ClipOnNo = null,
+    string? CustomsPermitNo = null, string? PaperlessCode = null, string? NextLocationCode = null,
+    // What the barrier said as the move was recorded (warnings and notes — a refusal never gets
+    // this far), e.g. a truck that is not the one paid for. Not stored: null when an EIR is read back.
+    IReadOnlyList<GateFindingResponse>? Findings = null);
 
 public sealed record GateSealResponse(string SealNo, string SealType, bool IsIntact, bool? MatchesDeclared);
 
@@ -89,11 +99,14 @@ public sealed record TruckRequest(
     [property: MaxLength(100)] string? DriverName = null,
     [property: MaxLength(30)] string? DriverLicence = null,
     [property: MaxLength(10)] string? LaneCode = null,
-    DateTimeOffset? ArrivedAt = null);
+    DateTimeOffset? ArrivedAt = null,
+    // Vector parity (gate-in-vector-parity.md §5): a tariff axis — MDM code list TRUCK_CATEGORY.
+    [property: MaxLength(20)] string? TruckCategoryCode = null);
 
+/// <summary>AGENT and CUSTOMER are Vector's "Agent Seal" / "Cust. Seal" (gecko_tos 15).</summary>
 public sealed record SealRequest(
     [property: Required, MaxLength(20)] string SealNo,
-    [property: AllowedValues("LINE", "CUSTOMS", "SHIPPER", "TERMINAL", "OTHER")] string SealType = "LINE",
+    [property: AllowedValues("LINE", "CUSTOMS", "SHIPPER", "TERMINAL", "OTHER", "AGENT", "CUSTOMER")] string SealType = "LINE",
     bool IsIntact = true);
 
 public sealed record GateTransactionRequest(
@@ -118,7 +131,23 @@ public sealed record GateTransactionRequest(
     [property: MaxLength(30)] string? PositionText = null,
     [property: MaxLength(300)] string? CheckDigitOverrideReason = null,
     [property: MaxLength(300)] string? LateOverrideReason = null,
-    [property: MaxLength(500)] string? Remarks = null);
+    [property: MaxLength(500)] string? Remarks = null,
+    // ── Vector Gate In parity (gate-in-vector-parity.md §5) ──
+    // TripType is REQUIRED (owner 2026-10-01): DROP_OFF_CONT is an IN and PICK_UP_CONT
+    // an OUT (GateRules.TripTypeDirections), and it drives the §2.1 mandatory-field
+    // matrix (GateRules.MissingForTrip) on every transaction. "Container class" is
+    // grade_code (Vector fills it from ContainerGrade) — there is no separate field.
+    [property: Required, AllowedValues("DROP_OFF_CONT", "PICK_UP_CONT")] string? TripType = null,
+    [property: MaxLength(20)] string? MaterialCode = null,
+    [property: Range(0.01, 99_999_999)] decimal? MaxGrossWeightKg = null,
+    [property: Range(0, 99_999_999)] decimal? CargoWeightKg = null,
+    [property: MaxLength(20)] string? VentSetting = null,
+    [property: Range(0, 100)] decimal? HumidityPct = null,
+    [property: MaxLength(20)] string? GensetNo = null,
+    [property: MaxLength(20)] string? ClipOnNo = null,
+    [property: MaxLength(40)] string? CustomsPermitNo = null,
+    [property: MaxLength(40)] string? PaperlessCode = null,
+    [property: MaxLength(20)] string? NextLocationCode = null);
 
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,
@@ -138,4 +167,5 @@ public sealed record TruckVisitResponse(
     Guid TruckVisitId, string VisitNo, Guid BranchId, string TruckPlate, string? TrailerPlate,
     string? HaulierCode, string? DriverName, string? LaneCode,
     DateTimeOffset ArrivedAt, DateTimeOffset? GateInAt, DateTimeOffset? GateOutAt, int? DwellMinutes,
-    string Status, string Source, IReadOnlyList<GateTransactionSummaryResponse> Transactions);
+    string Status, string Source, IReadOnlyList<GateTransactionSummaryResponse> Transactions,
+    string? TruckCategoryCode = null);

@@ -77,6 +77,8 @@ internal sealed class CouponHandler(TosDbContext db, TimeProvider clock, ILogger
             ValidUntil = coupon.ValidUntil,
             SourceEventId = coupon.CouponId,
             CreatedBy = coupon.IssuedBy,
+            TruckCategoryCode = coupon.TruckCategoryCode,
+            HaulierPartyCode = coupon.HaulierCode,
         });
         await db.SaveChangesAsync(ct);
     }
@@ -114,7 +116,9 @@ internal sealed class CouponHandler(TosDbContext db, TimeProvider clock, ILogger
     private sealed record CouponIssued(
         Guid CouponId, Guid BranchId, Guid BookingId, string? ContainerNo, string MovementCode,
         string CouponRef, string Channel, decimal? Amount, string? CurrencyCode,
-        DateTimeOffset ValidFrom, DateTimeOffset ValidUntil, Guid? IssuedBy);
+        DateTimeOffset ValidFrom, DateTimeOffset ValidUntil, Guid? IssuedBy,
+        // What the window priced with (gecko_tos 16); absent on a coupon queued before it.
+        string? TruckCategoryCode = null, string? HaulierCode = null);
 
     private sealed record CouponRevoked(Guid? CouponId, string? CouponRef, Guid RevokedBy, string Reason);
 }

@@ -756,6 +756,14 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
             entity.Property(e => e.ValidFrom).HasColumnName("valid_from");
             entity.Property(e => e.ValidUntil).HasColumnName("valid_until");
+            entity.Property(e => e.TruckCategoryCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("truck_category_code");
+            entity.Property(e => e.HaulierPartyCode)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("haulier_party_code");
         });
 
         modelBuilder.Entity<GateTransaction>(entity =>
@@ -794,10 +802,17 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.BookingContainerId).HasColumnName("booking_container_id");
             entity.Property(e => e.BookingId).HasColumnName("booking_id");
             entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.CargoWeightKg)
+                .HasColumnType("decimal(10, 2)")
+                .HasColumnName("cargo_weight_kg");
             entity.Property(e => e.CheckDigitOverrideBy).HasColumnName("check_digit_override_by");
             entity.Property(e => e.CheckDigitOverrideReason)
                 .HasMaxLength(300)
                 .HasColumnName("check_digit_override_reason");
+            entity.Property(e => e.ClipOnNo)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("clip_on_no");
             entity.Property(e => e.ConditionCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
@@ -811,6 +826,9 @@ public partial class TosDbContext : DbContext
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_transaction__created_at")
                 .HasColumnName("created_at");
             entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.CustomsPermitNo)
+                .HasMaxLength(40)
+                .HasColumnName("customs_permit_no");
             entity.Property(e => e.CutoffAtApplied).HasColumnName("cutoff_at_applied");
             entity.Property(e => e.CutoffExceptionId).HasColumnName("cutoff_exception_id");
             entity.Property(e => e.CutoffKindApplied)
@@ -837,6 +855,10 @@ public partial class TosDbContext : DbContext
                 .IsUnicode(false)
                 .HasColumnName("full_empty");
             entity.Property(e => e.GateAuthorizationId).HasColumnName("gate_authorization_id");
+            entity.Property(e => e.GensetNo)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("genset_no");
             entity.Property(e => e.GradeCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
@@ -844,6 +866,9 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.GrossWeightKg)
                 .HasColumnType("decimal(10, 2)")
                 .HasColumnName("gross_weight_kg");
+            entity.Property(e => e.HumidityPct)
+                .HasColumnType("decimal(5, 2)")
+                .HasColumnName("humidity_pct");
             entity.Property(e => e.IsCheckDigitValid).HasColumnName("is_check_digit_valid");
             entity.Property(e => e.IsLate).HasColumnName("is_late");
             entity.Property(e => e.IsoCode)
@@ -859,12 +884,27 @@ public partial class TosDbContext : DbContext
                 .IsUnicode(false)
                 .HasColumnName("line_party_code");
             entity.Property(e => e.LinePartyId).HasColumnName("line_party_id");
+            entity.Property(e => e.MaterialCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("material_code");
+            entity.Property(e => e.MaxGrossWeightKg)
+                .HasColumnType("decimal(10, 2)")
+                .HasColumnName("max_gross_weight_kg");
             entity.Property(e => e.MovementCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("movement_code");
             entity.Property(e => e.MovementId).HasColumnName("movement_id");
             entity.Property(e => e.MovementPlanId).HasColumnName("movement_plan_id");
+            entity.Property(e => e.NextLocationCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("next_location_code");
+            entity.Property(e => e.PaperlessCode)
+                .HasMaxLength(40)
+                .IsUnicode(false)
+                .HasColumnName("paperless_code");
             entity.Property(e => e.PositionNo)
                 .HasDefaultValue((byte)1, "df_gate_transaction__position")
                 .HasColumnName("position_no");
@@ -899,11 +939,19 @@ public partial class TosDbContext : DbContext
                 .HasColumnName("temp_observed_c");
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.TransactionAt).HasColumnName("transaction_at");
+            entity.Property(e => e.TripTypeCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("trip_type_code");
             entity.Property(e => e.TruckVisitId).HasColumnName("truck_visit_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_transaction__updated_at")
                 .HasColumnName("updated_at");
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+            entity.Property(e => e.VentSetting)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("vent_setting");
             entity.Property(e => e.VesselCallId).HasColumnName("vessel_call_id");
             entity.Property(e => e.VgmKg)
                 .HasColumnType("decimal(10, 2)")
@@ -1331,6 +1379,10 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.TrailerPlate)
                 .HasMaxLength(20)
                 .HasColumnName("trailer_plate");
+            entity.Property(e => e.TruckCategoryCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("truck_category_code");
             entity.Property(e => e.TruckPlate)
                 .HasMaxLength(20)
                 .HasColumnName("truck_plate");
@@ -1400,6 +1452,7 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(200)
                 .IsUnicode(false)
                 .HasColumnName("legacy_vessel_schedule_ids");
+            entity.Property(e => e.LadenReleaseAt).HasColumnName("laden_release_at");
             entity.Property(e => e.OperatorVoyageIn)
                 .HasMaxLength(20)
                 .IsUnicode(false)

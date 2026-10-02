@@ -76,6 +76,8 @@ public partial class MasterDataDbContext : DbContext
 
     public virtual DbSet<GateHoursWindow> GateHoursWindows { get; set; }
 
+    public virtual DbSet<HaulierChargeTerm> HaulierChargeTerms { get; set; }
+
     public virtual DbSet<HaulierExtension> HaulierExtensions { get; set; }
 
     public virtual DbSet<Hold> Holds { get; set; }
@@ -1134,6 +1136,10 @@ public partial class MasterDataDbContext : DbContext
                 .HasMaxLength(40)
                 .IsUnicode(false)
                 .HasColumnName("reefer_unit_model");
+            entity.Property(e => e.FixedPortCodes)
+                .HasMaxLength(400)
+                .IsUnicode(false)
+                .HasColumnName("fixed_port_codes");
             entity.Property(e => e.RowVersion)
                 .IsRowVersion()
                 .IsConcurrencyToken()
@@ -2029,6 +2035,73 @@ public partial class MasterDataDbContext : DbContext
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_hours_window__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<HaulierChargeTerm>(entity =>
+        {
+            entity.HasKey(e => e.HaulierChargeTermId).HasName("pk_haulier_charge_term");
+
+            entity
+                .ToTable("haulier_charge_term", "commercial")
+                .ToTable(tb => tb.IsTemporal(ttb =>
+                    {
+                        ttb.UseHistoryTable("commercial_haulier_charge_term", "history");
+                        ttb
+                            .HasPeriodStart("sys_valid_from")
+                            .HasColumnName("sys_valid_from");
+                        ttb
+                            .HasPeriodEnd("sys_valid_to")
+                            .HasColumnName("sys_valid_to");
+                    }));
+
+            entity.HasIndex(e => new { e.TenantId, e.HaulierPartyCode, e.OrderTypeCode }, "ix_hct__gate_read").HasFilter("([deleted_at] IS NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.HaulierPartyId, e.OrderTypeId, e.MovementId, e.ChargeCodeId }, "uq_hct__key")
+                .IsUnique()
+                .HasFilter("([deleted_at] IS NULL)");
+
+            entity.Property(e => e.HaulierChargeTermId)
+                .HasDefaultValueSql("(newsequentialid())", "df_hct__id")
+                .HasColumnName("haulier_charge_term_id");
+            entity.Property(e => e.ChargeCode)
+                .HasMaxLength(15)
+                .IsUnicode(false)
+                .HasColumnName("charge_code");
+            entity.Property(e => e.ChargeCodeId).HasColumnName("charge_code_id");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_hct__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
+            entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
+            entity.Property(e => e.HaulierPartyCode)
+                .HasMaxLength(25)
+                .IsUnicode(false)
+                .HasColumnName("haulier_party_code");
+            entity.Property(e => e.HaulierPartyId).HasColumnName("haulier_party_id");
+            entity.Property(e => e.MovementCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("movement_code");
+            entity.Property(e => e.MovementId).HasColumnName("movement_id");
+            entity.Property(e => e.OrderTypeCode)
+                .HasMaxLength(50)
+                .IsUnicode(false)
+                .HasColumnName("order_type_code");
+            entity.Property(e => e.OrderTypeId).HasColumnName("order_type_id");
+            entity.Property(e => e.PaymentTermCode)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("payment_term_code");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_hct__updated_at")
                 .HasColumnName("updated_at");
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });

@@ -154,6 +154,7 @@ internal static partial class VesselCallEndpoints
         var tenantId = caller.TenantId();
         var call = new VesselCall { TenantId = tenantId, CallRef = callRef, Source = "MANUAL" };
         ApplyHeader(call, request, header);
+        call.LadenReleaseAt = request.LadenReleaseAt;
 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         db.VesselCalls.Add(call);
@@ -200,6 +201,8 @@ internal static partial class VesselCallEndpoints
 
         call.CallRef = callRef;
         ApplyHeader(call, request, header);
+        // Set here, not in ApplyHeader: the schedule import shares that and has no such column to send.
+        call.LadenReleaseAt = request.LadenReleaseAt;
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
         return TypedResults.Ok((await DetailAsync(db, master, id, ct))!);
@@ -576,7 +579,7 @@ internal static partial class VesselCallEndpoints
                 c.VesselCallId, c.CallRef, c.VesselCode, vessel?.VesselName, c.PortCode, c.TerminalCode,
                 c.OperatorVoyageIn, c.OperatorVoyageOut, c.Eta, c.Etb, c.Etd, c.Ata, c.Atb, c.Atd,
                 row.CallStatus, c.IsCancelled, c.CancelledAt, c.CancelReason, c.Source, c.Remarks,
-                Convert.ToBase64String(c.RowVersion)),
+                Convert.ToBase64String(c.RowVersion), c.LadenReleaseAt),
             lines, cutoffs);
     }
 }

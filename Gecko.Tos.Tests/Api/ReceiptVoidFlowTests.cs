@@ -160,6 +160,7 @@ public sealed class ReceiptVoidFlowTests(TosApiFactory api)
     private static object GateMove(string box, string direction) => new
     {
         branchId = SctLcb01, containerNo = box, direction,
+        tripType = direction == "IN" ? "DROP_OFF_CONT" : "PICK_UP_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
         truck = new { plate = "70-4321", driverName = "Somsak K." },
         grossWeightKg = direction == "IN" ? 21000m : (decimal?)null, weightSource = direction == "IN" ? "WEIGHBRIDGE" : null,
         seals = new object[] { new { sealNo = "ZZ-VOID-01", sealType = "LINE", isIntact = true } },

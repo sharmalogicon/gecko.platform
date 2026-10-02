@@ -165,6 +165,38 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
     }
 
     [Fact]
+    public async Task A_containers_fixed_ports_are_known_ports_stored_as_sent_and_cleared_by_sending_none()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var number = await NewValidContainerNoAsync(sct, ct);
+
+        var created = await CreateAsync(sct, number, ct);
+        try
+        {
+            Assert.Empty(created.FixedPortCodes!);   // a new box may go to any port
+
+            object Put(string rowVersion, string[]? fixedPortCodes) => new { rowVersion, ownershipType = "LINE_OWNED", status = "IN_SERVICE", fixedPortCodes };
+            var unknown = await sct.PutAsJsonAsync($"{Base}/{number}", Put(created.RowVersion, ["SGSIN", "ZZNOPE"]), ct);
+            Assert.Equal(HttpStatusCode.BadRequest, unknown.StatusCode);
+            Assert.Contains("fixedPortCodes", await unknown.Content.ReadAsStringAsync(ct));
+
+            var set = await sct.PutAsJsonAsync($"{Base}/{number}", Put(created.RowVersion, ["sgsin", "THLCH", "SGSIN"]), ct);
+            Assert.True(set.StatusCode == HttpStatusCode.OK, await set.Content.ReadAsStringAsync(ct));
+            var designated = (await set.Content.ReadFromJsonAsync<ContainerRow>(ct))!;
+            Assert.Equal(["SGSIN", "THLCH"], designated.FixedPortCodes);
+            Assert.Equal(["SGSIN", "THLCH"], (await sct.GetFromJsonAsync<ContainerRow>($"{Base}/{number}", ct))!.FixedPortCodes);
+
+            var cleared = await sct.PutAsJsonAsync($"{Base}/{number}", Put(designated.RowVersion, null), ct);
+            Assert.Empty((await cleared.Content.ReadFromJsonAsync<ContainerRow>(ct))!.FixedPortCodes!);
+        }
+        finally
+        {
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{number}", ct);
+        }
+    }
+
+    [Fact]
     public async Task A_wrong_check_digit_is_refused_when_the_tenant_enforces_it()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -343,7 +375,8 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
     private sealed record ContainerRow(
         Guid ContainerId, string ContainerNo, string Prefix, Guid? EquipmentTypeId, string? TypeCode,
         string? IsoCode, Guid? OwnerPartyId, string? OwnerCode, Guid? LessorPartyId, string? LessorCode,
-        string OwnershipType, string Status, DateTimeOffset? StatusChangedAt, bool IsCheckDigitValid, string RowVersion);
+        string OwnershipType, string Status, DateTimeOffset? StatusChangedAt, bool IsCheckDigitValid, string RowVersion,
+        List<string>? FixedPortCodes = null);
 
     private sealed record Validation(
         string ContainerNo, bool IsWellFormed, bool IsCheckDigitValid, int? ExpectedCheckDigit,

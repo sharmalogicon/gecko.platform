@@ -27,6 +27,9 @@ namespace Gecko.Tos.Endpoints.Gate;
 /// </summary>
 internal static class GateEndpoints
 {
+    /// <summary>The MDM code list a truck's category is checked against (gecko_master 15).</summary>
+    private const string TruckCategoryList = "TRUCK_CATEGORY";
+
     public static RouteGroupBuilder MapGateEndpoints(this RouteGroupBuilder tos)
     {
         var gate = tos.MapGroup("/gate").WithTags("TOS — gate");
@@ -72,8 +75,9 @@ internal static class GateEndpoints
     // ── preflight ───────────────────────────────────────────────────────────
 
     private static async Task<Results<Ok<GatePreflightResponse>, ValidationProblem, ProblemHttpResult>> PreflightAsync(
-        BarrierReader barrier, TosDbContext db, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
-        Guid? branchId = null, string? containerNo = null, string? direction = null, DateTimeOffset? at = null)
+        BarrierReader barrier, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
+        Guid? branchId = null, string? containerNo = null, string? direction = null, DateTimeOffset? at = null,
+        Guid? truckVisitId = null, string? truckCategoryCode = null, string? haulierCode = null)
     {
         if (branchId is null) return TosSupport.Invalid("branchId", "Which gate? A barrier belongs to a depot.");
         if (string.IsNullOrWhiteSpace(containerNo)) return TosSupport.Invalid("containerNo", "The number the camera or the clerk read.");
@@ -84,7 +88,35 @@ internal static class GateEndpoints
             return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
 
         var view = await barrier.ReadAsync(branchId.Value, containerNo, way, at ?? time.GetUtcNow(), ct);
+
+        // The truck, when the clerk has named it: is it the truck that was paid for (§7.4, §7.5)?
+        var (category, haulier) = (truckCategoryCode.Clean(), haulierCode.Clean());
+        if (truckVisitId is { } visitId)
+        {
+            var visit = await db.TruckVisits.AsNoTracking().SingleOrDefaultAsync(v => v.TruckVisitId == visitId, ct);
+            if (visit is null) return TosSupport.Invalid("truckVisitId", "Unknown truck visit.");
+            (category, haulier) = (visit.TruckCategoryCode, visit.HaulierPartyCode);
+        }
+        if (truckVisitId is not null || category is not null || haulier is not null)
+            view.Findings.AddRange(await NotAsPaidAsync(master, view, category, haulier, ct));
+
         return TypedResults.Ok(await ProjectAsync(db, view, ct));
+    }
+
+    /// <summary>
+    /// The truck at the gate against what its coupon was priced with (gecko_tos 16),
+    /// read locally (ADR-007). The truck's side is resolved as Revenue resolves it
+    /// when it prices the gate event (CashQuoter.ResolveAsync): no category → the
+    /// tenant default, no haulier → the booking's.
+    /// </summary>
+    private static async Task<List<GateFinding>> NotAsPaidAsync(IMasterDataReferences master, BarrierView view,
+        string? truckCategory, string? haulierCode, CancellationToken ct)
+    {
+        if (view.Coupon is not { } coupon || view.Booking is null) return [];
+
+        truckCategory ??= (await master.GetStringSettingAsync(RevenueSettingKeys.DefaultTruckCategory, view.Booking.BranchId, ct)).Clean();
+        return GateRules.NotAsPaid(coupon.CouponRef, coupon.Amount is not null, coupon.TruckCategoryCode, truckCategory,
+            coupon.HaulierPartyCode, haulierCode ?? view.Booking.HaulierPartyCode).ToList();
     }
 
     // ── the gate event ──────────────────────────────────────────────────────
@@ -108,6 +140,11 @@ internal static class GateEndpoints
 
         var seals = request.Seals ?? [];
 
+        // Vector parity (gate-in-vector-parity.md §2): a trip type must agree with the direction.
+        var tripType = request.TripType.Clean()!;   // [Required] on the request
+        if (GateRules.TripTypeContradiction(tripType, way) is { } contradiction)
+            return TosSupport.Invalid("tripType", contradiction);
+
         // §5.5 — everything below commits together or not at all.
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
@@ -116,6 +153,14 @@ internal static class GateEndpoints
         var view = await barrier.ReadAsync(branchId, request.ContainerNo, way, at, ct);
         if (view.Booking is null || view.Step is null || view.StepRules is null || view.Assignment is null)
             return Refused(view);
+
+        // Vector's mandatory-field matrix (§2.1, GateRules.MissingForTrip), on every
+        // transaction — judged on the step's load state and the booking's direction,
+        // not on what the clerk picked. A missing input is a 400 before any refusal.
+        var missing = GateRules.MissingForTrip(tripType, view.StepRules.FullEmpty,
+            view.Booking.DirectionCode.Contains("EXPORT", StringComparison.OrdinalIgnoreCase),
+            request.TareWeightKg, request.MaxGrossWeightKg, request.CargoWeightKg, request.CustomsPermitNo, seals.Count);
+        if (missing.Count > 0) return TypedResults.ValidationProblem(missing);
 
         var findings = view.Findings.ToList();
         findings.AddRange(GateRules.Observations(view.StepRules, request.GrossWeightKg, seals.Count));
@@ -159,6 +204,12 @@ internal static class GateEndpoints
             if (request.Truck.HaulierCode.Clean() is not null && haulier is null)
                 return TosSupport.Invalid("truck.haulierCode", "Unknown haulier.");
 
+            // A tariff axis (§3.2): only a value of the tenant's TRUCK_CATEGORY code list prices.
+            var truckCategory = request.Truck.TruckCategoryCode.Clean();
+            if (truckCategory is not null
+                && !(await master.CodeListValuesAsync(TruckCategoryList, [truckCategory], ct)).Contains(truckCategory))
+                return TosSupport.Invalid("truck.truckCategoryCode", $"'{truckCategory}' is not a truck category of this tenant.");
+
             visit = new TruckVisit
             {
                 TenantId = caller.TenantId(),
@@ -171,6 +222,7 @@ internal static class GateEndpoints
                 DriverName = request.Truck.DriverName?.Trim(),
                 DriverLicenceHash = Hash(request.Truck.DriverLicence),
                 LaneCode = request.Truck.LaneCode.Clean(),
+                TruckCategoryCode = truckCategory,
                 ArrivedAt = request.Truck.ArrivedAt ?? at,
                 Source = "GATE",
             };
@@ -179,6 +231,9 @@ internal static class GateEndpoints
         visit.GateInAt ??= at;
         if (visit.ArrivedAt > at) visit.ArrivedAt = at;   // the CHECK: in never precedes arrival
         await db.SaveChangesAsync(ct);
+
+        // Not the truck that was paid for (§7.4, §7.5): said on the EIR's response, never a refusal.
+        findings.AddRange(await NotAsPaidAsync(master, view, visit.TruckCategoryCode, visit.HaulierPartyCode, ct));
 
         // ≤ 2 boxes each way (drop-one-take-one, twin 20s); the index is the backstop.
         var taken = await db.GateTransactions
@@ -239,6 +294,17 @@ internal static class GateEndpoints
             RecordedAt = now,
             Status = "COMPLETED",
             Remarks = request.Remarks?.Trim(),
+            TripTypeCode = tripType,
+            MaterialCode = request.MaterialCode.Clean(),
+            MaxGrossWeightKg = request.MaxGrossWeightKg,
+            CargoWeightKg = request.CargoWeightKg,
+            VentSetting = request.VentSetting.Clean(),
+            HumidityPct = request.HumidityPct,
+            GensetNo = request.GensetNo.Clean(),
+            ClipOnNo = request.ClipOnNo.Clean(),
+            CustomsPermitNo = request.CustomsPermitNo.Clean(),
+            PaperlessCode = request.PaperlessCode.Clean(),
+            NextLocationCode = request.NextLocationCode.Clean(),
         };
         db.GateTransactions.Add(transaction);
         await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
@@ -333,12 +399,12 @@ internal static class GateEndpoints
         }
 
         // ── the outbox: the LINE message leaves from here, not from the barrier ─
-        await QueueAsync(db, transaction, view, completed, ct);
+        await QueueAsync(db, transaction, view, visit, taken, completed, ct);
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await tx.CommitAsync(ct);
 
-        var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct);
+        var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct, findings);
         return TypedResults.Created($"/api/tos/gate/transactions/{transaction.GateTransactionId}", response);
     }
 
@@ -411,7 +477,17 @@ internal static class GateEndpoints
         }
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-        await QueueVoidAsync(db, transaction, ct);
+        await QueueVoidAsync(db, transaction,
+            await db.TruckVisits.AsNoTracking().SingleOrDefaultAsync(v => v.TruckVisitId == transaction.TruckVisitId, ct),
+            // The visit's other boxes still standing: Revenue re-raises the visit's
+            // once-per-truck gate charge on one of them (GATE_CHARGING_DESIGN §3 d).
+            await db.GateTransactions.AsNoTracking()
+                .Where(g => g.TruckVisitId == transaction.TruckVisitId && g.GateTransactionId != transaction.GateTransactionId && g.Status == "COMPLETED")
+                .OrderBy(g => g.TransactionAt).ThenBy(g => g.PositionNo)
+                .Select(g => new VisitSurvivor(g.GateTransactionId, g.EirNo, g.ContainerNo, g.Direction, g.MovementCode, g.BookingId,
+                    g.BookingContainerId, g.TransactionAt))
+                .ToListAsync(ct),
+            ct);
         foreach (var session in replugged)
             await ReeferLog.EnqueueAsync(db, session, closed!, ReeferLog.Corrected, transaction.VoidedAt!.Value, ct);
         await tx.CommitAsync(ct);
@@ -602,7 +678,15 @@ internal static class GateEndpoints
     /// transaction as the EIR (11_outbox): if the gate event rolls back, the
     /// message was never queued.
     /// </summary>
-    private static Task QueueAsync(TosDbContext db, GateTransaction transaction, BarrierView view, bool completed, CancellationToken ct)
+    /// <remarks>
+    /// Gate charging (GATE_CHARGING_DESIGN §2, S2): the truck facts Revenue prices
+    /// the credit side with at gate time — the visit (the PER_TRIP gate charge is
+    /// once per truck visit), its category, the trip type, and the VISIT's haulier
+    /// (Vector overrides on the truck's haulier, GateIn.cs:1320). haulierPartyCode
+    /// stays the booking's, as before.
+    /// </remarks>
+    private static Task QueueAsync(TosDbContext db, GateTransaction transaction, BarrierView view, TruckVisit visit, int visitBoxIndex,
+        bool completed, CancellationToken ct)
     {
         var booking = view.Booking!;
         return EnqueueAsync(db, transaction,
@@ -636,6 +720,12 @@ internal static class GateEndpoints
                 transactionAt = transaction.TransactionAt,
                 isLate = transaction.IsLate,
                 bookingContainerCompleted = completed,
+                truckVisitId = visit.TruckVisitId,
+                visitNo = visit.VisitNo,
+                visitBoxIndex,
+                truckCategoryCode = visit.TruckCategoryCode,
+                tripTypeCode = transaction.TripTypeCode,
+                visitHaulierPartyCode = visit.HaulierPartyCode,
             }, ct);
     }
 
@@ -643,7 +733,11 @@ internal static class GateEndpoints
     /// A void is news too: anything raised from that gate move — a charge, a
     /// LINE message, a CODECO — must be able to take it back.
     /// </summary>
-    private static Task QueueVoidAsync(TosDbContext db, GateTransaction transaction, CancellationToken ct) =>
+    private sealed record VisitSurvivor(Guid GateTransactionId, string? EirNo, string ContainerNo, string Direction, string? MovementCode,
+        Guid? BookingId, Guid? BookingContainerId, DateTimeOffset TransactionAt);
+
+    private static Task QueueVoidAsync(TosDbContext db, GateTransaction transaction, TruckVisit? visit,
+        IReadOnlyList<VisitSurvivor> survivors, CancellationToken ct) =>
         EnqueueAsync(db, transaction, "GateTransactionVoided", new
         {
             gateTransactionId = transaction.GateTransactionId,
@@ -656,6 +750,12 @@ internal static class GateEndpoints
             bookingContainerId = transaction.BookingContainerId,
             voidedAt = transaction.VoidedAt,
             voidReason = transaction.VoidReason,
+            truckVisitId = transaction.TruckVisitId,
+            visitNo = visit?.VisitNo,
+            truckCategoryCode = visit?.TruckCategoryCode,
+            tripTypeCode = transaction.TripTypeCode,
+            visitHaulierPartyCode = visit?.HaulierPartyCode,
+            visitSurvivors = survivors,
         }, ct);
 
     private static Task EnqueueAsync(TosDbContext db, GateTransaction transaction, string messageType, object payload, CancellationToken ct) =>
@@ -685,7 +785,7 @@ internal static class GateEndpoints
         v.TruckVisitId, v.VisitNo, v.BranchId, v.TruckPlate, v.TrailerPlate, v.HaulierPartyCode, v.DriverName, v.LaneCode,
         v.ArrivedAt, v.GateInAt, v.GateOutAt, v.DwellMinutes,
         v.GateOutAt is not null ? "DEPARTED" : v.GateInAt is not null ? "ON_SITE" : "ARRIVED",
-        v.Source, boxes);
+        v.Source, boxes, v.TruckCategoryCode);
 
     private static async Task<GatePreflightResponse> ProjectAsync(TosDbContext db, BarrierView view, CancellationToken ct)
     {
@@ -710,7 +810,8 @@ internal static class GateEndpoints
             view.Holds.Select(h => new GateHoldResponse(
                 h.Hold.ContainerHoldId, h.Hold.HoldCode, h.Definition?.DescriptionEn, h.Definition?.BlockingScope,
                 h.Definition?.ReleaseAuthority, h.Hold.HeldVia,
-                h.Definition is not null && HoldRules.Blocks(h.Definition.BlockingScope, view.Direction))).ToList(),
+                h.Definition is not null && HoldRules.Blocks(h.Definition.BlockingScope, view.Direction)
+                && !GateRules.ReleasedByMovement(h.Definition.AutoApplyOnEvent, view.Direction, view.StepRules?.AllowDamagedRelease ?? false))).ToList(),
             view.OpenVisit is null ? null : new GateYardResponse(
                 view.OpenVisit.ContainerVisitId, view.OpenVisit.BranchId, view.OpenVisit.FullEmpty,
                 view.OpenVisit.PositionText, view.OpenVisit.LastEventAt),
@@ -722,13 +823,14 @@ internal static class GateEndpoints
     }
 
     private static async Task<GateTransactionResponse> ProjectAsync(
-        TosDbContext db, Guid id, Guid? containerVisitId, bool completed, CancellationToken ct)
+        TosDbContext db, Guid id, Guid? containerVisitId, bool completed, CancellationToken ct,
+        IReadOnlyList<GateFinding>? findings = null)
     {
         var row = await (
             from t in db.GateTransactions.AsNoTracking().Where(x => x.GateTransactionId == id)
             join b in db.Bookings on t.BookingId equals b.BookingId
             join v in db.TruckVisits on t.TruckVisitId equals v.TruckVisitId
-            select new { g = t, b.OrderNo, v.VisitNo, v.TruckPlate }).SingleAsync(ct);
+            select new { g = t, b.OrderNo, v.VisitNo, v.TruckPlate, v.TruckCategoryCode }).SingleAsync(ct);
 
         var seals = await db.GateTransactionSeals.AsNoTracking()
             .Where(s => s.GateTransactionId == id)
@@ -753,6 +855,10 @@ internal static class GateEndpoints
             g.TransactionAt, g.RecordedAt, g.Status,
             visitId, completed, Convert.ToBase64String(g.RowVersion),
             g.TareWeightKg, g.TempObservedC, g.IsoCode, g.PositionText, g.SurveyId, g.Remarks,
-            g.VoidedAt, g.VoidedBy, g.VoidReason, g.ReplacesGateTransactionId);
+            g.VoidedAt, g.VoidedBy, g.VoidReason, g.ReplacesGateTransactionId,
+            row.TruckCategoryCode, g.TripTypeCode, g.MaterialCode,
+            g.MaxGrossWeightKg, g.CargoWeightKg, g.VentSetting, g.HumidityPct,
+            g.GensetNo, g.ClipOnNo, g.CustomsPermitNo, g.PaperlessCode, g.NextLocationCode,
+            findings?.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList());
     }
 }

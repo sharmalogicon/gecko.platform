@@ -154,14 +154,25 @@ internal sealed class BookingChangedHandler(
 }
 
 /// <summary>
-/// TOS gate events → Revenue (PLAN_BILLING §4.3, the part the cash window needs):
+/// TOS gate events → Revenue (PLAN_BILLING §4.3):
 ///   * the stay projection — a gate-in opens one, a gate-out closes it, a void
 ///     undoes whichever it was; storage is priced from it;
-///   * the cash charges the spent coupon paid for become EARNED, and go back to
-///     PAID if the EIR is voided (the coupon comes back unspent in TOS too).
-/// Credit accrual from the gate event is 6.3.
+///   * the cash charges the spent coupon paid for become EARNED (on the truck
+///     visit), and go back to PAID if the EIR is voided (the coupon comes back
+///     unspent in TOS too);
+///   * 6.3, clock 2 — the box's CREDIT lines (native, and cash lines the visit's
+///     haulier holds on credit) are priced AT GATE TIME with the payload's truck
+///     category and visit haulier, through the same CashQuoter as the window, and
+///     written UNBILLED (source GATE). The PER_TRIP gate charge is raised once
+///     per WHOLE truck visit (owner 2026-10-01): not when the visit already has a
+///     live one, cash or credit. A void CANCELS them (or flags an invoiced one for
+///     a credit note) and re-raises the visit's gate charge on a surviving box.
+/// Idempotent on the message id (billing.inbox), with uq_charge__gate and
+/// uq_charge__gate_trip as the database's backstop.
 /// </summary>
-internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, AutomaticCoupons coupons, ILogger<GateEventHandler> log) : IOutboxHandler
+internal sealed class GateEventHandler(
+    RevenueDbContext db, TimeProvider clock, AutomaticCoupons coupons, CashQuoter quoter, BranchCalendar calendar,
+    IMasterDataReferences master, ILogger<GateEventHandler> log) : IOutboxHandler
 {
     public const string GatedIn = "ContainerGatedIn";
     public const string GatedOut = "ContainerGatedOut";
@@ -193,6 +204,7 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
                     Status = "OPEN", Source = "GATE_EVENT",
                 });
             await EarnAsync(gate, now, ct);
+            await AccrueAsync(gate, message, now, tripOnly: false, ct);
             await MarkStepAsync(gate, "DONE", ct);
         }
         else if (message.MessageType == GatedOut)
@@ -211,6 +223,7 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
                 open.UpdatedAt = now;
             }
             await EarnAsync(gate, now, ct);
+            await AccrueAsync(gate, message, now, tripOnly: false, ct);
             await MarkStepAsync(gate, "DONE", ct);
         }
         else
@@ -236,7 +249,25 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
                 earned.Status = ChargeStatus.Paid;
                 earned.EarnedGateTransactionId = null;
                 earned.EarnedAt = null;
+                earned.TruckVisitId = null;
                 earned.UpdatedAt = now;
+            }
+
+            // 6.3: what the gate event accrued is taken back (§4.3; Q10 for an invoiced one).
+            var reason = $"EIR {gate.EirNo ?? gate.GateTransactionId.ToString()} voided: {gate.VoidReason ?? "no reason given"}";
+            if (reason.Length > 300) reason = reason[..300];
+            foreach (var accrued in await db.Charges.Where(c => c.GateTransactionId == gate.GateTransactionId && c.Source == ChargeSource.Gate
+                                                                && c.Status != ChargeStatus.Cancelled).ToListAsync(ct))
+            {
+                if (accrued.Status == ChargeStatus.Invoiced)
+                    accrued.CreditNoteRequired = true;
+                else
+                {
+                    accrued.Status = ChargeStatus.Cancelled;
+                    accrued.CancelledAt = now;
+                    accrued.CancelReason = reason;
+                }
+                accrued.UpdatedAt = now;
             }
         }
 
@@ -245,6 +276,10 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
 
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         await db.SaveChangesAsync(ct);
+        // The voided box carried the visit's gate charge on credit: a box still on
+        // the truck carries it now (once per whole visit, §7.1).
+        if (message.MessageType == Voided && await ReRaiseTripChargeAsync(gate, message, now, ct))
+            await db.SaveChangesAsync(ct);
         // The box's NEXT step may owe no cash (SCT: the empty return after a FULL_OUT):
         // it gets its coupon now, as a BookingChanged would have given it.
         if (message.MessageType != Voided && gate.BookingContainerId is { } boxId
@@ -277,6 +312,134 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
         box.UpdatedAt = clock.GetUtcNow();
     }
 
+    /// <summary>
+    /// 6.3 — the box's credit lines for this movement, priced at gate time with the
+    /// truck's category and the VISIT's haulier (Vector overrides on the truck's
+    /// haulier, GateIn.cs:1320), written UNBILLED. <paramref name="tripOnly"/>: the
+    /// re-raise after a void, which writes the PER_TRIP gate charge only.
+    /// </summary>
+    /// <returns>Whether a PER_TRIP gate charge was written.</returns>
+    private async Task<bool> AccrueAsync(GatePayload gate, OutboxMessage message, DateTimeOffset now, bool tripOnly, CancellationToken ct)
+    {
+        if (gate.BookingContainerId is not { } boxId || gate.MovementCode is null) return false;
+        var box = await db.BookingPlanContainers.AsNoTracking().SingleOrDefaultAsync(b => b.BookingContainerId == boxId, ct);
+        var plan = box is null ? null : await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.BookingId == box.BookingId, ct);
+        if (box is null || plan is null)
+        {
+            log.LogWarning("Gate event {Gate}: box {Box} is not in Revenue's booking copy; no credit accrued.", gate.GateTransactionId, boxId);
+            return false;
+        }
+
+        var orderType = (await master.OrderTypePlansAsync([plan.OrderTypeCode], ct)).GetValueOrDefault(plan.OrderTypeCode);
+        var rules = orderType?.Steps.FirstOrDefault(s => string.Equals(s.MovementCode, gate.MovementCode, StringComparison.OrdinalIgnoreCase));
+        if (rules is not { IsBillable: true }) return false;
+        var branch = await calendar.BranchAsync(plan.BranchId, ct);
+        if (branch is null) return false;
+
+        var carrier = gate.TruckVisitId is { } visitId ? await TripCarrierAsync(visitId, ct) : null;
+        var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, gate.TransactionAt, ct,
+            new GateTerms(gate.TruckCategoryCode, gate.VisitHaulierPartyCode, null, carrier));
+
+        var raisedTrip = false;
+        foreach (var line in quote.BilledLater.Where(l => !tripOnly || l.IsPerTrip))
+        {
+            // A gate charge must be keyed on its truck; a pre-S2 event has none.
+            if (line.IsPerTrip && gate.TruckVisitId is null)
+            {
+                log.LogWarning("Gate event {Gate}: {Charge} is once per truck but the event names no truck visit; not accrued.", gate.GateTransactionId, line.ChargeCode);
+                continue;
+            }
+            if (await db.Charges.AnyAsync(c => c.Source == ChargeSource.Gate && c.GateTransactionId == gate.GateTransactionId
+                                               && c.ChargeCode == line.ChargeCode && c.BillTo == line.BillTo && c.PaymentTermCode == line.PaymentTermCode, ct))
+                continue;   // uq_charge__gate: this gate move already raised it
+
+            var charge = CashQuoter.ChargeFrom(plan, box, gate.MovementCode, null, line, ChargeSource.Gate, ChargeStatus.Unbilled, now);
+            charge.GateTransactionId = gate.GateTransactionId;
+            charge.EirNo = gate.EirNo;
+            charge.TruckVisitId = gate.TruckVisitId;
+            charge.SourceMessageId = message.MessageId;
+            db.Charges.Add(charge);
+            raisedTrip |= line.IsPerTrip;
+        }
+
+        if (!tripOnly) await RecordCreditPricingAsync(gate, plan, box, quote, message, now, ct);
+        return raisedTrip;
+    }
+
+    /// <summary>
+    /// The box already carrying this visit's gate charge, if any: a live credit one
+    /// (GATE) or the cash one this visit's gate event earned. Tracked changes count
+    /// (the cash earned by this very message is not saved yet).
+    /// </summary>
+    private async Task<string?> TripCarrierAsync(Guid visitId, CancellationToken ct)
+    {
+        static bool Live(Charge c) => c.IsTripCharge && c.Status != ChargeStatus.Cancelled
+                                      && (c.Source == ChargeSource.Gate || c.Status == ChargeStatus.Earned);
+        var local = db.Charges.Local.FirstOrDefault(c => c.TruckVisitId == visitId && Live(c));
+        if (local is not null) return local.ContainerNo ?? "another box";
+
+        var stored = await db.Charges.Where(c => c.TruckVisitId == visitId && c.IsTripCharge && c.Status != ChargeStatus.Cancelled
+                                                 && (c.Source == ChargeSource.Gate || c.Status == ChargeStatus.Earned))
+            .ToListAsync(ct);   // tracked: a change made in this handler wins over the stored row
+        return stored.FirstOrDefault(Live) is { } carrier ? carrier.ContainerNo ?? "another box" : null;
+    }
+
+    /// <summary>
+    /// After a void: if the voided box carried the visit's gate charge on credit and
+    /// nothing live carries it now, the first box still on the truck (TOS lists them)
+    /// gets it — priced with the same truck facts.
+    /// </summary>
+    private async Task<bool> ReRaiseTripChargeAsync(GatePayload gate, OutboxMessage message, DateTimeOffset now, CancellationToken ct)
+    {
+        if (gate.TruckVisitId is not { } visitId || gate.VisitSurvivors is not { Count: > 0 } survivors) return false;
+        var lostTrip = await db.Charges.AnyAsync(c => c.GateTransactionId == gate.GateTransactionId && c.Source == ChargeSource.Gate
+                                                      && c.IsTripCharge && c.Status == ChargeStatus.Cancelled, ct);
+        if (!lostTrip || await TripCarrierAsync(visitId, ct) is not null) return false;
+
+        foreach (var s in survivors)
+        {
+            var standIn = gate with
+            {
+                GateTransactionId = s.GateTransactionId, EirNo = s.EirNo, ContainerNo = s.ContainerNo, Direction = s.Direction,
+                MovementCode = s.MovementCode, BookingId = s.BookingId, BookingContainerId = s.BookingContainerId,
+                TransactionAt = s.TransactionAt,
+            };
+            if (await AccrueAsync(standIn, message, now, tripOnly: true, ct))
+            {
+                log.LogInformation("Visit {Visit}: gate charge re-raised on {Box} after EIR {Eir} was voided.", gate.VisitNo, s.ContainerNo, gate.EirNo);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>The CREDIT pricing record (§4.1): one per gate transaction × movement, NO_CHARGE when nothing priced (Q11).</summary>
+    private async Task RecordCreditPricingAsync(GatePayload gate, BookingPlan plan, BookingPlanContainer box, MovementQuote quote,
+        OutboxMessage message, DateTimeOffset now, CancellationToken ct)
+    {
+        var credit = quote.Tried.Where(t => t.PaymentTermCode != "CASH").ToList();
+        var record = await db.MovementPricings.SingleOrDefaultAsync(m =>
+            m.GateTransactionId == gate.GateTransactionId && m.MovementCode == gate.MovementCode && m.Clock == "CREDIT", ct);
+        if (record is null)
+        {
+            record = new MovementPricing { TenantId = plan.TenantId, BranchId = plan.BranchId, Clock = "CREDIT", MovementCode = gate.MovementCode!, CreatedAt = now };
+            db.MovementPricings.Add(record);
+        }
+        record.GateTransactionId = gate.GateTransactionId;
+        record.BookingId = plan.BookingId;
+        record.BookingContainerId = box.BookingContainerId;
+        record.ContainerNo = box.ContainerNo;
+        record.OrderTypeCode = plan.OrderTypeCode;
+        record.VariantsTried = credit.Count;
+        record.VariantsPriced = quote.BilledLater.Count;
+        record.TotalAmount = quote.BilledLater.Sum(l => l.Amount);
+        record.CurrencyCode = quote.BilledLater.Select(l => l.CurrencyCode).FirstOrDefault();
+        record.TrailJson = JsonSerializer.Serialize(credit);
+        record.SourceMessageId = message.MessageId;
+        record.PricedAt = now;
+        record.UpdatedAt = now;
+    }
+
     /// <summary>The cash the spent coupon paid for is now earned — nothing is billed twice.</summary>
     private async Task EarnAsync(GatePayload gate, DateTimeOffset now, CancellationToken ct)
     {
@@ -289,14 +452,24 @@ internal sealed class GateEventHandler(RevenueDbContext db, TimeProvider clock, 
             paid.EarnedAt = gate.TransactionAt;
             paid.GateTransactionId = gate.GateTransactionId;
             paid.EirNo = gate.EirNo;
+            paid.TruckVisitId = gate.TruckVisitId;
             paid.UpdatedAt = now;
         }
     }
 
+    /// <param name="TruckVisitId">S2 (GATE_CHARGING_DESIGN §2): the truck facts; null on an event queued before them.</param>
+    /// <param name="VisitSurvivors">On a void only: the visit's other boxes still standing.</param>
     private sealed record GatePayload(
         Guid GateTransactionId, string? EirNo, Guid BranchId, string ContainerNo, string? Direction, string? MovementCode,
         string? FullEmpty, Guid? BookingId, Guid? BookingContainerId, string? EquipmentTypeCode, string? IsoCode,
-        string? LineCode, DateTimeOffset TransactionAt);
+        string? LineCode, DateTimeOffset TransactionAt,
+        Guid? TruckVisitId = null, string? VisitNo = null, int? VisitBoxIndex = null, string? TruckCategoryCode = null,
+        string? TripTypeCode = null, string? VisitHaulierPartyCode = null, string? VoidReason = null,
+        List<VisitSurvivor>? VisitSurvivors = null);
+
+    private sealed record VisitSurvivor(
+        Guid GateTransactionId, string? EirNo, string ContainerNo, string? Direction, string? MovementCode,
+        Guid? BookingId, Guid? BookingContainerId, DateTimeOffset TransactionAt);
 }
 
 /// <summary>
@@ -338,7 +511,8 @@ internal sealed class AutomaticCoupons(
                     MovementCode: step.MovementCode, CouponRef: $"AUTO-{plan.OrderNo}-{step.SequenceNo}-{ShortId(box.BookingContainerId)}",
                     Channel: "CREDIT", Amount: null, CurrencyCode: null,
                     ValidFrom: now, ValidUntil: plan.ValidTo is { } to && to > now ? to : now.AddDays(30),
-                    IssuedBy: null),
+                    IssuedBy: null,
+                    TruckCategoryCode: quote.Terms?.TruckCategoryCode, HaulierCode: quote.Terms?.HaulierCode),
                 ct);
         }
     }

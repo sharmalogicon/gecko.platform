@@ -119,6 +119,7 @@ public sealed class GateHoursBarrierTests(TosApiFactory api)
             var gateIn = await client.PostAsJsonAsync($"{Gate}/transactions", new
             {
                 branchId = SctLcb01, containerNo = box, direction = "IN",
+                tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
                 truck = new { plate = "70-1234", driverName = "Somchai P.", driverLicence = "1234567890123" },
                 grossWeightKg = 22150m, weightSource = "WEIGHBRIDGE",
                 seals = new object[] { new { sealNo = "ZZ-HOURS-1", sealType = "LINE", isIntact = true } },

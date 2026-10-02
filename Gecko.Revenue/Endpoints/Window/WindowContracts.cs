@@ -5,11 +5,29 @@ namespace Gecko.Revenue.Endpoints.Window;
 /// <param name="PaidUntil">The storage date the quote was made to (null when no box carries storage).</param>
 /// <param name="Today">The depot's calendar day now (branch time zone) — the earliest "paid until" the window accepts.</param>
 /// <param name="VoidedReceipts">This booking's voided receipts that no receipt replaces yet — the ones a new payment may name.</param>
+/// <param name="Subtotal">CASH due now (before VAT). <c>Total</c> is what is paid at the window.</param>
+/// <param name="TruckCategoryCode">The truck category the quote was priced with (given, or the tenant default gate.default_truck_category).</param>
+/// <param name="HaulierCode">The haulier whose charge terms applied (given, or the booking's).</param>
+/// <param name="BilledLater">Credit lines (native, or cash moved to credit by the haulier's term): shown, not paid here.</param>
 public sealed record WindowBookingResponse(
     Guid BookingId, Guid BranchId, string OrderNo, string Status, string OrderTypeCode,
     string? CustomerCode, string? AgentCode, string? LineCode, DateOnly? PaidUntil, DateOnly Today,
     IReadOnlyList<WindowBoxResponse> Boxes, decimal Subtotal, decimal Tax, decimal Total, string? CurrencyCode,
-    IReadOnlyList<VoidedReceiptResponse>? VoidedReceipts = null);
+    IReadOnlyList<VoidedReceiptResponse>? VoidedReceipts = null,
+    string? TruckCategoryCode = null, string? HaulierCode = null, BilledLaterResponse? BilledLater = null,
+    // "ZZKU1234565 on BK-…": a box of another booking on the same truck (sameTruckAs) carries the truck's gate charge.
+    string? GateChargeCarriedBy = null,
+    // Set when the clerk MAY apply withholding tax (cash total over 1,000): what it would be, and what is then paid.
+    WithholdingTaxResponse? WithholdingTax = null);
+
+/// <summary>
+/// Withholding tax the clerk may choose to apply (Vector: offered when the cash total is over 1,000; 3% of the
+/// amount before VAT). <c>Nett</c> = <c>Total</c> − <c>Amount</c>: what the payments must add up to when it is applied.
+/// </summary>
+public sealed record WithholdingTaxResponse(decimal Rate, decimal Amount, decimal Nett);
+
+/// <summary>What the boxes will be billed on credit, priced now for the clerk to see. Nothing in it is paid at the window.</summary>
+public sealed record BilledLaterResponse(decimal Subtotal, decimal Tax, decimal Total, string? CurrencyCode);
 
 public sealed record VoidedReceiptResponse(Guid ReceiptId, string ReceiptNo, DateTimeOffset? VoidedAt, string? VoidReason, decimal Total);
 
@@ -19,17 +37,54 @@ public sealed record WindowBoxResponse(
     string? NextMovementCode, string? Direction, bool IsBillable,
     DateTimeOffset? InAt, int? StayDays,
     IReadOnlyList<QuoteLineResponse> Due, IReadOnlyList<SettledChargeResponse> Settled,
-    IReadOnlyList<TriedVariantResponse> Tried, decimal Total, string? Note);
+    IReadOnlyList<TriedVariantResponse> Tried, decimal Total, string? Note,
+    IReadOnlyList<QuoteLineResponse>? BilledLater = null, bool VasOffered = false);
 
+/// <param name="Kind">MOVEMENT, VAS, STORAGE or REEFER.</param>
+/// <param name="BillingUnitCode">PER_TRIP = the once-per-truck gate charge.</param>
+/// <param name="ByHaulierTerm">A cash line the haulier's charge term moved to credit.</param>
 public sealed record QuoteLineResponse(
     string Kind, string ChargeCode, string ChargeName, string BillTo, string? PayerPartyCode,
     decimal Quantity, decimal? UnitRate, decimal Amount, string? TaxCode, decimal TaxRate, decimal TaxAmount, decimal Total,
-    DateOnly? ServiceFrom, DateOnly? ServiceTo, string? ScheduleNo);
+    DateOnly? ServiceFrom, DateOnly? ServiceTo, string? ScheduleNo,
+    string PaymentTermCode = "CASH", string? BillingUnitCode = null, bool ByHaulierTerm = false);
 
 public sealed record SettledChargeResponse(
     Guid ChargeId, string ChargeCode, string Status, decimal Total, string? CouponRef, DateOnly? ServiceTo, string? WaiveReason);
 
-public sealed record TriedVariantResponse(string ChargeCode, string BillTo, string Outcome, decimal? Amount);
+/// <param name="Outcome">PRICED, UNPRICED, PRICED_ZERO, NO_VARIANT, SETTLED, PER_TRIP_ON_OTHER_BOX, GATE_CHARGE_ONLY, HAULIER_CREDIT.</param>
+/// <param name="Note">Why, in a sentence, for the outcomes the gate rules decide (once per truck, gate charge only, haulier credit).</param>
+public sealed record TriedVariantResponse(string ChargeCode, string BillTo, string Outcome, decimal? Amount,
+    string PaymentTermCode = "CASH", string? Note = null);
+
+// ── a truck visit, priced (gate-in-vector-parity §6.2) ──────────────────────
+
+/// <summary>
+/// What one truck visit was charged, per box and per charge line: the cash the
+/// window took for the moves it made (<c>PaidNow</c>), and the credit the gate
+/// event accrued (<c>BilledLater</c>). Vector's one-truck invoice plus its credit
+/// statement lines, read from the charges Revenue already holds.
+/// </summary>
+public sealed record VisitQuoteResponse(
+    Guid TruckVisitId, Guid BranchId, IReadOnlyList<VisitQuoteBoxResponse> Boxes,
+    VisitMoneyResponse PaidNow, VisitMoneyResponse BilledLater, string? CurrencyCode);
+
+/// <param name="Total">VAT-inclusive; <c>Amount</c> and <c>Vat</c> are kept apart (owner: VAT separate).</param>
+public sealed record VisitMoneyResponse(decimal Amount, decimal Vat, decimal Total);
+
+public sealed record VisitQuoteBoxResponse(
+    string? ContainerNo, string? OrderNo, string? MovementCode, string? EirNo, Guid? GateTransactionId,
+    IReadOnlyList<VisitQuoteLineResponse> Lines);
+
+/// <param name="SellingAmount">Amount + VAT (Vector's SellingAmount is tax-inclusive).</param>
+/// <param name="PaymentTerm">CASH (paid at the window, <c>ReceiptNo</c>) or CREDIT (billed later).</param>
+/// <param name="PaymentTo">Who is billed: CUSTOMER in the pilot.</param>
+/// <param name="IsGateCharge">The once-per-truck-visit gate charge (billing unit PER_TRIP).</param>
+public sealed record VisitQuoteLineResponse(
+    string ChargeCode, string? Description, decimal? SellRate, decimal Qty, decimal VatRate,
+    decimal Amount, decimal TaxAmount, decimal SellingAmount,
+    string PaymentTerm, string PaymentTo, string? PayerCode, string Status,
+    string? BillingUnitCode, bool IsGateCharge, string? ReceiptNo);
 
 // ── the drawer ──────────────────────────────────────────────────────────────
 
@@ -59,9 +114,16 @@ public sealed record ShiftReceiptResponse(
 /// <param name="PaidUntil">For a gate-out: the last day of storage paid for (defaults to today). The coupon expires at the end of it.</param>
 /// <param name="ExpectedTotal">The total the cashier saw. Prices are recalculated here; a different answer is refused, never silently charged.</param>
 /// <param name="ReplacesReceiptId">Paying again after a void: the VOIDED receipt of the same booking this one replaces (printed on it). Each is replaced once.</param>
+/// <param name="BookingContainerIds">The boxes going on ONE truck: its PER_TRIP gate charge is charged once, on the first of them.</param>
+/// <param name="TruckCategoryCode">As on the quote — the receipt is re-quoted with the same truck, haulier and VAS.</param>
+/// <param name="SameTruckAs">As on the quote — order numbers of the truck's other bookings; one that carries the gate charge takes it off this receipt.</param>
 public sealed record CreateReceiptRequest(
     Guid BookingId, IReadOnlyList<Guid> BookingContainerIds, DateOnly? PaidUntil,
-    PayerRequest? Payer, IReadOnlyList<PaymentRequest> Payments, decimal ExpectedTotal, Guid? ReplacesReceiptId = null);
+    PayerRequest? Payer, IReadOnlyList<PaymentRequest> Payments, decimal ExpectedTotal, Guid? ReplacesReceiptId = null,
+    string? TruckCategoryCode = null, string? HaulierCode = null, IReadOnlyList<string>? Vas = null,
+    IReadOnlyList<string>? SameTruckAs = null,
+    // The clerk applies withholding tax (only when the quote offers it): the payments then add up to the quote's withholdingTax.nett.
+    bool WithholdingTax = false);
 
 /// <summary>Why the receipt is wrong — kept on it and printed with VOID.</summary>
 public sealed record VoidReceiptRequest(string Reason);
@@ -82,7 +144,9 @@ public sealed record ReceiptResponse(
     Guid BranchId, string? BranchCode, string? PayerBranchNo, string? PayerAddress,
     Guid ShiftId, Guid CashierUserId, SellerResponse? Seller,
     DateTimeOffset? VoidedAt, string? VoidReason,
-    string? ReplacesReceiptNo = null, string? ReplacedByReceiptNo = null);
+    string? ReplacesReceiptNo = null, string? ReplacedByReceiptNo = null,
+    // Withholding tax the payer kept back (0 = none). Total is the tax invoice's; NettAmount is what was paid.
+    decimal? WithholdingTaxRate = null, decimal WithholdingTaxAmount = 0, decimal NettAmount = 0);
 
 /// <summary>
 /// The seller block of the tax invoice, exactly as MDM holds it. A null field is

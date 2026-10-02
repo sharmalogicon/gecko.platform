@@ -285,11 +285,17 @@ public partial class RevenueDbContext : DbContext
 
             entity.HasIndex(e => new { e.TenantId, e.ReceiptId }, "ix_charge__receipt").HasFilter("([receipt_id] IS NOT NULL)");
 
+            entity.HasIndex(e => new { e.TenantId, e.TruckVisitId }, "ix_charge__truck_visit").HasFilter("([truck_visit_id] IS NOT NULL)");
+
             entity.HasIndex(e => new { e.TenantId, e.BranchId, e.PayerPartyCode, e.Status }, "ix_charge__unbilled").HasFilter("([status]='UNBILLED')");
 
             entity.HasIndex(e => new { e.TenantId, e.GateTransactionId, e.ChargeCode, e.BillTo, e.PaymentTermCode }, "uq_charge__gate")
                 .IsUnique()
                 .HasFilter("([source]='GATE')");
+
+            entity.HasIndex(e => new { e.TenantId, e.TruckVisitId, e.ChargeCode }, "uq_charge__gate_trip")
+                .IsUnique()
+                .HasFilter("([source]='GATE' AND [is_trip_charge]=(1) AND [status]<>'CANCELLED')");
 
             entity.HasIndex(e => new { e.TenantId, e.ContainerStayId, e.ChargeCode, e.BillingPeriod }, "uq_charge__storage")
                 .IsUnique()
@@ -371,6 +377,7 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.GateTransactionId).HasColumnName("gate_transaction_id");
             entity.Property(e => e.InvoiceId).HasColumnName("invoice_id");
             entity.Property(e => e.InvoiceLineId).HasColumnName("invoice_line_id");
+            entity.Property(e => e.IsTripCharge).HasColumnName("is_trip_charge");
             entity.Property(e => e.MovementCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
@@ -447,6 +454,7 @@ public partial class RevenueDbContext : DbContext
                 .HasComputedColumnSql("([amount]+[tax_amount])", true)
                 .HasColumnType("decimal(19, 2)")
                 .HasColumnName("total_amount");
+            entity.Property(e => e.TruckVisitId).HasColumnName("truck_visit_id");
             entity.Property(e => e.UnitRate)
                 .HasColumnType("decimal(18, 4)")
                 .HasColumnName("unit_rate");
@@ -1318,6 +1326,12 @@ public partial class RevenueDbContext : DbContext
                 .HasColumnName("void_reason");
             entity.Property(e => e.VoidedAt).HasColumnName("voided_at");
             entity.Property(e => e.VoidedBy).HasColumnName("voided_by");
+            entity.Property(e => e.WithholdingTaxRate)
+                .HasColumnType("decimal(5, 2)")
+                .HasColumnName("withholding_tax_rate");
+            entity.Property(e => e.WithholdingTaxAmount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("withholding_tax_amount");
         });
 
         modelBuilder.Entity<ReceiptLine>(entity =>

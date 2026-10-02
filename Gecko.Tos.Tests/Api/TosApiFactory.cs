@@ -47,7 +47,16 @@ public class TosApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.UseSetting("FileStore:Root", Path.Combine(Path.GetTempPath(), "gecko-tos-test-files"));
     }
 
-    public async ValueTask InitializeAsync() => _liveApiRowsBefore = await LiveApiRowsAsync();
+    public async ValueTask InitializeAsync()
+    {
+        // This host's dispatchers must be the only ones on the local queues: a second
+        // Gecko.Api takes the tests' messages and answers them with its own build.
+        if (await TestDatabase.OtherDispatchersAsync() is { Count: > 0 } others)
+            throw new InvalidOperationException(
+                $"Another Gecko.Api (process {string.Join(", ", others)}) is draining the local outbox. Stop it before running these tests.");
+
+        _liveApiRowsBefore = await LiveApiRowsAsync();
+    }
 
     public override async ValueTask DisposeAsync()
     {

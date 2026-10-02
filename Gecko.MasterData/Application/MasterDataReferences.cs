@@ -149,6 +149,9 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
     public Task<int> GetIntSettingAsync(string settingKey, Guid? branchId, int fallback, CancellationToken ct) =>
         settings.GetIntAsync(settingKey, branchId, fallback, ct);
 
+    public Task<string?> GetStringSettingAsync(string settingKey, Guid? branchId, CancellationToken ct) =>
+        settings.GetAsync(settingKey, branchId, ct);
+
     public async Task<IReadOnlyDictionary<string, VesselRef>> VesselsAsync(IEnumerable<string> vesselCodes, CancellationToken ct)
     {
         var codes = Normalise(vesselCodes);
@@ -210,13 +213,17 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
     public async Task<IReadOnlyDictionary<string, ContainerRef>> ContainersAsync(IEnumerable<string> containerNos, CancellationToken ct)
     {
         var numbers = Normalise(containerNos);
-        return await (
+        var rows = await (
             from c in db.Containers.AsNoTracking()
             join t in db.EquipmentTypes on c.EquipmentTypeId equals t.EquipmentTypeId into types
             from t in types.DefaultIfEmpty()
             where numbers.Contains(c.ContainerNo)
-            select new ContainerRef(c.ContainerId, c.ContainerNo, t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid))
-            .ToDictionaryAsync(c => c.ContainerNo, StringComparer.OrdinalIgnoreCase, ct);
+            select new { c.ContainerId, c.ContainerNo, TypeCode = t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid, c.FixedPortCodes })
+            .ToListAsync(ct);
+        return rows.ToDictionary(c => c.ContainerNo,
+            c => new ContainerRef(c.ContainerId, c.ContainerNo, c.TypeCode, c.Status, c.IsCheckDigitValid,
+                (c.FixedPortCodes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+            StringComparer.OrdinalIgnoreCase);
     }
 
     public async Task<IReadOnlyDictionary<string, CommodityRef>> CommoditiesAsync(IEnumerable<string> commodityCodes, CancellationToken ct)
@@ -282,6 +289,17 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
                 select new OrderTypeChargeRef(cc.ChargeCodeId, cc.ChargeCode1, m == null ? null : m.MovementCode,
                     otc.PaymentTo, otc.PaymentTermCode, otc.IsDefault, otc.IsOptional, otc.IsValueAddedService,
                     otc.RaiseAtGateIn, otc.DefaultQty))
+            .ToListAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<HaulierChargeTermRef>> HaulierChargeTermsAsync(string haulierCode, string orderTypeCode, CancellationToken ct)
+    {
+        var haulier = haulierCode.Trim().ToUpperInvariant();
+        var orderType = orderTypeCode.Trim().ToUpperInvariant();
+        return await db.HaulierChargeTerms.AsNoTracking()
+            .Where(t => t.HaulierPartyCode == haulier && t.OrderTypeCode == orderType)
+            .OrderBy(t => t.MovementCode).ThenBy(t => t.ChargeCode)
+            .Select(t => new HaulierChargeTermRef(t.HaulierPartyCode, t.OrderTypeCode, t.MovementCode, t.ChargeCode, t.PaymentTermCode))
             .ToListAsync(ct);
     }
 

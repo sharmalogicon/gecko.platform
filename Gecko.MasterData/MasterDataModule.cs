@@ -65,6 +65,7 @@ public static class MasterDataModule
             .MapCommercialEndpoints()
             .MapCommercialVocabulary()
             .MapOrderTypeEndpoints()
+            .MapHaulierChargeTermEndpoints()
             .MapConfigEndpoints()
             .MapPartyEndpoints()
             .MapContactEndpoints()

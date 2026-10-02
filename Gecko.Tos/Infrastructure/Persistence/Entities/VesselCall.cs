@@ -51,6 +51,9 @@ public partial class VesselCall
 
     public string? LegacyVesselScheduleIds { get; set; }
 
+    /// <summary>gecko_tos 17: a FULL EXPORT box may not gate out before this; null = no restriction.</summary>
+    public DateTimeOffset? LadenReleaseAt { get; set; }
+
     public string? Remarks { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }

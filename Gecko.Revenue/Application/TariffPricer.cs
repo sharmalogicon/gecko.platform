@@ -93,7 +93,30 @@ internal sealed class TariffPricer(RevenueDbContext db, IMasterDataReferences ma
                 && (r.CargoCategoryCode == null || r.CargoCategoryCode == cargo)
                 && (r.TruckCategoryCode == null || r.TruckCategoryCode == truck))
             .ToListAsync(ct);
-        var bestBySchedule = rates.GroupBy(r => r.ScheduleId).ToDictionary(g => g.Key, g => g.MaxBy(r => r.Specificity)!);
+        // Equal specificity is an identical axis set; since gecko_revenue 22 such lines
+        // may still differ by billing unit. The charge's own unit wins, then the
+        // lowest unit code — never whichever row the database returned first.
+        var bestBySchedule = new Dictionary<Guid, Infrastructure.Persistence.Entities.TosRate>();
+        var tieNotes = new Dictionary<Guid, string>();
+        string? chargeUnit = null;
+        var chargeUnitLoaded = false;
+        foreach (var group in rates.GroupBy(r => r.ScheduleId))
+        {
+            var top = group.Max(r => r.Specificity);
+            var tied = group.Where(r => r.Specificity == top).ToList();
+            if (tied.Count > 1 && !chargeUnitLoaded)
+            {
+                chargeUnit = (await masterData.ChargeCodesAsync([charge], ct)).GetValueOrDefault(charge)?.BillingUnitCode;
+                chargeUnitLoaded = true;
+            }
+            var best = tied.OrderBy(r => r.BillingUnitCode == chargeUnit ? 0 : 1).ThenBy(r => r.BillingUnitCode, StringComparer.Ordinal).First();
+            bestBySchedule[group.Key] = best;
+            if (tied.Count > 1)
+                tieNotes[group.Key] = $"{tied.Count} lines tie, billed per {string.Join(" / ", tied.Select(r => r.BillingUnitCode).Order(StringComparer.Ordinal))}; "
+                    + (best.BillingUnitCode == chargeUnit ? $"{best.BillingUnitCode} is the charge's own unit" : $"{best.BillingUnitCode} is the first by code");
+        }
+
+        string TieNote(Guid scheduleId) => tieNotes.TryGetValue(scheduleId, out var note) ? $" ({note})" : "";
 
         Infrastructure.Persistence.Entities.Schedule? winner = null;
         foreach (var s in candidates)
@@ -104,10 +127,10 @@ internal sealed class TariffPricer(RevenueDbContext db, IMasterDataReferences ma
             else if (winner is null)
             {
                 winner = s;
-                trail.Add($"{name}: {DescribeRate(best)} — CHOSEN");
+                trail.Add($"{name}: {DescribeRate(best)}{TieNote(s.ScheduleId)} — CHOSEN");
             }
             else
-                trail.Add($"{name}: {DescribeRate(best)} — outranked");
+                trail.Add($"{name}: {DescribeRate(best)}{TieNote(s.ScheduleId)} — outranked");
         }
 
         var now = clock.GetUtcNow();

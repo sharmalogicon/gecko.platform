@@ -40,53 +40,55 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .ToDictionaryAsync(p => p.PartyCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 
-    public async Task<IReadOnlyList<string>> ChargeCodesForModuleAsync(string moduleCode, CancellationToken ct)
+    public async Task<IReadOnlyList<CodeDescription>> ChargeCodesForModuleAsync(string moduleCode, CancellationToken ct)
     {
         var module = moduleCode.ToUpperInvariant();
         return await db.ChargeCodes.AsNoTracking()
             .Where(c => c.ModuleCode == module && c.IsActive)
             .OrderBy(c => c.ChargeCode1)
-            .Select(c => c.ChargeCode1)
+            .Select(c => new CodeDescription(c.ChargeCode1, c.DescriptionEn))
             .ToListAsync(ct);
     }
 
-    public async Task<IReadOnlyList<string>> ActiveOrderTypeCodesAsync(CancellationToken ct) =>
+    public async Task<IReadOnlyList<CodeDescription>> ActiveOrderTypeCodesAsync(CancellationToken ct) =>
         await db.OrderTypes.AsNoTracking()
             .Where(o => o.IsActive)
             .OrderBy(o => o.OrderTypeCode)
-            .Select(o => o.OrderTypeCode)
+            .Select(o => new CodeDescription(o.OrderTypeCode, o.DescriptionEn))
             .ToListAsync(ct);
 
-    public async Task<IReadOnlyList<string>> MovementCodesForModuleAsync(string moduleCode, CancellationToken ct)
+    public async Task<IReadOnlyList<CodeDescription>> MovementCodesForModuleAsync(string moduleCode, CancellationToken ct)
     {
         var module = moduleCode.ToUpperInvariant();
         return await db.Movements.AsNoTracking()
             .Where(m => m.IsActive && (m.AppliesToModule == module || m.AppliesToModule == "BOTH"))
             .OrderBy(m => m.MovementCode)
-            .Select(m => m.MovementCode)
+            .Select(m => new CodeDescription(m.MovementCode, m.DescriptionEn))
             .ToListAsync(ct);
     }
 
-    public async Task<IReadOnlyList<EquipmentTypeRef>> ActiveEquipmentTypesAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<EquipmentTypeItem>> ActiveEquipmentTypesAsync(CancellationToken ct)
     {
         var rows = await db.EquipmentTypes.AsNoTracking()
             .Where(e => e.IsActive)
             .OrderBy(e => e.LengthFt).ThenBy(e => e.TypeCode)
-            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive, e.Teu })
+            .Select(e => new { e.TypeCode, e.LengthFt, e.DescriptionEn })
             .ToListAsync(ct);
-        return rows.Select(e => new EquipmentTypeRef(e.EquipmentTypeId, e.TypeCode,
-            decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive, e.Teu)).ToList();
+        return rows.Select(e => new EquipmentTypeItem(e.TypeCode,
+            decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.DescriptionEn)).ToList();
     }
 
-    public async Task<IReadOnlyList<string>> CodeListAsync(string categoryCode, CancellationToken ct)
+    public async Task<IReadOnlyList<CodeDescription>> CodeListAsync(string categoryCode, CancellationToken ct)
     {
         var category = categoryCode.ToUpperInvariant();
         var found = await db.VwCodeLists.AsNoTracking()
             .Where(v => v.CategoryCode == category && v.IsActive == true)
             .OrderBy(v => v.SortOrder).ThenBy(v => v.Code)
-            .Select(v => v.Code!)
+            .Select(v => new { Code = v.Code!, v.DescriptionEn })
             .ToListAsync(ct);
-        return found.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        // A code can appear twice (global and tenant-defined); keep the first in sort order.
+        return found.DistinctBy(v => v.Code, StringComparer.OrdinalIgnoreCase)
+            .Select(v => new CodeDescription(v.Code, v.DescriptionEn ?? "")).ToList();
     }
 
     public async Task<IReadOnlyDictionary<string, ChargeCodeRef>> ChargeCodesAsync(IEnumerable<string> chargeCodes, CancellationToken ct)

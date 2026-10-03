@@ -178,7 +178,7 @@ public sealed class ImportApiTests(RevenueApiFactory api)
         }
     }
 
-    /// <summary>Decision 6: no blank templates, and a workbook belongs to the tariff it was downloaded for.</summary>
+    /// <summary>Decision 6: only a workbook GECKO wrote, and a tariff's own workbook belongs to that tariff.</summary>
     [Fact]
     public async Task Only_a_workbook_downloaded_for_this_tariff_is_accepted()
     {
@@ -312,12 +312,16 @@ public sealed class ImportApiTests(RevenueApiFactory api)
         return (client, (await created.Content.ReadFromJsonAsync<ScheduleResponse>(ct))!, no);
     }
 
-    /// <summary>The values of one drop-down, as the Lists sheet carries them.</summary>
+    /// <summary>The sheet a drop-down reads: a visible reference sheet, or the hidden Lists sheet.</summary>
+    private static string ListSheet(string column) =>
+        Gecko.Revenue.Application.TariffWorkbook.ReferenceSheets.SingleOrDefault(r => r.Column == column).Sheet ?? "Lists";
+
+    /// <summary>The values of one drop-down, as its sheet carries them.</summary>
     private static List<string> ListValues(XLWorkbook book, string column)
     {
-        var lists = book.Worksheet("Lists");
-        var col = lists.Row(1).CellsUsed().Single(c => c.GetString() == column).Address.ColumnNumber;
-        return lists.Column(col).CellsUsed().Skip(1).Select(c => c.GetString()).ToList();
+        var sheet = book.Worksheet(ListSheet(column));
+        var col = sheet.Name == "Lists" ? sheet.Row(1).CellsUsed().Single(c => c.GetString() == column).Address.ColumnNumber : 1;
+        return sheet.Column(col).CellsUsed().Skip(1).Select(c => c.GetString()).ToList();
     }
 
     private static int Col(string name) => Array.IndexOf(Gecko.Revenue.Application.TariffWorkbook.Columns, name) + 1;
@@ -333,13 +337,14 @@ public sealed class ImportApiTests(RevenueApiFactory api)
             var sheet = book.Worksheet("Rates");
 
             Assert.True(sheet.Column(1).IsHidden);
-            Assert.Equal("RateKey", sheet.Cell(1, 1).GetString());
-            Assert.True(sheet.Cell(2, 1).Style.Protection.Locked);
+            Assert.Equal("RateKey", sheet.Cell(2, 1).GetString());                 // layout 2: the note is row 1
+            Assert.Contains("1-7:160; 8-14:275; 15+:390", sheet.Cell(1, 2).GetString());
+            Assert.True(sheet.Cell(3, 1).Style.Protection.Locked);
             Assert.True(sheet.IsProtected);
-            Assert.Equal(1, sheet.SheetView.SplitRow);
+            Assert.Equal(2, sheet.SheetView.SplitRow);
             Assert.True(sheet.AutoFilter.IsEnabled);
             Assert.Equal(XLWorksheetVisibility.Hidden, book.Worksheet("Lists").Visibility);
-            Assert.All(Gecko.Revenue.Application.TariffWorkbook.Columns, c => Assert.True(sheet.Cell(1, Col(c)).HasComment, $"{c} has no note"));
+            Assert.All(Gecko.Revenue.Application.TariffWorkbook.Columns, c => Assert.True(sheet.Cell(2, Col(c)).HasComment, $"{c} has no note"));
 
             string[] dropDowns = ["ChargeCode", "BillTo", "PaymentTerm", "OrderType", "Movement", "EquipmentType", "Size",
                 "CargoCategory", "TruckCategory", "BillingUnit", "PricingMethod", "TierBasis"];
@@ -347,12 +352,12 @@ public sealed class ImportApiTests(RevenueApiFactory api)
             {
                 Assert.NotEmpty(ListValues(book, column));
                 var validation = sheet.DataValidations.SingleOrDefault(v => v.Ranges.Any(r =>
-                    r.FirstCell().Address.ColumnNumber == Col(column) && r.FirstCell().Address.RowNumber == 2
+                    r.FirstCell().Address.ColumnNumber == Col(column) && r.FirstCell().Address.RowNumber == 3
                     && r.LastCell().Address.RowNumber == 5000));
                 Assert.True(validation is not null, $"no drop-down on {column}");
                 Assert.Equal(XLAllowedValues.List, validation.AllowedValues);
                 Assert.True(validation.IgnoreBlanks);
-                Assert.Contains("Lists", validation.Value);
+                Assert.Contains(ListSheet(column), validation.Value);
             }
             Assert.Contains("LIN", ListValues(book, "OrderType"));
             Assert.Contains("40", ListValues(book, "Size"));
@@ -372,7 +377,7 @@ public sealed class ImportApiTests(RevenueApiFactory api)
         {
             using var book = await DownloadAsync(client, draft.ScheduleId, ct);
             var sheet = book.Worksheet("Rates");
-            Assert.True(sheet.Cell(2, Col("ChargeCode")).IsEmpty());
+            Assert.True(sheet.Cell(3, Col("ChargeCode")).IsEmpty());
 
             string Pick(string column, string value)
             {
@@ -380,22 +385,22 @@ public sealed class ImportApiTests(RevenueApiFactory api)
                 return value;
             }
 
-            // Row 2: a lift-on for 40' LIN boxes. Row 3: a gate fee for one equipment type, cargo and truck category.
-            sheet.Cell(2, Col("ChargeCode")).Value = Pick("ChargeCode", "LIFTIN");
-            sheet.Cell(2, Col("BillTo")).Value = Pick("BillTo", "CUSTOMER");
-            sheet.Cell(2, Col("PaymentTerm")).Value = Pick("PaymentTerm", "CASH");
-            sheet.Cell(2, Col("OrderType")).Value = Pick("OrderType", "LIN");
-            sheet.Cell(2, Col("Size")).Value = Pick("Size", "40");
-            sheet.Cell(2, Col("Rate")).Value = 555;
-
-            var equipment = ListValues(book, "EquipmentType")[0];
-            sheet.Cell(3, Col("ChargeCode")).Value = Pick("ChargeCode", "GATEFEE");
+            // Row 3: a lift-on for 40' LIN boxes. Row 4: a gate fee for one equipment type, cargo and truck category.
+            sheet.Cell(3, Col("ChargeCode")).Value = Pick("ChargeCode", "LIFTIN");
             sheet.Cell(3, Col("BillTo")).Value = Pick("BillTo", "CUSTOMER");
             sheet.Cell(3, Col("PaymentTerm")).Value = Pick("PaymentTerm", "CASH");
-            sheet.Cell(3, Col("CargoCategory")).Value = ListValues(book, "CargoCategory")[0];
-            sheet.Cell(3, Col("TruckCategory")).Value = ListValues(book, "TruckCategory")[0];
-            sheet.Cell(3, Col("EquipmentType")).Value = equipment;
-            sheet.Cell(3, Col("Rate")).Value = 150;
+            sheet.Cell(3, Col("OrderType")).Value = Pick("OrderType", "LIN");
+            sheet.Cell(3, Col("Size")).Value = Pick("Size", "40");
+            sheet.Cell(3, Col("Rate")).Value = 555;
+
+            var equipment = ListValues(book, "EquipmentType")[0];
+            sheet.Cell(4, Col("ChargeCode")).Value = Pick("ChargeCode", "GATEFEE");
+            sheet.Cell(4, Col("BillTo")).Value = Pick("BillTo", "CUSTOMER");
+            sheet.Cell(4, Col("PaymentTerm")).Value = Pick("PaymentTerm", "CASH");
+            sheet.Cell(4, Col("CargoCategory")).Value = ListValues(book, "CargoCategory")[0];
+            sheet.Cell(4, Col("TruckCategory")).Value = ListValues(book, "TruckCategory")[0];
+            sheet.Cell(4, Col("EquipmentType")).Value = equipment;
+            sheet.Cell(4, Col("Rate")).Value = 150;
 
             var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, Save(book), ct), ct);
             Assert.True(preview.RowsError == 0, string.Join("; ", preview.Rows.SelectMany(r => r.Issues).Select(i => $"{i.Column}: {i.Message}")));
@@ -447,6 +452,310 @@ public sealed class ImportApiTests(RevenueApiFactory api)
             var lifts = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!
                 .Rates.Where(r => r.ChargeCode == "LIFTIN").ToList();
             Assert.Equal([450m, 555m], lifts.Select(r => r.Rate!.Value).Order());
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    // ── the blank template (gecko_revenue 22): download before any draft, upload merges ──
+
+    private static async Task<XLWorkbook> DownloadBlankAsync(HttpClient client, CancellationToken ct)
+    {
+        var response = await client.GetAsync($"{Tariffs}/template", ct);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Gecko-Tariff-Template.xlsx", response.Content.Headers.ContentDisposition?.FileName?.Trim('"'));
+        return new XLWorkbook(new MemoryStream(await response.Content.ReadAsByteArrayAsync(ct)));
+    }
+
+    /// <summary>Writes one line under the headers of a layout-2 Rates sheet; returns its row.</summary>
+    private static int AddLine(IXLWorksheet sheet, params (string Column, object Value)[] cells)
+    {
+        var row = Math.Max(sheet.LastRowUsed()!.RowNumber(), 2) + 1;
+        foreach (var (column, value) in cells)
+            sheet.Cell(row, Col(column)).Value = value switch { int i => i, decimal d => d, var v => v.ToString() };
+        return row;
+    }
+
+    [Fact]
+    public async Task The_blank_template_is_the_same_workbook_with_no_rows_no_token_and_described_codes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (client, draft, no) = await EmptyDraftAsync(ct);
+        try
+        {
+            using var blank = await DownloadBlankAsync(client, ct);
+            using var own = await DownloadAsync(client, draft.ScheduleId, ct);
+
+            // The same Rates sheet: same headers in the same order, the key hidden, no data rows.
+            var sheet = blank.Worksheet("Rates");
+            var columns = Gecko.Revenue.Application.TariffWorkbook.Columns;
+            Assert.Equal(columns, Enumerable.Range(1, columns.Length).Select(c => sheet.Cell(2, c).GetString()));
+            Assert.Equal(columns, Enumerable.Range(1, columns.Length).Select(c => own.Worksheet("Rates").Cell(2, c).GetString()));
+            Assert.True(sheet.Column(1).IsHidden);
+            Assert.All(Enumerable.Range(1, columns.Length), c => Assert.True(sheet.Cell(3, c).IsEmpty()));
+            var note = sheet.Cell(1, 2).GetString();
+            Assert.Contains("1-7:160; 8-14:275; 15+:390", note);
+            Assert.Contains("RateKey", note);
+
+            // No token, no schedule: the _gecko sheet says BLANK.
+            var meta = blank.Worksheet("_gecko");
+            Assert.Equal(XLWorksheetVisibility.VeryHidden, meta.Visibility);
+            Assert.Equal(("", "", "2", "BLANK"), (meta.Cell(1, 2).GetString(), meta.Cell(2, 2).GetString(), meta.Cell(5, 2).GetString(), meta.Cell(6, 2).GetString()));
+            Assert.Equal("SCHEDULE", own.Worksheet("_gecko").Cell(6, 2).GetString());
+
+            // Visible reference sheets, code + description, in both templates; the drop-downs read them.
+            foreach (var (column, name) in Gecko.Revenue.Application.TariffWorkbook.ReferenceSheets)
+            {
+                foreach (var book in new[] { blank, own })
+                {
+                    var reference = book.Worksheet(name);
+                    Assert.Equal(XLWorksheetVisibility.Visible, reference.Visibility);
+                    Assert.Equal(("Code", "Description"), (reference.Cell(1, 1).GetString(), reference.Cell(1, 2).GetString()));
+                }
+                Assert.Equal(ListValues(own, column), ListValues(blank, column));
+            }
+            var charges = blank.Worksheet("Charge codes");
+            var liftIn = charges.Column(1).CellsUsed().Single(c => c.GetString() == "LIFTIN");
+            Assert.False(string.IsNullOrWhiteSpace(charges.Cell(liftIn.Address.RowNumber, 2).GetString()));
+            Assert.Contains(sheet.DataValidations, v => v.Ranges.Any(r => r.FirstCell().Address.ColumnNumber == Col("ChargeCode"))
+                                                        && v.Value.Contains("Charge codes"));
+
+            // Downloading a blank template records nothing.
+            await using var db = TestDatabase.ForTenant(TestDatabase.Sct);
+            Assert.Equal(1, db.TemplateExports.Count(e => e.ScheduleId == draft.ScheduleId));   // the tariff's own download only
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    [Fact]
+    public async Task The_blank_template_needs_the_import_permission()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ops = await api.ClientForAsync(RevenueApiFactory.SctOpsLcb);
+        Assert.Equal(HttpStatusCode.Forbidden, (await ops.GetAsync($"{Tariffs}/template", ct)).StatusCode);
+    }
+
+    /// <summary>The UI's flow: download blank → fill offline → save a draft header → upload → all INSERT → apply.</summary>
+    [Fact]
+    public async Task A_blank_template_fills_an_empty_draft()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(RevenueApiFactory.SctAccounts);
+        using var book = await DownloadBlankAsync(client, ct);
+        var sheet = book.Worksheet("Rates");
+        AddLine(sheet, ("ChargeCode", "LIFTIN"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"), ("Size", "40"), ("Rate", 555));
+        AddLine(sheet, ("ChargeCode", "STORAGE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("PricingMethod", "TIERED_INCREMENTAL"),
+            ("TierBasis", "DAY"), ("BillingUnit", "PER_DAY"), ("Tiers", "1-7:160; 8-14:275; 15+:390"));
+        var file = Save(book);
+
+        var (_, draft, no) = await EmptyDraftAsync(ct);   // the draft is created after the file was filled
+        try
+        {
+            var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, file, ct), ct);
+            Assert.True(preview.RowsError == 0, string.Join("; ", preview.Rows.SelectMany(r => r.Issues).Select(i => $"{i.Column}: {i.Message}")));
+            Assert.False(preview.ScheduleChangedSinceExport);
+            Assert.Equal((2, 0, 0, 0), (preview.RowsInsert, preview.RowsUpdate, preview.RowsDelete, preview.RowsUnchanged));
+            Assert.All(preview.Rows, r => Assert.Equal("INSERT", r.Action));
+
+            var confirm = await client.PostAsync($"/api/revenue/imports/{preview.ImportBatchId}/confirm", null, ct);
+            Assert.True(confirm.IsSuccessStatusCode, await confirm.Content.ReadAsStringAsync(ct));
+            var after = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!;
+            Assert.Equal(["LIFTIN", "STORAGE"], after.Rates.Select(r => r.ChargeCode).Order());
+            Assert.Equal(3, after.Rates.Single(r => r.ChargeCode == "STORAGE").Tiers.Count);
+
+            await using var db = TestDatabase.ForTenant(TestDatabase.Sct);
+            Assert.Null(db.ImportBatches.Single(b => b.ImportBatchId == preview.ImportBatchId).TemplateExportId);
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    [Fact]
+    public async Task A_blank_template_updates_matching_prices_inserts_new_lines_and_removes_nothing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (client, draft, no) = await DraftAsync(ct);
+        try
+        {
+            var before = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!;
+            using var book = await DownloadBlankAsync(client, ct);
+            var sheet = book.Worksheet("Rates");
+            var lift = AddLine(sheet, ("ChargeCode", "LIFTIN"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"),
+                ("Size", "40"), ("Rate", 600));                                                      // 555 → 600
+            var storage = AddLine(sheet, ("ChargeCode", "STORAGE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"),
+                ("Size", "20"), ("PricingMethod", "TIERED_INCREMENTAL"), ("TierBasis", "DAY"), ("BillingUnit", "PER_DAY"),
+                ("Tiers", "1-7:170; 8+:290"));                                                      // new tiers
+            var gate = AddLine(sheet, ("ChargeCode", "GATEFEE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("Rate", 150));   // same price
+            var liftOut = AddLine(sheet, ("ChargeCode", "LIFTOUT"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LOUT"),
+                ("Size", "40"), ("Rate", 500));                                                     // no match
+            var anySize = AddLine(sheet, ("ChargeCode", "LIFTIN"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"),
+                ("Rate", 400));                                                                     // blank Size = any: not the 40' line
+            // SEALFEE is not in the file.
+
+            var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, Save(book), ct), ct);
+            Assert.True(preview.RowsError == 0, string.Join("; ", preview.Rows.SelectMany(r => r.Issues).Select(i => $"{i.Column}: {i.Message}")));
+            Assert.False(preview.ScheduleChangedSinceExport);
+            Assert.Equal((2, 2, 0, 1), (preview.RowsInsert, preview.RowsUpdate, preview.RowsDelete, preview.RowsUnchanged));
+            Assert.Equal(0, preview.RowsWarning);                                                 // a price change is INFO, not a warning
+            Assert.DoesNotContain(preview.Rows, r => r.Sheet != "Rates");                         // nothing listed for removal
+
+            ImportRowView Row(int n) => preview.Rows.Single(r => r.Sheet == "Rates" && r.RowNo == n);
+            Guid Id(string charge, string? size) => before.Rates.Single(r => r.ChargeCode == charge && r.EquipmentSize == size).TosRateId;
+            Assert.Equal(("UPDATE", "OK", Id("LIFTIN", "40")), (Row(lift).Action, Row(lift).Status, Row(lift).RateKey));
+            var change = Assert.Single(Row(lift).Issues);
+            Assert.Equal(("INFO", "PRICE_CHANGE", "Rate", "555 → 600"), (change.Severity, change.Code, change.Column, change.Message));
+            Assert.Equal("UPDATE", Row(storage).Action);
+            Assert.Equal("TIERED_INCREMENTAL by DAY 1-7:160; 8+:275 → TIERED_INCREMENTAL by DAY 1-7:170; 8+:290", Assert.Single(Row(storage).Issues).Message);
+            Assert.Equal(("UNCHANGED", Id("GATEFEE", null)), (Row(gate).Action, Row(gate).RateKey));
+            Assert.Equal(("INSERT", (Guid?)null), (Row(liftOut).Action, Row(liftOut).RateKey));
+            Assert.Equal("INSERT", Row(anySize).Action);
+
+            var confirm = await client.PostAsync($"/api/revenue/imports/{preview.ImportBatchId}/confirm", null, ct);
+            Assert.True(confirm.IsSuccessStatusCode, await confirm.Content.ReadAsStringAsync(ct));
+
+            var after = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!;
+            Assert.Equal(["GATEFEE", "LIFTIN", "LIFTIN", "LIFTOUT", "SEALFEE", "STORAGE"], after.Rates.Select(r => r.ChargeCode).Order());
+            RateResponse After(Guid id) => after.Rates.Single(r => r.TosRateId == id);
+
+            // updated IN PLACE: same rate, new price, marked imported
+            Assert.Equal((600m, "IMPORTED"), (After(Id("LIFTIN", "40")).Rate, After(Id("LIFTIN", "40")).Source));
+            var tiers = After(Id("STORAGE", "20"));
+            Assert.Equal([new TierItem(1, 7, 170), new TierItem(8, null, 290)], tiers.Tiers);
+            Assert.Equal("DG x1.5", Assert.Single(tiers.Conditions).Label);                     // surcharges are not the price
+            // untouched: the unchanged line and the line not in the file
+            Assert.Equal(("MANUAL", 150m), (After(Id("GATEFEE", null)).Source, After(Id("GATEFEE", null)).Rate));
+            Assert.Equal(("MANUAL", 60m), (After(Id("SEALFEE", null)).Source, After(Id("SEALFEE", null)).Rate));
+            Assert.Equal(400m, after.Rates.Single(r => r.ChargeCode == "LIFTIN" && r.EquipmentSize is null).Rate);
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    [Fact]
+    public async Task A_blank_template_keeps_credit_days_and_ignores_a_pasted_key()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (client, draft, no) = await DraftAsync(ct);
+        try
+        {
+            var before = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!;
+            using var book = await DownloadBlankAsync(client, ct);
+            var sheet = book.Worksheet("Rates");
+            sheet.Unprotect();
+            var seal = AddLine(sheet, ("RateKey", before.Rates.Single(r => r.ChargeCode == "GATEFEE").TosRateId.ToString()),
+                ("ChargeCode", "SEALFEE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("CreditDays", 30), ("Rate", 70));
+
+            var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, Save(book), ct), ct);
+            var row = preview.Rows.Single(r => r.RowNo == seal);
+            Assert.Equal(("UPDATE", "WARNING"), (row.Action, row.Status));
+            Assert.Equal(before.Rates.Single(r => r.ChargeCode == "SEALFEE").TosRateId, row.RateKey);   // matched on codes, not the key
+            Assert.Equal(["CREDIT_DAYS_KEPT", "PRICE_CHANGE", "RATE_KEY_IGNORED"], row.Issues.Select(i => i.Code).Order());
+
+            var confirm = await client.PostAsync($"/api/revenue/imports/{preview.ImportBatchId}/confirm", null, ct);
+            Assert.True(confirm.IsSuccessStatusCode, await confirm.Content.ReadAsStringAsync(ct));
+            var sealFee = (await client.GetFromJsonAsync<RateSetResponse>($"{Tariffs}/{draft.ScheduleId}/rates", ct))!
+                .Rates.Single(r => r.ChargeCode == "SEALFEE");
+            Assert.Equal((70m, (short?)null), (sealFee.Rate, sealFee.CreditTermDays));
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    [Fact]
+    public async Task A_blank_template_with_the_same_line_twice_is_an_error()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (client, draft, no) = await EmptyDraftAsync(ct);
+        try
+        {
+            using var book = await DownloadBlankAsync(client, ct);
+            var sheet = book.Worksheet("Rates");
+            AddLine(sheet, ("ChargeCode", "GATEFEE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("Rate", 150));
+            var twice = AddLine(sheet, ("ChargeCode", "GATEFEE"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("Rate", 160));
+
+            var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, Save(book), ct), ct);
+            Assert.Equal(1, preview.RowsError);
+            Assert.Contains(preview.Rows.Single(r => r.RowNo == twice).Issues, i => i.Message.Contains("billing unit"));
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    /// <summary>gecko_revenue 22: the billing unit is part of a rate's identity, and the pricer breaks the tie on it.</summary>
+    [Fact]
+    public async Task Two_lines_may_differ_by_billing_unit_alone_and_the_charges_own_unit_prices()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (maker, draft, no) = await EmptyDraftAsync(ct);
+        var checker = await api.ClientForAsync(RevenueApiFactory.SctOwner);
+        try
+        {
+            using var book = await DownloadBlankAsync(maker, ct);
+            var sheet = book.Worksheet("Rates");
+            AddLine(sheet, ("ChargeCode", "LIFTIN"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"), ("Size", "40"),
+                ("BillingUnit", "PER_TEU"), ("Rate", 300));
+            AddLine(sheet, ("ChargeCode", "LIFTIN"), ("BillTo", "CUSTOMER"), ("PaymentTerm", "CASH"), ("OrderType", "LIN"), ("Size", "40"),
+                ("Rate", 555));                                                                     // blank unit = LIFTIN's own, PER_CONTAINER
+            var preview = await PreviewOf(await UploadAsync(maker, draft.ScheduleId, Save(book), ct), ct);
+            Assert.True(preview.RowsError == 0, string.Join("; ", preview.Rows.SelectMany(r => r.Issues).Select(i => $"{i.Column}: {i.Message}")));
+            Assert.True((await maker.PostAsync($"/api/revenue/imports/{preview.ImportBatchId}/confirm", null, ct)).IsSuccessStatusCode);
+
+            var current = (await maker.GetFromJsonAsync<ScheduleResponse>($"{Tariffs}/{draft.ScheduleId}", ct))!;
+            var submitted = await (await maker.PostAsJsonAsync($"{Tariffs}/{draft.ScheduleId}/submit", new { rowVersion = current.RowVersion }, ct))
+                .Content.ReadFromJsonAsync<ScheduleResponse>(ct);
+            var approve = await checker.PostAsJsonAsync($"{Tariffs}/{draft.ScheduleId}/approve", new { rowVersion = submitted!.RowVersion }, ct);
+            Assert.True(approve.IsSuccessStatusCode, await approve.Content.ReadAsStringAsync(ct));
+
+            var price = await maker.PostAsJsonAsync("/api/revenue/price", new Gecko.Revenue.Contracts.PriceRequest(
+                "TOS", null, new DateTimeOffset(2031, 1, 5, 3, 0, 0, TimeSpan.Zero), "LIFTIN", "CUSTOMER", "CASH",
+                CustomerPartyCode: "CUS-TAE", BookingRef: $"BKG-{no}", OrderTypeCode: "LIN", EquipmentSize: "40"), ct);
+            var body = await price.Content.ReadAsStringAsync(ct);
+            Assert.True(price.IsSuccessStatusCode, body);
+            var result = JsonSerializer.Deserialize<Gecko.Revenue.Contracts.PriceResult>(body, JsonSerializerOptions.Web)!;
+            Assert.Equal((draft.ScheduleId, "PER_CONTAINER", 555m), (result.ScheduleId!.Value, result.BillingUnitCode!, result.Amount!.Value));
+            Assert.Contains(result.PrecedenceTrail, t => t.Contains("2 lines tie") && t.Contains("PER_CONTAINER is the charge's own unit"));
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    /// <summary>A workbook downloaded before layout 2 (headers in row 1, no template_kind) still uploads.</summary>
+    [Fact]
+    public async Task A_layout_1_workbook_still_uploads()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (client, draft, no) = await DraftAsync(ct);
+        try
+        {
+            using var book = await DownloadAsync(client, draft.ScheduleId, ct);
+            var sheet = book.Worksheet("Rates");
+            sheet.Unprotect();
+            sheet.Row(1).Delete();                                                                  // headers back in row 1
+            var meta = book.Worksheet("_gecko");
+            meta.Unprotect();
+            meta.Cell(5, 2).Value = 1;
+            meta.Row(6).Delete();
+            Assert.Equal("RateKey", sheet.Cell(1, 1).GetString());
+            sheet.Cell(RowOf(sheet, "LIFTIN"), Col("Rate")).Value = 600;
+
+            var preview = await PreviewOf(await UploadAsync(client, draft.ScheduleId, Save(book), ct), ct);
+            Assert.Equal((0, 0, 1, 0, 3), (preview.RowsError, preview.RowsInsert, preview.RowsUpdate, preview.RowsDelete, preview.RowsUnchanged));
         }
         finally
         {

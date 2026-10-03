@@ -17,22 +17,23 @@ public interface IMasterDataReferences
 {
     Task<IReadOnlyDictionary<string, BranchRef>> BranchesAsync(IEnumerable<Guid> branchIds, CancellationToken ct);
     Task<IReadOnlyDictionary<string, PartyRef>> PartiesAsync(IEnumerable<string> partyCodes, CancellationToken ct);
-    /// <summary>Every active charge code of a module, for template drop-downs.</summary>
-    Task<IReadOnlyList<string>> ChargeCodesForModuleAsync(string moduleCode, CancellationToken ct);
 
-    // ── "list all" — for template drop-downs (the user picks, never types) ──
+    // ── "list all" — for template drop-downs and reference sheets (the user picks, never types) ──
 
-    /// <summary>Every active order type code of the tenant, sorted.</summary>
-    Task<IReadOnlyList<string>> ActiveOrderTypeCodesAsync(CancellationToken ct);
+    /// <summary>Every active charge code of a module, sorted, with its description.</summary>
+    Task<IReadOnlyList<CodeDescription>> ChargeCodesForModuleAsync(string moduleCode, CancellationToken ct);
 
-    /// <summary>Every active movement code that applies to a module (the module's own, plus BOTH), sorted.</summary>
-    Task<IReadOnlyList<string>> MovementCodesForModuleAsync(string moduleCode, CancellationToken ct);
+    /// <summary>Every active order type of the tenant, sorted, with its description.</summary>
+    Task<IReadOnlyList<CodeDescription>> ActiveOrderTypeCodesAsync(CancellationToken ct);
+
+    /// <summary>Every active movement that applies to a module (the module's own, plus BOTH), sorted, with its description.</summary>
+    Task<IReadOnlyList<CodeDescription>> MovementCodesForModuleAsync(string moduleCode, CancellationToken ct);
 
     /// <summary>Every active equipment type of the tenant, sorted by length then code.</summary>
-    Task<IReadOnlyList<EquipmentTypeRef>> ActiveEquipmentTypesAsync(CancellationToken ct);
+    Task<IReadOnlyList<EquipmentTypeItem>> ActiveEquipmentTypesAsync(CancellationToken ct);
 
     /// <summary>Every active value of a code-list category for this tenant (global or tenant-defined), in sort order.</summary>
-    Task<IReadOnlyList<string>> CodeListAsync(string categoryCode, CancellationToken ct);
+    Task<IReadOnlyList<CodeDescription>> CodeListAsync(string categoryCode, CancellationToken ct);
 
     Task<IReadOnlyDictionary<string, ChargeCodeRef>> ChargeCodesAsync(IEnumerable<string> chargeCodes, CancellationToken ct);
     Task<IReadOnlyDictionary<string, CodeRef>> OrderTypesAsync(IEnumerable<string> orderTypeCodes, CancellationToken ct);
@@ -189,6 +190,12 @@ public sealed record SurveyCodeSets(
 
 /// <summary><see cref="MakesUnserviceable"/> is what turns a survey into a hold, not the surveyor's mood.</summary>
 public sealed record DamageCodeRef(string DamageCode, string DescriptionEn, byte Severity, bool MakesUnserviceable);
+
+/// <summary>A code and what it means — one line of a template's reference sheet.</summary>
+public sealed record CodeDescription(string Code, string Description);
+
+/// <summary>An equipment type for a template's reference sheet; <see cref="SizeCode"/> as in <see cref="EquipmentTypeRef"/>.</summary>
+public sealed record EquipmentTypeItem(string TypeCode, string SizeCode, string Description);
 
 /// <summary>Dictionary keys are the CODE, upper-case (for branches, the id as a string).</summary>
 public sealed record CodeRef(Guid Id, string Code, bool IsActive);

@@ -1775,7 +1775,7 @@ public partial class RevenueDbContext : DbContext
 
             entity.HasIndex(e => new { e.TenantId, e.ScheduleId, e.ChargeCodeId, e.BillTo, e.PaymentTermCode, e.Specificity }, "ix_tos_rate__resolve").HasFilter("([deleted_at] IS NULL)");
 
-            entity.HasIndex(e => new { e.TenantId, e.ScheduleId, e.ChargeCodeId, e.BillTo, e.PaymentTermCode, e.AxisSignature }, "uq_tos_rate__signature")
+            entity.HasIndex(e => new { e.TenantId, e.ScheduleId, e.ChargeCodeId, e.BillTo, e.PaymentTermCode, e.AxisSignature, e.BillingUnitCode }, "uq_tos_rate__signature")
                 .IsUnique()
                 .HasFilter("([deleted_at] IS NULL)");
 

@@ -14,7 +14,7 @@ namespace Gecko.Revenue.Endpoints.Tariffs;
 /// A tariff's rate table and free-time rules, each REPLACED AS A SET.
 ///
 /// Why not row-by-row PATCH: uq_tos_rate__signature makes a table of rates a
-/// set with an invariant ("no two rows the resolver cannot choose between"),
+/// set with an invariant (no two rows with the same axes AND billing unit),
 /// and a partial edit discovers a clash halfway. Sending the whole intended
 /// table lets it be checked once — the same reason MasterData replaces charge
 /// variants and gate rules wholesale, and the shape the Excel import will send.

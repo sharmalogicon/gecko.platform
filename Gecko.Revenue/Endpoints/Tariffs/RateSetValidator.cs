@@ -181,12 +181,12 @@ internal sealed partial class RateSetValidator(RevenueDbContext db, IMasterDataR
                 }, values));
             }
 
-            // duplicate axis values for the same charge + payer + terms
+            // duplicate axis values for the same charge + payer + terms + unit (uq_tos_rate__signature)
             var signature = string.Join('|', r.ChargeCode, r.BillTo, r.PaymentTermCode,
                 r.OrderTypeCode ?? "*", r.MovementCode ?? "*", r.EquipmentTypeCode ?? "*", size ?? "*",
-                r.CargoCategoryCode ?? "*", r.TruckCategoryCode ?? "*");
+                r.CargoCategoryCode ?? "*", r.TruckCategoryCode ?? "*", unit ?? "*");
             if (signatures.TryGetValue(signature, out var first))
-                errors.Add($"{at}", $"Same charge, payer, terms and axes as rates[{first}] — the resolver could not choose between them.");
+                errors.Add($"{at}", $"Same charge, payer, terms, axes and billing unit as rates[{first}] — the resolver could not choose between them.");
             else
                 signatures[signature] = i;
 

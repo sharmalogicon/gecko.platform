@@ -30,8 +30,12 @@ public sealed record ImportPreview(
 /// <summary>
 /// Excel in and out for a tariff (ROADMAP 2.7, decisions 5 and 6).
 ///
+///   GET  /tariffs/template          a BLANK TOS workbook: no rows, no token (gecko_revenue 22)
 ///   GET  /tariffs/{id}/template     download the tariff as a workbook (records the token)
-///   POST /tariffs/{id}/imports      upload it → parsed, validated, previewed; NOTHING applied
+///   POST /tariffs/{id}/imports      upload it → parsed, validated, previewed; NOTHING applied.
+///                                   A tariff's own workbook REPLACES the rate set; a blank
+///                                   one MERGES (matching line → new price, other → new rate,
+///                                   nothing removed).
 ///   GET  /imports/{batchId}         the preview again
 ///   POST /imports/{batchId}/confirm apply it — only if still error-free and the draft has not moved
 ///   POST /imports/{batchId}/cancel
@@ -50,6 +54,8 @@ internal static class ImportEndpoints
     public static RouteGroupBuilder MapImportEndpoints(this RouteGroupBuilder revenue)
     {
         var tariffs = revenue.MapGroup("/tariffs").WithTags("Revenue — Excel import");
+        tariffs.MapGet("/template", BlankTemplateAsync).RequirePermission(RevenuePermissions.ImportManage)
+            .WithSummary("Download a blank TOS tariff workbook to fill in and upload into a draft");
         tariffs.MapGet("/{scheduleId:guid}/template", TemplateAsync).RequirePermission(RevenuePermissions.ImportManage)
             .WithSummary("Download the tariff as an Excel workbook to edit and upload back");
         tariffs.MapPost("/{scheduleId:guid}/imports", UploadAsync).RequirePermission(RevenuePermissions.ImportManage)
@@ -98,23 +104,45 @@ internal static class ImportEndpoints
         });
         await db.SaveChangesAsync(ct);
 
+        var bytes = TariffWorkbook.Write(
+            TariffWorkbook.Header.ForSchedule(token, scheduleId, schedule.ScheduleNo, schedule.VersionNo),
+            $"{schedule.ScheduleNo} v{schedule.VersionNo} — {schedule.Name}", lines,
+            await ListsAsync(db, masterData, schedule.ModuleCode, ct));
+        return TypedResults.File(bytes, XlsxContentType, $"{schedule.ScheduleNo.Replace('/', '-')}-v{schedule.VersionNo}.xlsx");
+    }
+
+    /// <summary>
+    /// The same writer with no schedule: no rows, no token, nothing recorded. TOS only —
+    /// the only module with a rate template. Its upload merges (see <see cref="PlanAsync"/>).
+    /// </summary>
+    private static async Task<FileContentHttpResult> BlankTemplateAsync(
+        RevenueDbContext db, IMasterDataReferences masterData, CancellationToken ct)
+    {
+        var bytes = TariffWorkbook.Write(TariffWorkbook.Header.Blank(),
+            "New TOS tariff — fill in, then upload into a draft tariff", [], await ListsAsync(db, masterData, "TOS", ct));
+        return TypedResults.File(bytes, XlsxContentType, "Gecko-Tariff-Template.xlsx");
+    }
+
+    /// <summary>The reference sheets: the caller's tenant's codes, each with its description.</summary>
+    private static async Task<TariffWorkbook.Lists> ListsAsync(
+        RevenueDbContext db, IMasterDataReferences masterData, string moduleCode, CancellationToken ct)
+    {
         var equipment = await masterData.ActiveEquipmentTypesAsync(ct);
-        var lists = new TariffWorkbook.Lists(
-            await masterData.ChargeCodesForModuleAsync(schedule.ModuleCode, ct),
-            await db.BillToRoles.AsNoTracking().Where(b => b.IsActive).OrderBy(b => b.SortOrder).Select(b => b.Code).ToListAsync(ct),
-            await db.PaymentTerms.AsNoTracking().Where(p => p.IsActive).OrderBy(p => p.DisplayOrder).Select(p => p.Code).ToListAsync(ct),
-            await db.BillingUnits.AsNoTracking().Where(b => b.IsActive).OrderBy(b => b.DisplayOrder).Select(b => b.Code).ToListAsync(ct),
+        return new TariffWorkbook.Lists(
+            await masterData.ChargeCodesForModuleAsync(moduleCode, ct),
+            await db.BillToRoles.AsNoTracking().Where(b => b.IsActive).OrderBy(b => b.SortOrder)
+                .Select(b => new CodeDescription(b.Code, b.DescriptionEn)).ToListAsync(ct),
+            await db.PaymentTerms.AsNoTracking().Where(p => p.IsActive).OrderBy(p => p.DisplayOrder)
+                .Select(p => new CodeDescription(p.Code, p.DescriptionEn)).ToListAsync(ct),
+            await db.BillingUnits.AsNoTracking().Where(b => b.IsActive).OrderBy(b => b.DisplayOrder)
+                .Select(b => new CodeDescription(b.Code, b.DescriptionEn)).ToListAsync(ct),
             await masterData.ActiveOrderTypeCodesAsync(ct),
-            await masterData.MovementCodesForModuleAsync(schedule.ModuleCode, ct),
-            equipment.Select(e => e.TypeCode).ToList(),
-            equipment.Select(e => e.SizeCode).Distinct().OrderBy(z => int.TryParse(z, out var n) ? n : int.MaxValue).ToList(),
+            await masterData.MovementCodesForModuleAsync(moduleCode, ct),
+            equipment.Select(e => new CodeDescription(e.TypeCode, $"{e.Description} ({e.SizeCode} ft)")).ToList(),
+            equipment.Select(e => e.SizeCode).Distinct().OrderBy(z => int.TryParse(z, out var n) ? n : int.MaxValue)
+                .Select(z => new CodeDescription(z, $"{z}-foot container, any type")).ToList(),
             await masterData.CodeListAsync("CARGO_CATEGORY", ct),
             await masterData.CodeListAsync("TRUCK_CATEGORY", ct));
-
-        var bytes = TariffWorkbook.Write(
-            new TariffWorkbook.Header(token, scheduleId, schedule.ScheduleNo, schedule.VersionNo, TariffWorkbook.LayoutVersion),
-            schedule.Name, lines, lists);
-        return TypedResults.File(bytes, XlsxContentType, $"{schedule.ScheduleNo.Replace('/', '-')}-v{schedule.VersionNo}.xlsx");
     }
 
     // ── upload → preview ────────────────────────────────────────────────────
@@ -136,13 +164,17 @@ internal static class ImportEndpoints
         var read = TariffWorkbook.Read(buffer);
         if (read.Header is null) return RevenueSupport.Invalid("file", read.Error!);
 
-        var export = await db.TemplateExports.AsNoTracking()
-            .SingleOrDefaultAsync(e => e.Token == read.Header.Token, ct);
-        if (export is null || export.ScheduleId != scheduleId)
-            return RevenueSupport.Invalid("file",
-                $"This workbook was downloaded for {read.Header.ScheduleNo} v{read.Header.VersionNo}, not for {schedule.ScheduleNo} v{schedule.VersionNo}. Download this tariff's template.");
-        if (read.Header.LayoutVersion != TariffWorkbook.LayoutVersion)
-            return RevenueSupport.Invalid("file", "This workbook uses an older layout. Download a fresh template.");
+        // A tariff's own workbook must carry a token we issued for THIS tariff. A blank
+        // template has none, by design: it fits any draft and merges into it.
+        TemplateExport? export = null;
+        if (!read.Header.IsBlank)
+        {
+            export = await db.TemplateExports.AsNoTracking()
+                .SingleOrDefaultAsync(e => e.Token == read.Header.Token, ct);
+            if (export is null || export.ScheduleId != scheduleId)
+                return RevenueSupport.Invalid("file",
+                    $"This workbook was downloaded for {read.Header.ScheduleNo} v{read.Header.VersionNo}, not for {schedule.ScheduleNo} v{schedule.VersionNo}. Download this tariff's template.");
+        }
         if (read.Error is not null) return RevenueSupport.Invalid("file", read.Error);
 
         if (await db.ImportBatches.AnyAsync(b => b.ScheduleId == scheduleId && b.FileSha256 == sha && b.Status == "APPLIED", ct))
@@ -152,7 +184,7 @@ internal static class ImportEndpoints
         {
             ImportBatchId = Guid.CreateVersion7(),
             TenantId = caller.TenantId(),
-            TemplateExportId = export.TemplateExportId,
+            TemplateExportId = export?.TemplateExportId,
             ScheduleId = scheduleId,
             TemplateKind = "TOS_RATE",
             FileName = Path.GetFileName(file.FileName),
@@ -160,7 +192,8 @@ internal static class ImportEndpoints
             FileSizeBytes = (int)file.Length,
             UploadedBy = caller.UserId,
             ScheduleRowVersion = schedule.RowVersion,
-            ScheduleChangedSinceExport = !export.ScheduleRowVersion.SequenceEqual(schedule.RowVersion),
+            // Nothing was exported, so nothing can have changed since.
+            ScheduleChangedSinceExport = export is not null && !export.ScheduleRowVersion.SequenceEqual(schedule.RowVersion),
         };
 
         var plan = await PlanAsync(db, validator, schedule, read.Rows, batch, ct);
@@ -174,11 +207,22 @@ internal static class ImportEndpoints
 
     private sealed record Plan(List<ImportRow> Rows, List<ImportRowIssue> Issues);
 
-    /// <summary>Parses every line, validates the whole set, and decides what each line would do.</summary>
+    /// <summary>
+    /// Parses every line, validates the whole set, and decides what each line would do.
+    ///
+    /// A tariff's own workbook (batch has an export) is the FULL rate set: lines find
+    /// their rate by RateKey, and a rate missing from the file is DELETEd.
+    ///
+    /// A blank template (no export) MERGES: each line finds its rate by
+    /// <see cref="MatchKey"/> — every code, NULL = NULL — and UPDATEs only its
+    /// price (method, basis, rate, tiers; an INFO issue says old → new), or is an
+    /// INSERT. Rates not in the file are left alone.
+    /// </summary>
     private static async Task<Plan> PlanAsync(
         RevenueDbContext db, RateSetValidator validator, Schedule schedule,
         IReadOnlyList<TariffWorkbook.ReadRow> lines, ImportBatch batch, CancellationToken ct)
     {
+        var merge = batch.TemplateExportId is null;
         var current = (await CurrentRatesAsync(db, schedule.ScheduleId, ct)).ToDictionary(c => c.Rate.TosRateId);
         var rows = new List<ImportRow>();
         var issues = new List<ImportRowIssue>();
@@ -193,7 +237,7 @@ internal static class ImportEndpoints
                 ColumnName = column, Severity = severity, IssueCode = code, Message = message,
             });
             if (severity == "ERROR") row.Status = "ERROR";
-            else if (row.Status == "OK") row.Status = "WARNING";
+            else if (severity == "WARNING" && row.Status == "OK") row.Status = "WARNING";
         }
 
         foreach (var line in lines)
@@ -207,8 +251,10 @@ internal static class ImportEndpoints
             };
             rows.Add(row);
 
-            // the key
-            if (c["RateKey"] is { } keyText)
+            // the key — a blank template matches on codes, so a key pasted into one means nothing
+            if (merge && c["RateKey"] is not null)
+                Issue(row, "RateKey", "RATE_KEY_IGNORED", "A blank template matches lines on their codes; this RateKey is ignored.", "WARNING");
+            else if (c["RateKey"] is { } keyText)
             {
                 if (!Guid.TryParse(keyText, out var key) || !current.ContainsKey(key))
                     Issue(row, "RateKey", "UNKNOWN_RATE_KEY", "This RateKey does not belong to this tariff. Leave it blank for a new line — never type or copy it.");
@@ -260,24 +306,39 @@ internal static class ImportEndpoints
             foreach (var message in messages) Issue(items[index].Row, column, "INVALID", message);
         }
 
+        var byMatchKey = merge ? current.Values.ToDictionary(v => MatchKey(v.Rate)) : null;
         foreach (var valid in result.Rates)
         {
             var (row, item) = items[valid.Index];
             row.ResolvedJson = JsonSerializer.Serialize(item, JsonSerializerOptions.Web);
-            row.Action = row.TargetId is { } key
-                ? Canonical(valid.Rate, valid.Tiers.Select(t => new Tier(t.FromQty, t.ToQty, t.Rate)))
-                  == Canonical(current[key].Rate, current[key].Tiers) ? "UNCHANGED" : "UPDATE"
-                : "INSERT";
+            var tiers = valid.Tiers.Select(t => new Tier(t.FromQty, t.ToQty, t.Rate)).ToList();
+            if (byMatchKey is null)
+                row.Action = row.TargetId is { } key
+                    ? Canonical(valid.Rate, tiers) == Canonical(current[key].Rate, current[key].Tiers) ? "UNCHANGED" : "UPDATE"
+                    : "INSERT";
+            else if (byMatchKey.TryGetValue(MatchKey(valid.Rate), out var match))
+            {
+                row.TargetId = match.Rate.TosRateId;
+                var (was, now) = (PriceText(match.Rate, match.Tiers), PriceText(valid.Rate, tiers));
+                row.Action = was == now ? "UNCHANGED" : "UPDATE";
+                if (row.Action == "UPDATE")
+                    Issue(row, valid.Rate.PricingMethod == PricingMethods.Flat ? "Rate" : "Tiers", "PRICE_CHANGE", $"{was} → {now}", "INFO");
+                if (valid.Rate.CreditTermDays is { } days && days != match.Rate.CreditTermDays)
+                    Issue(row, "CreditDays", "CREDIT_DAYS_KEPT",
+                        $"A blank template changes the price only; this rate keeps credit days {match.Rate.CreditTermDays?.ToString(CultureInfo.InvariantCulture) ?? "(charge default)"}.", "WARNING");
+            }
+            else
+                row.Action = "INSERT";
         }
 
-        // lines that disappeared
+        // lines that disappeared — a full rate set only; a merge never removes
         var removedNo = 0;
-        foreach (var gone in current.Values.Where(v => !seenKeys.Contains(v.Rate.TosRateId)))
+        foreach (var gone in merge ? Enumerable.Empty<CurrentRate>() : current.Values.Where(v => !seenKeys.Contains(v.Rate.TosRateId)))
             rows.Add(new ImportRow
             {
                 ImportRowId = Guid.CreateVersion7(), TenantId = batch.TenantId, ImportBatchId = batch.ImportBatchId,
                 SheetName = RemovedSheet, RowNo = ++removedNo, TargetId = gone.Rate.TosRateId, Action = "DELETE", Status = "OK",
-                RawJson = JsonSerializer.Serialize(new { gone.Rate.ChargeCode, gone.Rate.BillTo, gone.Rate.PaymentTermCode, gone.Rate.AxisSignature }, JsonSerializerOptions.Web),
+                RawJson = JsonSerializer.Serialize(new { gone.Rate.ChargeCode, gone.Rate.BillTo, gone.Rate.PaymentTermCode, gone.Rate.AxisSignature, gone.Rate.BillingUnitCode }, JsonSerializerOptions.Web),
             });
 
         if (batch.ScheduleChangedSinceExport && rows.FirstOrDefault(r => r.SheetName == Sheet) is { } first)
@@ -310,6 +371,23 @@ internal static class ImportEndpoints
         r.EquipmentTypeCode, r.EquipmentSize, r.CargoCategoryCode, r.TruckCategoryCode, r.BillingUnitCode,
         r.PricingMethod, r.TierBasis, r.Rate?.ToString("0.####", CultureInfo.InvariantCulture), TierText.Format(tiers));
 
+    /// <summary>
+    /// What a blank-template line is matched on: every code of uq_tos_rate__signature
+    /// (gecko_revenue 22) — the schedule is the target's, the tenant the caller's. A NULL
+    /// axis is "*", so NULL = NULL. Values are the validator's resolved ones: a blank
+    /// BillingUnit is the charge's unit, and an equipment type implies its size.
+    /// </summary>
+    private static string MatchKey(TosRate r) => string.Join('|',
+        r.ChargeCode, r.BillTo, r.PaymentTermCode, r.OrderTypeCode ?? "*", r.MovementCode ?? "*",
+        r.EquipmentTypeCode ?? "*", r.EquipmentSize ?? "*", r.CargoCategoryCode ?? "*", r.TruckCategoryCode ?? "*",
+        r.BillingUnitCode).ToUpperInvariant();
+
+    /// <summary>The price a blank-template line may change, as the preview shows it: "600" or "TIERED_INCREMENTAL by DAY 1-7:160; 8+:275".</summary>
+    private static string PriceText(TosRate r, IEnumerable<Tier> tiers) =>
+        r.PricingMethod == PricingMethods.Flat
+            ? r.Rate?.ToString("0.####", CultureInfo.InvariantCulture) ?? ""
+            : $"{r.PricingMethod} by {r.TierBasis} {TierText.Format(tiers)}";
+
     // ── confirm / cancel / read ─────────────────────────────────────────────
 
     private static async Task<Results<Ok<ImportPreview>, NotFound, ValidationProblem, ProblemHttpResult>> ConfirmAsync(
@@ -339,16 +417,22 @@ internal static class ImportEndpoints
 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         db.TrySetExpectedVersion(schedule, Convert.ToBase64String(batch.ScheduleRowVersion));
-        await RateSetWriter.RemoveRatesAsync(db, schedule.ScheduleId, ct);
         schedule.UpdatedAt = clock.GetUtcNow();
-        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
-
         foreach (var valid in result.Rates)
         {
             valid.Rate.Source = "IMPORTED";
             valid.Rate.ImportRowId = rows[valid.Index].ImportRowId;
         }
-        RateSetWriter.Add(db, result.Rates);
+
+        if (batch.TemplateExportId is not null)
+        {
+            // a tariff's own workbook: the file IS the rate set
+            await RateSetWriter.RemoveRatesAsync(db, schedule.ScheduleId, ct);
+            if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+            RateSetWriter.Add(db, result.Rates);
+        }
+        else if (await MergeAsync(db, schedule.ScheduleId, result.Rates, ct) is { } conflict)
+            return conflict;
 
         var now = clock.GetUtcNow();
         batch.Status = "APPLIED";
@@ -359,6 +443,51 @@ internal static class ImportEndpoints
         await tx.CommitAsync(ct);
 
         return TypedResults.Ok(await PreviewOfAsync(db, batchId, ct));
+    }
+
+    /// <summary>
+    /// A blank template, applied: a line matching a rate (<see cref="MatchKey"/>) replaces
+    /// that rate's price in place — same row, same surcharges, same credit days — and any
+    /// other line is added. Rates the file does not mention are not touched. The match is
+    /// made again here, not trusted from the preview; the schedule's row version
+    /// guarantees it is the same draft the preview saw.
+    /// </summary>
+    private static async Task<ProblemHttpResult?> MergeAsync(
+        RevenueDbContext db, Guid scheduleId, IReadOnlyList<RateSetValidator.ValidRate> rates, CancellationToken ct)
+    {
+        var existing = (await db.TosRates.Where(r => r.ScheduleId == scheduleId).ToListAsync(ct)).ToDictionary(MatchKey);
+        var ids = existing.Values.Select(r => r.TosRateId).ToList();
+        var tiers = (await db.RateTiers.Where(t => t.OwnerType == "TOS_RATE" && ids.Contains(t.OwnerId)).ToListAsync(ct))
+            .ToLookup(t => t.OwnerId);
+
+        var inserts = new List<RateSetValidator.ValidRate>();
+        var newTiers = new List<RateTier>();
+        foreach (var valid in rates)
+        {
+            if (!existing.TryGetValue(MatchKey(valid.Rate), out var target))
+            {
+                inserts.Add(valid);
+                continue;
+            }
+            var was = tiers[target.TosRateId].Select(t => new Tier(t.FromQty, t.ToQty, t.Rate)).ToList();
+            if (PriceText(target, was) == PriceText(valid.Rate, valid.Tiers.Select(t => new Tier(t.FromQty, t.ToQty, t.Rate))))
+                continue;   // UNCHANGED
+
+            target.PricingMethod = valid.Rate.PricingMethod;
+            target.TierBasis = valid.Rate.TierBasis;
+            target.Rate = valid.Rate.Rate;
+            target.Source = valid.Rate.Source;
+            target.ImportRowId = valid.Rate.ImportRowId;
+            db.RateTiers.RemoveRange(tiers[target.TosRateId]);
+            foreach (var tier in valid.Tiers) tier.OwnerId = target.TosRateId;
+            newTiers.AddRange(valid.Tiers);
+        }
+
+        // Old tiers go first (soft delete), so a new tier with the same range never meets them.
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        db.RateTiers.AddRange(newTiers);
+        RateSetWriter.Add(db, inserts);
+        return null;
     }
 
     private static async Task<Results<Ok<ImportPreview>, NotFound, ProblemHttpResult>> CancelAsync(

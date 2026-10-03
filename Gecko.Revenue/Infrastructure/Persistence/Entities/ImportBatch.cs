@@ -9,7 +9,7 @@ public partial class ImportBatch
 
     public Guid TenantId { get; set; }
 
-    public Guid TemplateExportId { get; set; }
+    public Guid? TemplateExportId { get; set; }
 
     public Guid ScheduleId { get; set; }
 

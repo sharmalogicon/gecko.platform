@@ -3,9 +3,10 @@ namespace Gecko.Revenue.Domain;
 /// <summary>
 /// How a rate row is chosen inside one schedule (PLAN.md §5.2, decision D-2).
 /// The weights match the persisted `specificity` column in 05_tariff_tos_rate.sql.
-/// A NULL axis means "any"; the highest total among matching rows wins, and
-/// because equal totals mean an identical axis set, the unique axis signature
-/// makes a tie impossible.
+/// A NULL axis means "any"; the highest total among matching rows wins. Equal
+/// totals mean an identical axis set, which the unique signature allows only
+/// with a different billing unit (gecko_revenue 22); TariffPricer then prefers
+/// the charge code's own unit, then the lowest unit code.
 /// </summary>
 public static class RateSpecificity
 {

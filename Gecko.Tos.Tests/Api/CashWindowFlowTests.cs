@@ -176,6 +176,85 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
         }
     }
 
+    /// <summary>
+    /// Owner 2026-10-03: a cash charge no tariff prices is never a free pass. Before,
+    /// FULL_IN with an unpriced cash charge got an automatic coupon and went through at 0.
+    /// Now: no coupon, the barrier holds the box, the window lists the charge under noPrice
+    /// and refuses a receipt, and a supervisor's waiver releases the box.
+    /// </summary>
+    [Fact]
+    public async Task A_cash_charge_no_tariff_prices_holds_the_box_until_a_supervisor_waives_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = $"ZZC-{Guid.NewGuid():N}"[..16].ToUpperInvariant();
+        Guid? shiftId = null;
+
+        await TestDatabase.RequireCouponAtAsync(SctLcb01, true);
+        await TestDatabase.UnpricedChargeOnImpCyCyAsync("FULL_IN", add: true);
+        try
+        {
+            var created = await client.PostAsJsonAsync("/api/tos/bookings", new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+                requirements = new object[] { new { equipmentTypeCode = "40GP", qty = 1 } },
+                containers = new object[] { new { containerNo = Box } },
+            }, ct);
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            var booking = (await created.Content.ReadFromJsonAsync<BookingDetailResponse>(ct))!;
+            var orderNo = Uri.EscapeDataString(booking.Booking.OrderNo);
+
+            // The window sees the hole in the tariff.
+            var quote = (await EventuallyAsync(
+                async () =>
+                {
+                    var r = await client.GetAsync($"{Window}/bookings?orderNo={orderNo}", ct);   // 404 until Revenue hears of it
+                    return r.IsSuccessStatusCode ? await r.Content.ReadFromJsonAsync<WindowBookingResponse>(ct) : null;
+                },
+                q => q?.Boxes.Count == 1, "Revenue to learn the booking", ct))!;
+            var box = quote.Boxes.Single();
+            Assert.Equal("FULL_IN", box.NextMovementCode);
+            var hole = Assert.Single(box.NoPrice!);
+            Assert.Equal(("VASSEAL", "CUSTOMER", 0m), (hole.ChargeCode, hole.BillTo, hole.Amount));
+            Assert.Contains("VASSEAL", box.Note);
+
+            // No automatic coupon: the barrier holds the box.
+            await Task.Delay(1500, ct);
+            var held = await PreflightAsync(client, "IN", ct);
+            Assert.Equal("BLOCKED", held.Decision);
+            Assert.Contains(held.Findings, f => f.Code == "NO_COUPON");
+
+            // The window will not take money around the hole.
+            var opened = await client.PostAsJsonAsync($"{Window}/shifts", new { branchId = SctLcb01, openingFloat = 0m }, ct);
+            Assert.Equal(HttpStatusCode.Created, opened.StatusCode);
+            shiftId = (await opened.Content.ReadFromJsonAsync<ShiftResponse>(ct))!.ShiftId;
+            var refused = await client.PostAsJsonAsync($"{Window}/receipts", Pay(booking, quote, expected: 0m, cash: 1m), ct);
+            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+            Assert.Contains("No price", await refused.Content.ReadAsStringAsync(ct));
+
+            // A supervisor waives it, with a reason: nothing else is due, so the waiver is the coupon.
+            var waived = await client.PostAsJsonAsync($"{Window}/waive", new
+            {
+                bookingContainerId = box.BookingContainerId, chargeCode = "VASSEAL", billTo = "CUSTOMER",
+                reason = "Seal fee not in the contract; waived for this release",
+            }, ct);
+            Assert.True(waived.StatusCode == HttpStatusCode.OK, await waived.Content.ReadAsStringAsync(ct));
+            Assert.NotNull((await waived.Content.ReadFromJsonAsync<WaiveResponse>(ct))!.Coupon);
+
+            var cleared = await EventuallyAsync(() => PreflightAsync(client, "IN", ct), v => v.Decision == "ALLOWED", "the waiver coupon", ct);
+            Assert.DoesNotContain(cleared.Findings, f => f.Code == "NO_COUPON");
+        }
+        finally
+        {
+            await TestDatabase.UnpricedChargeOnImpCyCyAsync("FULL_IN", add: false);
+            await TestDatabase.RequireCouponAtAsync(SctLcb01, null);
+            await TestDatabase.RemoveCashWindowAsync(carrierRef, shiftId);
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
     private static object Pay(BookingDetailResponse booking, WindowBookingResponse quote, decimal expected, decimal cash, decimal? tendered = null) => new
     {
         bookingId = booking.Booking.BookingId,

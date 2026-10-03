@@ -308,6 +308,13 @@ internal sealed class GateEventHandler(
         if (step is null) return;
 
         steps[steps.IndexOf(step)] = step with { Status = status };
+        // The gate skips an optional step the truck did not do (TOS marks it SKIPPED, a
+        // required one would have blocked): mirror it, or the window keeps quoting it as
+        // "next" and its coupon is issued for a movement that will never happen.
+        if (status == "DONE")
+            for (var i = 0; i < steps.Count; i++)
+                if (steps[i].Status == "PENDING" && steps[i].SequenceNo < step.SequenceNo)
+                    steps[i] = steps[i] with { Status = "SKIPPED" };
         box.StepsJson = JsonSerializer.Serialize(steps);
         box.UpdatedAt = clock.GetUtcNow();
     }
@@ -503,6 +510,14 @@ internal sealed class AutomaticCoupons(
             var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);
             // Something is (or may become) payable in cash: that is the window's job.
             if (quote.Lines.Count > 0 || quote.StorageApplies || quote.ReeferApplies) continue;
+            // A cash charge with no rate anywhere is NOT "nothing to pay": no coupon, so
+            // the barrier holds the box until a rate is added or a supervisor waives it.
+            if (quote.NoPrice.Count > 0)
+            {
+                log.LogWarning("Booking {OrderNo} box {Box} {Movement}: no tariff prices {Charges}; no automatic coupon.",
+                    plan.OrderNo, box.ContainerNo, step.MovementCode, string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode)));
+                continue;
+            }
 
             await RevenueOutbox.EnqueueAsync(db, plan.TenantId, "BOOKING", plan.BookingId, RevenueOutbox.CouponIssued,
                 new CouponIssuedPayload(

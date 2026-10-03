@@ -443,4 +443,36 @@ internal static class TestDatabase
         command.Parameters.AddWithValue("@box", containerNo);
         return await command.ExecuteScalarAsync() is Guid id ? id : null;
     }
+
+    /// <summary>
+    /// Adds (add = true) or removes a CASH, customer-paid order-type charge on one step of
+    /// SCT's IMP CY/CY in gecko_master, for the length of one test. VASSEAL has a cash
+    /// variant and no rate in any SCT tariff: the "missing price" case. Test-only.
+    /// </summary>
+    public static async Task UnpricedChargeOnImpCyCyAsync(string movementCode, bool add)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DECLARE @ot UNIQUEIDENTIFIER = (SELECT order_type_id FROM gecko_master.commercial.order_type
+                                            WHERE tenant_id = @tenant AND order_type_code = 'IMP CY/CY' AND deleted_at IS NULL);
+            DECLARE @cc UNIQUEIDENTIFIER = (SELECT charge_code_id FROM gecko_master.commercial.charge_code
+                                            WHERE tenant_id = @tenant AND charge_code = 'VASSEAL' AND deleted_at IS NULL);
+            DECLARE @mv UNIQUEIDENTIFIER = (SELECT movement_id FROM gecko_master.commercial.movement
+                                            WHERE tenant_id = @tenant AND movement_code = @movement AND deleted_at IS NULL);
+            DELETE FROM gecko_master.commercial.order_type_charge
+             WHERE tenant_id = @tenant AND order_type_id = @ot AND charge_code_id = @cc AND movement_id = @mv;
+            IF @add = 1
+                INSERT INTO gecko_master.commercial.order_type_charge
+                    (tenant_id, order_type_id, charge_code_id, movement_id, payment_to, payment_term_code,
+                     is_default, is_optional, is_cargo_charge, is_value_added_service, raise_at_gate_in)
+                VALUES (@tenant, @ot, @cc, @mv, 'CUSTOMER', 'CASH', 1, 0, 0, 0, 0);
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@movement", movementCode);
+        command.Parameters.AddWithValue("@add", add);
+        await command.ExecuteNonQueryAsync();
+    }
 }

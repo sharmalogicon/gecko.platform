@@ -117,7 +117,8 @@ internal static class WindowEndpoints
                 t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" ? t.Trail.FirstOrDefault() : null)).ToList(),
             b.Quote?.Total ?? 0, b.Note,
             (b.Quote?.BilledLater ?? []).Select(ToResponse).ToList(),
-            b.Rules is { } r && CashQuoter.OffersVas(r))).ToList();
+            b.Rules is { } r && CashQuoter.OffersVas(r),
+            (b.Quote?.NoPrice ?? []).Select(ToResponse).ToList())).ToList();
 
         var lines = boxes.SelectMany(b => b.Quote?.Lines ?? []).ToList();
         var later = boxes.SelectMany(b => b.Quote?.BilledLater ?? []).ToList();
@@ -341,6 +342,11 @@ internal static class WindowEndpoints
         var missing = request.BookingContainerIds!.Where(id => boxes.All(b => b.Box.BookingContainerId != id)).ToList();
         if (missing.Count > 0) return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", missing)}.");
         if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
+        // Taking the priced lines and issuing the coupon would let the unpriced one through for free.
+        if (boxes.Where(b => b.Quote is { NoPrice.Count: > 0 }).ToList() is { Count: > 0 } unpriced)
+            return RevenueSupport.Conflict("No price for some charges of these boxes.",
+                string.Join(" ", unpriced.Select(b => $"{b.Box.ContainerNo ?? b.Box.BookingContainerId.ToString()}: {b.Note}"))
+                + " Add the rate to the customer's tariff or the standard tariff, or a supervisor waives the line.");
         var payable = boxes.Where(b => b.Quote is { Lines.Count: > 0 }).ToList();
         var idle = boxes.Except(payable).ToList();
         if (idle.Count > 0)
@@ -504,7 +510,7 @@ internal static class WindowEndpoints
         if (context is null) return NoBranch(plan);
 
         var quoted = (await window.QuoteBoxesAsync(context, new HashSet<Guid> { box.BookingContainerId }, request.PaidUntil, ct)).Single();
-        var line = quoted.Quote?.Lines.FirstOrDefault(l =>
+        var line = (quoted.Quote?.Lines ?? []).Concat(quoted.Quote?.NoPrice ?? []).FirstOrDefault(l =>
             string.Equals(l.ChargeCode, request.ChargeCode, StringComparison.OrdinalIgnoreCase)
             && string.Equals(l.BillTo, request.BillTo, StringComparison.OrdinalIgnoreCase));
         if (line is null)
@@ -686,7 +692,9 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
                 (terms ?? GateTerms.None) with { TripChargeCarriedBy = carrier });
             if (carrier is null && quote.CarriesTripCharge) carrier = box.ContainerNo ?? $"box {box.BookingContainerId}";
             result.Add(new QuotedBox(box, step, rules, quote,
-                quote.Lines.Count > 0 ? null
+                quote.NoPrice.Count > 0
+                    ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {step.MovementCode} (contract or standard tariff)."
+                : quote.Lines.Count > 0 ? null
                 : quote.Tried.Any(t => t.Outcome == "SETTLED") ? $"{step.MovementCode} is already paid."
                 : $"Nothing is charged in cash for {step.MovementCode}."));
         }
@@ -784,7 +792,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
 
         // Nothing left to pay on this move → the box goes on the waiver, no receipt.
         CouponResponse? coupon = null;
-        var remaining = box.Quote!.Lines.Where(l => l != line).ToList();
+        var remaining = box.Quote!.Lines.Concat(box.Quote.NoPrice).Where(l => l != line).ToList();
         if (remaining.Count == 0)
         {
             var payload = new CouponIssuedPayload(

@@ -31,14 +31,17 @@ public sealed record BilledLaterResponse(decimal Subtotal, decimal Tax, decimal 
 
 public sealed record VoidedReceiptResponse(Guid ReceiptId, string ReceiptNo, DateTimeOffset? VoidedAt, string? VoidReason, decimal Total);
 
-/// <param name="Note">Why nothing is due, when nothing is (not billable, nothing pending, already paid…).</param>
+/// <param name="Note">Why nothing is due, when nothing is (not billable, nothing pending, already paid…), or why it cannot be paid yet.</param>
+/// <param name="NoPrice">Cash charges of this movement that no tariff prices (contract or standard), at 0. While any is listed
+/// the box cannot be receipted and gets no coupon: add the rate, or a supervisor waives the line (POST /window/waive).</param>
 public sealed record WindowBoxResponse(
     Guid BookingContainerId, string? ContainerNo, string? EquipmentTypeCode,
     string? NextMovementCode, string? Direction, bool IsBillable,
     DateTimeOffset? InAt, int? StayDays,
     IReadOnlyList<QuoteLineResponse> Due, IReadOnlyList<SettledChargeResponse> Settled,
     IReadOnlyList<TriedVariantResponse> Tried, decimal Total, string? Note,
-    IReadOnlyList<QuoteLineResponse>? BilledLater = null, bool VasOffered = false);
+    IReadOnlyList<QuoteLineResponse>? BilledLater = null, bool VasOffered = false,
+    IReadOnlyList<QuoteLineResponse>? NoPrice = null);
 
 /// <param name="Kind">MOVEMENT, VAS, STORAGE or REEFER.</param>
 /// <param name="BillingUnitCode">PER_TRIP = the once-per-truck gate charge.</param>

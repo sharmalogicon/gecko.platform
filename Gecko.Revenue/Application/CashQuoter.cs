@@ -73,8 +73,16 @@ internal sealed record MovementQuote(
     DateOnly? PaidUntil, ContainerStay? Stay, int? StayDays, bool StorageApplies,
     IReadOnlyList<QuoteLine> Lines, IReadOnlyList<TriedVariant> Tried,
     bool ReeferApplies = false, ReeferPowerQuote? Reefer = null,
-    IReadOnlyList<QuoteLine>? Later = null, GateTerms? Terms = null)
+    IReadOnlyList<QuoteLine>? Later = null, GateTerms? Terms = null, IReadOnlyList<QuoteLine>? Unpriced = null)
 {
+    /// <summary>
+    /// Cash charges the order type raises on this movement that NO tariff prices (not a
+    /// contract, not the public / standard tariff), as lines at 0. While any is here the
+    /// box gets no automatic coupon and no receipt: a supervisor adds the rate or waives
+    /// the line (owner 2026-10-03: missing price = warn, then block — never a free pass).
+    /// </summary>
+    public IReadOnlyList<QuoteLine> NoPrice => Unpriced ?? [];
+
     /// <summary>Credit lines, priced for display: nothing to pay at the window (§2 step 2).</summary>
     public IReadOnlyList<QuoteLine> BilledLater => Later ?? [];
     /// <summary>The box carries a PER_TRIP gate charge, cash or credit — the next box on the truck does not.</summary>
@@ -155,6 +163,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     {
         var lines = new List<QuoteLine>();
         var later = new List<QuoteLine>();
+        var unpriced = new List<QuoteLine>();
         var tried = new List<TriedVariant>();
         var terms = await ResolveAsync(gate, plan, ct);
 
@@ -260,8 +269,12 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             var amount = result.Outcome == PriceOutcomes.Priced ? result.Amount ?? 0 : (decimal?)null;
             if (amount is not > 0)
             {
+                // A rate of 0 is "free under this tariff" (owner 2026-10-03). No rate at all, on a
+                // cash line, is a hole in the tariff: kept as a NoPrice line so it cannot be skipped.
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, term,
                     amount is null ? PriceOutcomes.Unpriced : "PRICED_ZERO", amount, result.PrecedenceTrail));
+                if (amount is null && term == Cash)
+                    unpriced.Add(Line(kind, variant, PayerFor(plan, item.BillTo), result.Quantity, null, 0m, result, null, null));
                 return;
             }
 
@@ -350,7 +363,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         }
 
         return new MovementQuote(box.BookingContainerId, box.ContainerNo, step.MovementCode, step.Direction,
-            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms);
+            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms, unpriced);
     }
 
     /// <summary>gate.gate_charge_only_order_types — a JSON array of order type codes; anything unreadable is "none".</summary>

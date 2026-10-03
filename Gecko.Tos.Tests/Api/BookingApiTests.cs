@@ -572,4 +572,121 @@ public sealed class BookingApiTests(TosApiFactory api)
             foreach (var carrierRef in refs) await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    // ── header first, then 100 rows that survive a dropped line (BOOKING_ENTRY_GAP_ANALYSIS P1/P2/P4) ──
+
+    private static Task<HttpResponseMessage> BatchAsync(HttpClient client, Guid bookingId, CancellationToken ct, params object[] containers) =>
+        client.PostAsJsonAsync($"{Bookings}/{bookingId}/containers/batch", new { containers }, ct);
+
+    [Fact]
+    public async Task A_header_is_saved_alone_and_rows_are_saved_one_by_one_and_a_retry_never_doubles_a_row()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            // The header alone: the order number comes back at once.
+            var booking = await CreateAsync(client, ImportDo(carrierRef, requirements: []), ct);
+            var id = booking.Booking.BookingId;
+            Assert.StartsWith("BK-SCT-LCB01-", booking.Booking.OrderNo);
+            Assert.Empty(booking.Requirements);
+
+            // No box goes on a booking without a line.
+            Assert.Contains("no requirement lines", await ExpectAsync(
+                await BatchAsync(client, id, ct, new { clientLineId = Guid.NewGuid(), containerNo = Gp20A }), HttpStatusCode.Conflict, ct));
+            await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{id}/requirements", new
+            {
+                rowVersion = booking.Booking.RowVersion, requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 2 } },
+            }, ct), HttpStatusCode.OK, ct);
+
+            // Every row needs its id.
+            Assert.Contains("clientLineId", await ExpectAsync(await BatchAsync(client, id, ct, new { containerNo = Gp20A }), HttpStatusCode.BadRequest, ct));
+
+            // Three rows: the misread one is rejected, the other two are saved.
+            var (a, bad, b) = (Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+            var misread = Gp20A[..10] + ((Gp20A[10] - '0' + 1) % 10);
+            object[] rows =
+            [
+                new { clientLineId = a, containerNo = Gp20A, declaredSealNo = "LS-1", customerSealNo = "CS-1", declaredVgmKg = 21500m,
+                      declaredVolumeCbm = 33.2m, requiredDate = "2031-02-01", cargoCategoryCode = "CONSOL", stowageCode = "DECK", stowageNo = "12",
+                      isPreCool = false, remarks = "Handle with care" },
+                new { clientLineId = bad, containerNo = misread },
+                new { clientLineId = b, containerNo = Gp20B, cargoCategoryCode = "NOT-A-CARGO" },
+            ];
+            var first = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, id, ct, rows), HttpStatusCode.OK, ct));
+            Assert.Equal(["CREATED", "REJECTED", "REJECTED"], first.Items.Select(i => i.Outcome));
+            Assert.Contains("check digit", first.Items[1].Errors!["containerNo"].Single());
+            Assert.Contains("CARGO_CATEGORY", first.Items[2].Errors!["cargoCategoryCode"].Single());
+            var saved = first.Items[0].Line!;
+            Assert.Equal((a, "CS-1", 33.2m, new DateOnly(2031, 2, 1), "CONSOL", "DECK", "12", "Handle with care"),
+                (saved.ClientLineId!.Value, saved.CustomerSealNo, saved.DeclaredVolumeCbm!.Value, saved.RequiredDate!.Value, saved.CargoCategoryCode,
+                 saved.StowageCode, saved.StowageNo, saved.Remarks));
+            Assert.NotEmpty(saved.Steps);
+            Assert.Equal(1, Assert.Single(first.Lines).Assigned);
+
+            // The connection dropped: the UI sends the same rows again (the bad one fixed). Nothing doubles.
+            object[] retry =
+            [
+                new { clientLineId = a, containerNo = Gp20A },
+                new { clientLineId = b, containerNo = Gp20B },
+            ];
+            var second = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, id, ct, retry), HttpStatusCode.OK, ct));
+            Assert.Equal(["REPLAYED", "CREATED"], second.Items.Select(i => i.Outcome));
+            Assert.Equal(saved.BookingContainerId, second.Items[0].Line!.BookingContainerId);
+            var third = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, id, ct, retry), HttpStatusCode.OK, ct));
+            Assert.Equal(["REPLAYED", "REPLAYED"], third.Items.Select(i => i.Outcome));
+            Assert.Equal(2, Assert.Single(third.Lines).Assigned);
+
+            // An id already used for one box is not a new row for another.
+            var reused = Read<ContainerBatchResponse>(await ExpectAsync(
+                await BatchAsync(client, id, ct, new { clientLineId = a, containerNo = Hc40 }), HttpStatusCode.OK, ct));
+            Assert.Contains("clientLineId", reused.Items.Single().Errors!.Keys);
+
+            var detail = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{id}", ct))!;
+            Assert.Equal(2, detail.Containers.Count(c => c.EndedAt is null));
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    [Fact]
+    public async Task A_line_is_edited_with_its_own_row_version_and_keeps_what_the_gate_checked()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            var booking = await CreateAsync(client, ImportDo(carrierRef, containers: [new { containerNo = Gp20A, declaredSealNo = "LS-1" }]), ct);
+            var line = booking.Containers.Single();
+            Assert.NotNull(line.RowVersion);
+            var url = $"{Bookings}/{booking.Booking.BookingId}/containers/{line.BookingContainerId}";
+
+            var edited = Read<BookingContainerResponse>(await ExpectAsync(await client.PutAsJsonAsync(url, new
+            {
+                rowVersion = line.RowVersion, declaredSealNo = "LS-2", customerSealNo = "CS-9", declaredVgmKg = 20100m, remarks = "Seal replaced",
+            }, ct), HttpStatusCode.OK, ct));
+            Assert.Equal(("LS-2", "CS-9", 20100m, "Seal replaced"), (edited.DeclaredSealNo, edited.CustomerSealNo, edited.DeclaredVgmKg!.Value, edited.Remarks));
+            Assert.NotEqual(line.RowVersion, edited.RowVersion);
+
+            // A second clerk working from the old copy is told, not allowed to overwrite.
+            Assert.Contains("changed since you loaded it", await ExpectAsync(await client.PutAsJsonAsync(url, new
+            {
+                rowVersion = line.RowVersion, declaredSealNo = "LS-OLD",
+            }, ct), HttpStatusCode.Conflict, ct));
+
+            // After the gate: the seal it checked can no longer change; a remark still can.
+            await TestDatabase.MarkFirstStepDoneAsync(line.BookingContainerId);
+            Assert.Contains("already passed the gate", await ExpectAsync(await client.PutAsJsonAsync(url, new
+            {
+                rowVersion = edited.RowVersion, declaredSealNo = "LS-3", customerSealNo = "CS-9", declaredVgmKg = 20100m,
+            }, ct), HttpStatusCode.BadRequest, ct));
+            var later = Read<BookingContainerResponse>(await ExpectAsync(await client.PutAsJsonAsync(url, new
+            {
+                rowVersion = edited.RowVersion, declaredSealNo = "LS-2", customerSealNo = "CS-9", declaredVgmKg = 20100m, remarks = "Gate noted a dent",
+            }, ct), HttpStatusCode.OK, ct));
+            Assert.Equal("Gate noted a dent", later.Remarks);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
 }

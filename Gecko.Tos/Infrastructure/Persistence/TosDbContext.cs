@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Gecko.Tos.Infrastructure.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -342,6 +342,23 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("handover_mode_code");
+            entity.HasIndex(e => new { e.TenantId, e.BookingId, e.ClientLineId }, "uq_booking_container__client_line")
+                .IsUnique()
+                .HasFilter("([client_line_id] IS NOT NULL AND [deleted_at] IS NULL)");
+            entity.Property(e => e.ClientLineId).HasColumnName("client_line_id");
+            entity.Property(e => e.CustomerSealNo).HasMaxLength(20).IsUnicode(false).HasColumnName("customer_seal_no");
+            entity.Property(e => e.DeclaredVolumeCbm).HasColumnType("decimal(10, 3)").HasColumnName("declared_volume_cbm");
+            entity.Property(e => e.RequiredDate).HasColumnName("required_date");
+            entity.Property(e => e.CargoCategoryCode).HasMaxLength(40).IsUnicode(false).HasColumnName("cargo_category_code");
+            entity.Property(e => e.ImdgClass).HasMaxLength(10).IsUnicode(false).HasColumnName("imdg_class");
+            entity.Property(e => e.UnNumber).HasMaxLength(4).IsUnicode(false).IsFixedLength().HasColumnName("un_number");
+            entity.Property(e => e.ReeferSetTempC).HasColumnType("decimal(5, 2)").HasColumnName("reefer_set_temp_c");
+            entity.Property(e => e.ReeferVentPct).HasColumnType("decimal(5, 2)").HasColumnName("reefer_vent_pct");
+            entity.Property(e => e.ReeferHumidityPct).HasColumnType("decimal(5, 2)").HasColumnName("reefer_humidity_pct");
+            entity.Property(e => e.StowageCode).HasMaxLength(20).IsUnicode(false).HasColumnName("stowage_code");
+            entity.Property(e => e.StowageNo).HasMaxLength(20).IsUnicode(false).HasColumnName("stowage_no");
+            entity.Property(e => e.IsPreCool).HasColumnName("is_pre_cool");
+            entity.Property(e => e.Remarks).HasMaxLength(500).HasColumnName("remarks");
             entity.Property(e => e.DeletedAt).HasColumnName("deleted_at");
             entity.Property(e => e.DeletedBy).HasColumnName("deleted_by");
             entity.Property(e => e.EndReason)

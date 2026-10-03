@@ -42,7 +42,14 @@ public sealed record BookingContainerResponse(
     string Source, string? DeclaredSealNo, decimal? DeclaredVgmKg, DateTimeOffset AssignedAt,
     DateTimeOffset? EndedAt, string? EndReason, IReadOnlyList<StepResponse> Steps,
     // Vector's P/U Mode / D/O Mode / repo mode: who collects or delivers this box. Null = not said.
-    string? HandoverMode = null);
+    string? HandoverMode = null,
+    // gecko_tos 20: the UI's id for the row (retry = same line) and the per-box details Vector keeps.
+    Guid? ClientLineId = null, string? CustomerSealNo = null, decimal? DeclaredVolumeCbm = null, DateOnly? RequiredDate = null,
+    string? CargoCategoryCode = null, string? ImdgClass = null, string? UnNumber = null,
+    decimal? ReeferSetTempC = null, decimal? ReeferVentPct = null, decimal? ReeferHumidityPct = null,
+    string? StowageCode = null, string? StowageNo = null, bool? IsPreCool = null, string? Remarks = null,
+    // The line's own row version: send it back to edit the line.
+    string? RowVersion = null);
 
 public sealed record BookingDetailResponse(
     BookingResponse Booking,
@@ -103,7 +110,12 @@ public sealed record ReplaceRequirementsRequest(
     [property: Required, MinLength(1)] IReadOnlyList<RequirementItem> Requirements,
     [property: Required] string RowVersion);
 
-/// <summary><see cref="LineNo"/> may be left out when the box's registry type, or a single line, makes it obvious.</summary>
+/// <summary>
+/// One container line. <see cref="LineNo"/> may be left out when the box's registry type, or a single line, makes it
+/// obvious. <see cref="ClientLineId"/>: the UI's own id for the row, made when the row is keyed — a retry with it answers
+/// with the line already made (required on …/containers/batch). Reefer and DG details left out are taken from the
+/// requirement line. <see cref="DeclaredSealNo"/> is the line's / agent's seal, <see cref="DeclaredVgmKg"/> the weight.
+/// </summary>
 public sealed record AssignContainerItem(
     string ContainerNo,
     short? LineNo = null,
@@ -111,11 +123,73 @@ public sealed record AssignContainerItem(
     decimal? DeclaredVgmKg = null,
     // IMPORT: DO_OWN | DO_OTHER | DO_ONLY | DO_CUS · EXPORT: PU_OWN | PU_OTHER | PU_ONLY | PU_PORT · other: REPO_OWN | REPO_OTHER.
     // Optional. When sent, Vector's booking checks apply (BookingRules.HandoverRefusal).
-    [property: MaxLength(20)] string? HandoverMode = null);
+    [property: MaxLength(20)] string? HandoverMode = null,
+    Guid? ClientLineId = null,
+    [property: MaxLength(20)] string? CustomerSealNo = null,
+    decimal? DeclaredVolumeCbm = null,
+    DateOnly? RequiredDate = null,
+    [property: MaxLength(40)] string? CargoCategoryCode = null,
+    [property: MaxLength(10)] string? ImdgClass = null,
+    [property: MaxLength(4)] string? UnNumber = null,
+    decimal? ReeferSetTempC = null,
+    decimal? ReeferVentPct = null,
+    decimal? ReeferHumidityPct = null,
+    [property: MaxLength(20)] string? StowageCode = null,
+    [property: MaxLength(20)] string? StowageNo = null,
+    bool? IsPreCool = null,
+    [property: MaxLength(500)] string? Remarks = null);
 
 public sealed record AssignContainersRequest(
     [property: Required, MinLength(1)] IReadOnlyList<AssignContainerItem> Containers,
     [property: AllowedValues("PRE_ADVISED", "PORTAL", "EDI")] string Source = "PRE_ADVISED");
+
+/// <summary>
+/// Container entry that survives a dropped connection: every row carries its <see cref="AssignContainerItem.ClientLineId"/>,
+/// each row stands alone (the good ones are saved, the bad ones come back with their errors), and a retry is answered
+/// with the lines already made. At most 200 rows per call.
+/// </summary>
+public sealed record AssignContainersBatchRequest(
+    [property: Required, MinLength(1), MaxLength(200)] IReadOnlyList<AssignContainerItem> Containers,
+    [property: AllowedValues("PRE_ADVISED", "PORTAL", "EDI")] string Source = "PRE_ADVISED");
+
+/// <summary>How full each requirement line is after the call: <see cref="Assigned"/> boxes active on it of <see cref="Qty"/>.</summary>
+public sealed record LineFillResponse(short LineNo, string EquipmentTypeCode, short Qty, int Assigned);
+
+/// <param name="Outcome">CREATED (saved now), REPLAYED (saved by an earlier try of the same clientLineId), REJECTED (see <see cref="Errors"/>).</param>
+/// <param name="Errors">Field (containerNo, lineNo, clientLineId, reeferSetTempC…; "" = the row) → messages. Null unless REJECTED.</param>
+public sealed record ContainerBatchItemResponse(
+    int Index, Guid? ClientLineId, string? ContainerNo, string Outcome,
+    BookingContainerResponse? Line, IReadOnlyDictionary<string, string[]>? Errors);
+
+public sealed record ContainerBatchResponse(
+    Guid BookingId, string OrderNo, int Created, int Replayed, int Rejected,
+    IReadOnlyList<LineFillResponse> Lines, IReadOnlyList<ContainerBatchItemResponse> Items);
+
+/// <summary>
+/// The details of one container line, REPLACED AS A WHOLE (a field left out is cleared — send back what you read and
+/// change what the user changed), guarded by the line's own <see cref="RowVersion"/>: two people editing the same line
+/// cannot overwrite each other (stale = 409). The container number and the requirement line do not change here
+/// (unassign and assign). Once the box has passed the gate, its seals, cargo, IMO/UN, required date and handover mode
+/// are frozen.
+/// </summary>
+public sealed record UpdateContainerLineRequest(
+    [property: Required] string RowVersion,
+    [property: MaxLength(20)] string? DeclaredSealNo = null,
+    [property: MaxLength(20)] string? CustomerSealNo = null,
+    decimal? DeclaredVgmKg = null,
+    decimal? DeclaredVolumeCbm = null,
+    DateOnly? RequiredDate = null,
+    [property: MaxLength(40)] string? CargoCategoryCode = null,
+    [property: MaxLength(10)] string? ImdgClass = null,
+    [property: MaxLength(4)] string? UnNumber = null,
+    decimal? ReeferSetTempC = null,
+    decimal? ReeferVentPct = null,
+    decimal? ReeferHumidityPct = null,
+    [property: MaxLength(20)] string? StowageCode = null,
+    [property: MaxLength(20)] string? StowageNo = null,
+    bool? IsPreCool = null,
+    [property: MaxLength(500)] string? Remarks = null,
+    [property: MaxLength(20)] string? HandoverMode = null);
 
 public sealed record EndBookingRequest(
     [property: Required, MinLength(5), MaxLength(500)] string Reason,

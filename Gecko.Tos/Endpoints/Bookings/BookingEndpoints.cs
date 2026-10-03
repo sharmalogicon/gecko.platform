@@ -42,6 +42,8 @@ internal static class BookingEndpoints
         bookings.MapPut("/{id:guid}", UpdateAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<SaveBookingRequest>().WithSummary("Update the header of an OPEN booking");
         bookings.MapPut("/{id:guid}/requirements", ReplaceRequirementsAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<ReplaceRequirementsRequest>().WithSummary("Replace the requirement lines (by line number)");
         bookings.MapPost("/{id:guid}/containers", AssignAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<AssignContainersRequest>().WithSummary("Assign boxes — each gets the order type's steps as PENDING");
+        bookings.MapPost("/{id:guid}/containers/batch", AssignBatchAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<AssignContainersBatchRequest>().WithSummary("Save container rows one by one: each row stands alone, a retry with the same clientLineId gets the same line");
+        bookings.MapPut("/{id:guid}/containers/{bookingContainerId:guid}", UpdateLineAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<UpdateContainerLineRequest>().WithSummary("Edit one container line's details (seals, weight, reefer, DG, stowage, remarks…) with its rowVersion");
         bookings.MapDelete("/{id:guid}/containers/{bookingContainerId:guid}", UnassignAsync).RequireBranchPermission(TosPermissions.BookingManage).WithSummary("Take a box off the booking (refused once it has done a step)");
         bookings.MapPost("/{id:guid}/cancel", CancelAsync).RequireBranchPermission(TosPermissions.BookingCancel).Validate<EndBookingRequest>().WithSummary("Cancel a booking no box has worked on");
         bookings.MapPost("/{id:guid}/close", CloseAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<EndBookingRequest>().WithSummary("Close a part-used booking; open boxes are released");
@@ -161,8 +163,9 @@ internal static class BookingEndpoints
         if (header is not null && !scope.HasAt(TosPermissions.BookingManage, header.Branch.BranchId))
             return TosScope.OutsideYourBranches($"You cannot raise a booking at {header.Branch.BranchCode}.");
 
+        // Header first (owner 2026-10-03): the clerk saves the header, gets the order number,
+        // and adds requirement lines and boxes afterwards. No box goes on a booking without a line.
         var items = request.Requirements ?? [];
-        if (items.Count == 0) errors.Add("requirements", "A booking needs at least one requirement line — what equipment, how many.");
         var requirements = await ResolveRequirementsAsync(master, items, errors, ct);
         if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
         if (await CarrierRefTakenAsync(db, header.Branch.BranchId, request.CarrierRef, null, ct) is { } taken) return taken;
@@ -208,9 +211,9 @@ internal static class BookingEndpoints
 
         if (request.Containers is { Count: > 0 } boxes)
         {
-            var problem = await AssignBoxesAsync(db, master, caller, booking, header.Plan, created, boxes, "PRE_ADVISED", ct);
-            if (problem?.Invalid is { } invalid) return invalid;
-            if (problem?.Refused is { } refused) return refused;
+            var assigned = await AssignBoxesAsync(db, master, caller, booking, header.Plan, created, boxes, "PRE_ADVISED", partial: false, ct);
+            if (assigned.Problem?.Invalid is { } invalid) return invalid;
+            if (assigned.Problem?.Refused is { } refused) return refused;
         }
 
         await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
@@ -372,13 +375,147 @@ internal static class BookingEndpoints
         if (plan is null) return TosSupport.Conflict($"Order type {booking.OrderTypeCode} no longer exists in master data.");
         var requirements = await db.EquipmentRequirements.Where(r => r.BookingId == id).ToListAsync(ct);
 
-        var problem = await AssignBoxesAsync(db, master, caller, booking, plan, requirements, request.Containers, request.Source, ct);
-        if (problem?.Invalid is { } invalid) return invalid;
-        if (problem?.Refused is { } refused) return refused;
-        await BookingEvents.QueueChangedAsync(db, id, "CONTAINERS_ASSIGNED", DateTimeOffset.UtcNow, ct);
+        var assigned = await AssignBoxesAsync(db, master, caller, booking, plan, requirements, request.Containers, request.Source, partial: false, ct);
+        if (assigned.Problem?.Invalid is { } invalid) return invalid;
+        if (assigned.Problem?.Refused is { } refused) return refused;
+        if (assigned.Created.Count > 0) await BookingEvents.QueueChangedAsync(db, id, "CONTAINERS_ASSIGNED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
 
         return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+    }
+
+    /// <summary>
+    /// The 100-box entry (BOOKING_ENTRY_GAP_ANALYSIS P2): the UI sends rows as they are keyed,
+    /// each with its clientLineId. Every row stands alone — a typo rejects that row, not the
+    /// other 99 — and a row resent after a dropped answer comes back REPLAYED, never twice.
+    /// The answer is lean: what happened to each row and how full each line is.
+    /// </summary>
+    private static async Task<Results<Ok<ContainerBatchResponse>, NotFound, ValidationProblem, ProblemHttpResult>> AssignBatchAsync(
+        Guid id, AssignContainersBatchRequest request, TosDbContext db, IMasterDataReferences master,
+        ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
+    {
+        var noId = request.Containers.Select((c, i) => (c, i)).Where(x => x.c.ClientLineId is null).Select(x => x.i).ToList();
+        if (noId.Count > 0)
+            return TosSupport.Invalid(noId.ToDictionary(i => $"containers[{i}].clientLineId",
+                _ => new List<string> { "Every row needs its clientLineId (a UUID the UI makes when the row is keyed)." }));
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
+        var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
+        if (booking is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
+        if (booking.Status != BookingRules.Open) return NotOpen(booking);
+
+        var plan = (await master.OrderTypePlansAsync([booking.OrderTypeCode], ct)).GetValueOrDefault(booking.OrderTypeCode);
+        if (plan is null) return TosSupport.Conflict($"Order type {booking.OrderTypeCode} no longer exists in master data.");
+        var requirements = await db.EquipmentRequirements.Where(r => r.BookingId == id).OrderBy(r => r.LineNo).ToListAsync(ct);
+
+        var assigned = await AssignBoxesAsync(db, master, caller, booking, plan, requirements, request.Containers, request.Source, partial: true, ct);
+        if (assigned.Problem?.Invalid is { } invalid) return invalid;
+        if (assigned.Problem?.Refused is { } refused) return refused;
+        if (assigned.Created.Count > 0) await BookingEvents.QueueChangedAsync(db, id, "CONTAINERS_ASSIGNED", DateTimeOffset.UtcNow, ct);
+        await tx.CommitAsync(ct);
+
+        var lineNoOf = requirements.ToDictionary(r => r.EquipmentRequirementId, r => r.LineNo);
+        var touched = assigned.Created.Concat(assigned.Replayed).Select(x => x.Box.BookingContainerId).ToList();
+        var steps = (await db.MovementPlans.AsNoTracking().Where(m => touched.Contains(m.BookingContainerId)).OrderBy(m => m.SequenceNo).ToListAsync(ct))
+            .ToLookup(m => m.BookingContainerId);
+        var active = await db.BookingContainers.AsNoTracking().Where(x => x.BookingId == id && x.EndedAt == null)
+            .GroupBy(x => x.EquipmentRequirementId).Select(g => new { g.Key, Count = g.Count() }).ToDictionaryAsync(g => g.Key, g => g.Count, ct);
+
+        var created = assigned.Created.ToDictionary(x => x.Index, x => x.Box);
+        var replayed = assigned.Replayed.ToDictionary(x => x.Index, x => x.Box);
+        var items = request.Containers.Select((c, i) =>
+        {
+            var box = created.GetValueOrDefault(i) ?? replayed.GetValueOrDefault(i);
+            return box is not null
+                ? new ContainerBatchItemResponse(i, c.ClientLineId, box.ContainerNo, created.ContainsKey(i) ? "CREATED" : "REPLAYED",
+                    ToResponse(box, lineNoOf.GetValueOrDefault(box.EquipmentRequirementId), steps[box.BookingContainerId]), null)
+                : new ContainerBatchItemResponse(i, c.ClientLineId, c.ContainerNo, "REJECTED", null, assigned.ErrorsOf(i));
+        }).ToList();
+
+        return TypedResults.Ok(new ContainerBatchResponse(
+            booking.BookingId, booking.OrderNo, created.Count, replayed.Count, items.Count(x => x.Outcome == "REJECTED"),
+            requirements.Select(r => new LineFillResponse(r.LineNo, r.EquipmentTypeCode, r.Qty, active.GetValueOrDefault(r.EquipmentRequirementId))).ToList(),
+            items));
+    }
+
+    /// <summary>
+    /// Edit one line (G5/G6): its own row version, so a second clerk editing the same line gets
+    /// a 409 instead of overwriting the first. A box that passed the gate keeps what the gate
+    /// checked (Vector BookingEntry.cs:1272-1285 froze the same fields).
+    /// </summary>
+    private static async Task<Results<Ok<BookingContainerResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateLineAsync(
+        Guid id, Guid bookingContainerId, UpdateContainerLineRequest request, TosDbContext db, IMasterDataReferences master,
+        ICallerPermissions scope, CancellationToken ct)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
+        var booking = await db.Bookings.AsNoTracking().SingleOrDefaultAsync(b => b.BookingId == id, ct);
+        var box = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == bookingContainerId && x.BookingId == id, ct);
+        if (booking is null || box is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
+        if (booking.Status != BookingRules.Open) return NotOpen(booking);
+        if (box.EndedAt is not null) return TosSupport.Conflict($"{box.ContainerNo} has left this booking ({box.EndReason}); its line can no longer be edited.");
+        if (!db.TrySetExpectedVersion(box, request.RowVersion))
+            return TosSupport.Invalid("rowVersion", "Send the line's rowVersion you received when reading the booking.");
+
+        var line = await db.EquipmentRequirements.AsNoTracking().SingleAsync(r => r.EquipmentRequirementId == box.EquipmentRequirementId, ct);
+        var steps = await db.MovementPlans.AsNoTracking().Where(m => m.BookingContainerId == bookingContainerId).OrderBy(m => m.SequenceNo).ToListAsync(ct);
+        var started = steps.Any(s => s.Status == "DONE");
+
+        var errors = new Dictionary<string, List<string>>();
+        if (request.DeclaredVgmKg is <= 0) errors.Add("declaredVgmKg", "A weight is positive; leave it out if unknown.");
+        if (request.DeclaredVolumeCbm is <= 0) errors.Add("declaredVolumeCbm", "A volume is positive; leave it out if unknown.");
+        var cargoCode = request.CargoCategoryCode.Clean();
+        if (cargoCode is not null && !(await master.CodeListValuesAsync("CARGO_CATEGORY", [cargoCode], ct)).Contains(cargoCode))
+            errors.Add("cargoCategoryCode", $"'{cargoCode}' is not a CARGO_CATEGORY of this depot.");
+        if (request.ReeferSetTempC is not null && line.ReeferSetTempC is null)
+            errors.Add("reeferSetTempC", $"Line {line.LineNo} ({line.EquipmentTypeCode}) is not a reefer line; a set temperature makes no sense on it.");
+        if (request.ReeferSetTempC is < -70 or > 40) errors.Add("reeferSetTempC", "Between −70 °C and +40 °C.");
+        if (request.ReeferVentPct is < 0 or > 100) errors.Add("reeferVentPct", "Between 0 and 100 %.");
+        if (request.ReeferHumidityPct is < 0 or > 100) errors.Add("reeferHumidityPct", "Between 0 and 100 %.");
+        var imdg = request.ImdgClass.Clean();
+        var un = request.UnNumber?.Trim() is { Length: > 0 } u ? u : null;
+        if (un is not null && (un.Length != 4 || !un.All(char.IsAsciiDigit))) errors.Add("unNumber", "A UN number is four digits, e.g. 1203.");
+        else if (un is not null && imdg is null) errors.Add("imdgClass", "A UN number needs its IMDG class.");
+        var mode = request.HandoverMode.Clean();
+        if (mode is not null && mode != box.HandoverModeCode && BookingRules.HandoverModeProblem(booking.DirectionCode, mode) is { } wrongList)
+            errors.Add("handoverMode", wrongList);
+
+        var seal = request.DeclaredSealNo.Clean();
+        var customerSeal = request.CustomerSealNo.Clean();
+        if (started)
+            foreach (var (field, before, after) in new (string, object?, object?)[]
+                     {
+                         ("declaredSealNo", box.DeclaredSealNo, seal), ("customerSealNo", box.CustomerSealNo, customerSeal),
+                         ("cargoCategoryCode", box.CargoCategoryCode, cargoCode), ("imdgClass", box.ImdgClass, imdg),
+                         ("unNumber", box.UnNumber, un), ("requiredDate", box.RequiredDate, request.RequiredDate),
+                         ("handoverMode", box.HandoverModeCode, mode),
+                     })
+                if (!Equals(before, after))
+                    errors.Add(field, $"{box.ContainerNo} has already passed the gate on this booking; this can no longer change.");
+        if (errors.Count > 0) return TosSupport.Invalid(errors);
+
+        box.DeclaredSealNo = seal;
+        box.CustomerSealNo = customerSeal;
+        box.DeclaredVgmKg = request.DeclaredVgmKg;
+        box.DeclaredVolumeCbm = request.DeclaredVolumeCbm;
+        box.RequiredDate = request.RequiredDate;
+        box.CargoCategoryCode = cargoCode;
+        box.ImdgClass = imdg;
+        box.UnNumber = un;
+        box.ReeferSetTempC = request.ReeferSetTempC;
+        box.ReeferVentPct = request.ReeferVentPct;
+        box.ReeferHumidityPct = request.ReeferHumidityPct;
+        box.StowageCode = request.StowageCode.Clean();
+        box.StowageNo = string.IsNullOrWhiteSpace(request.StowageNo) ? null : request.StowageNo.Trim();
+        box.IsPreCool = request.IsPreCool;
+        box.Remarks = string.IsNullOrWhiteSpace(request.Remarks) ? null : request.Remarks.Trim();
+        box.HandoverModeCode = mode;
+
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_CHANGED", DateTimeOffset.UtcNow, ct);
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok(ToResponse(box, line.LineNo, steps));
     }
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ProblemHttpResult>> UnassignAsync(
@@ -489,30 +626,59 @@ internal static class BookingEndpoints
 
     // ── assignment (§5.1) ───────────────────────────────────────────────────
 
+    /// <summary>What an assignment did: the problem to send back (all-or-nothing), or per item what happened.</summary>
+    private sealed record AssignResult(
+        Problem? Problem,
+        List<(int Index, BookingContainer Box)> Created,
+        List<(int Index, BookingContainer Box)> Replayed,
+        Dictionary<string, List<string>> Errors)
+    {
+        public static AssignResult Failed(Problem problem) => new(problem, [], [], []);
+
+        /// <summary>The errors of item <paramref name="index"/>, keyed by its field ("containerNo", "lineNo"...).</summary>
+        public Dictionary<string, string[]> ErrorsOf(int index)
+        {
+            var prefix = $"containers[{index}]";
+            return Errors.Where(e => e.Key == prefix || e.Key.StartsWith(prefix + ".", StringComparison.Ordinal))
+                .ToDictionary(e => e.Key == prefix ? "" : e.Key[(prefix.Length + 1)..], e => e.Value.ToArray());
+        }
+    }
+
     /// <summary>
-    /// Assigns every box or none. Returns a problem to send back, or null. Runs
-    /// inside the caller's transaction; the filtered unique index on active
-    /// container numbers is the backstop against a concurrent double assignment.
+    /// Assigns boxes. <paramref name="partial"/> false: every box or none (a problem comes
+    /// back). True: each box stands alone — the good ones are added, the bad ones are
+    /// reported per item. A box whose <see cref="AssignContainerItem.ClientLineId"/> this
+    /// booking already has is REPLAYED (a retry after a lost answer), never added twice.
+    /// Runs inside the caller's transaction, under the booking lock; the filtered unique
+    /// index on active container numbers is the backstop against another booking.
     /// </summary>
-    private static async Task<Problem?> AssignBoxesAsync(
+    private static async Task<AssignResult> AssignBoxesAsync(
         TosDbContext db, IMasterDataReferences master, ITenantContext caller, Booking booking, OrderTypePlanRef plan,
-        IReadOnlyList<EquipmentRequirement> requirements, IReadOnlyList<AssignContainerItem> items, string source, CancellationToken ct)
+        IReadOnlyList<EquipmentRequirement> requirements, IReadOnlyList<AssignContainerItem> items, string source, bool partial, CancellationToken ct)
     {
         var errors = new Dictionary<string, List<string>>();
         var steps = BookingRules.PlanFor(plan);
         if (steps.Count == 0)
-            return Problem.Of(TosSupport.Conflict($"Order type {plan.OrderTypeCode} has no steps in master data — the gate would not know what to do with a box."));
+            return AssignResult.Failed(Problem.Of(TosSupport.Conflict($"Order type {plan.OrderTypeCode} has no steps in master data — the gate would not know what to do with a box.")));
+        if (requirements.Count == 0)
+            return AssignResult.Failed(Problem.Of(TosSupport.Conflict($"{booking.OrderNo} has no requirement lines yet.",
+                "Add what equipment and how many (PUT …/requirements) before assigning boxes.")));
 
         var numbers = items.Select(i => ContainerNumber.Normalise(i.ContainerNo ?? "")).ToList();
         var registry = await master.ContainersAsync(numbers.Where(ContainerNumber.IsWellFormed), ct);
         var allowUnknown = await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, booking.BranchId, true, ct);
         var enforceDigit = await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, true, ct);
 
+        var clientIds = items.Select(i => i.ClientLineId).OfType<Guid>().ToList();
+        var already = clientIds.Count == 0 ? []
+            : await db.BookingContainers.Where(x => x.BookingId == booking.BookingId && x.ClientLineId != null && clientIds.Contains(x.ClientLineId.Value))
+                .ToDictionaryAsync(x => x.ClientLineId!.Value, ct);
+
         var activeElsewhere = await (
             from x in db.BookingContainers
             join b in db.Bookings on x.BookingId equals b.BookingId
             where numbers.Contains(x.ContainerNo) && x.EndedAt == null
-            select new { x.ContainerNo, b.OrderNo, x.BookingId }).ToListAsync(ct);
+            select new { x.ContainerNo, b.OrderNo, x.BookingId, x.ClientLineId }).ToListAsync(ct);
 
         // Where each box stands now, for the checks a handover mode switches on (Vector BookingEntry.cs:626-655).
         var inYard = items.Any(i => i.HandoverMode.Clean() is not null)
@@ -521,15 +687,35 @@ internal static class BookingEndpoints
                 .Select(v => new { v.ContainerNo, v.FullEmpty }).ToListAsync(ct)
             : [];
 
+        var cargoCodes = items.Select(i => i.CargoCategoryCode.Clean()).OfType<string>().Distinct().ToList();
+        var cargo = cargoCodes.Count == 0 ? new HashSet<string>() : (await master.CodeListValuesAsync("CARGO_CATEGORY", cargoCodes, ct)).ToHashSet();
+
         var used = await UsedPerLineAsync(db, booking.BookingId, ct);
         var adding = new Dictionary<Guid, int>();
-        var toAdd = new List<(BookingContainer Box, IReadOnlyList<OrderTypeStepRef> Steps)>();
+        var toAdd = new List<(int Index, BookingContainer Box)>();
+        var replayed = new List<(int Index, BookingContainer Box)>();
+        var seenClientIds = new HashSet<Guid>();
 
         for (var i = 0; i < items.Count; i++)
         {
             var key = $"containers[{i}]";
             var no = numbers[i];
             var item = items[i];
+            bool Failed() => errors.Keys.Any(k => k == key || k.StartsWith(key + ".", StringComparison.Ordinal));
+
+            // A retry of a line this booking already has: answer with that line.
+            if (item.ClientLineId is { } clientId)
+            {
+                if (!seenClientIds.Add(clientId)) { errors.Add($"{key}.clientLineId", "This clientLineId is listed twice in the request."); continue; }
+                if (already.TryGetValue(clientId, out var prior))
+                {
+                    if (prior.ContainerNo != no)
+                        errors.Add($"{key}.clientLineId", $"This clientLineId is already line {prior.ContainerNo} on this booking; a new row needs a new id.");
+                    else
+                        replayed.Add((i, prior));
+                    continue;
+                }
+            }
 
             if (!ContainerNumber.IsWellFormed(no)) { errors.Add($"{key}.containerNo", $"'{item.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits)."); continue; }
             if (numbers.Take(i).Contains(no)) { errors.Add($"{key}.containerNo", $"{no} is listed twice."); continue; }
@@ -569,10 +755,28 @@ internal static class BookingEndpoints
                 errors.Add($"{key}.containerNo", $"{no}: {refusal}");
                 continue;
             }
-            adding[line.EquipmentRequirementId] = adding.GetValueOrDefault(line.EquipmentRequirementId) + 1;
 
             if (item.DeclaredSealNo?.Length > 20) errors.Add($"{key}.declaredSealNo", "At most 20 characters.");
-            if (item.DeclaredVgmKg is <= 0) errors.Add($"{key}.declaredVgmKg", "A VGM is a positive weight; leave it out if unknown.");
+            if (item.CustomerSealNo?.Length > 20) errors.Add($"{key}.customerSealNo", "At most 20 characters.");
+            if (item.DeclaredVgmKg is <= 0) errors.Add($"{key}.declaredVgmKg", "A weight is positive; leave it out if unknown.");
+            if (item.DeclaredVolumeCbm is <= 0) errors.Add($"{key}.declaredVolumeCbm", "A volume is positive; leave it out if unknown.");
+
+            var cargoCode = item.CargoCategoryCode.Clean();
+            if (cargoCode is not null && !cargo.Contains(cargoCode))
+                errors.Add($"{key}.cargoCategoryCode", $"'{cargoCode}' is not a CARGO_CATEGORY of this depot.");
+
+            // Reefer and DG details: the box's own, else the line's (owner Q2: the line holds the defaults).
+            var setTemp = item.ReeferSetTempC ?? line.ReeferSetTempC;
+            if (item.ReeferSetTempC is not null && line.ReeferSetTempC is null)
+                errors.Add($"{key}.reeferSetTempC", $"Line {line.LineNo} ({line.EquipmentTypeCode}) is not a reefer line; a set temperature makes no sense on it.");
+            if (item.ReeferSetTempC is < -70 or > 40) errors.Add($"{key}.reeferSetTempC", "Between −70 °C and +40 °C.");
+            if (item.ReeferVentPct is < 0 or > 100) errors.Add($"{key}.reeferVentPct", "Between 0 and 100 %.");
+            if (item.ReeferHumidityPct is < 0 or > 100) errors.Add($"{key}.reeferHumidityPct", "Between 0 and 100 %.");
+            var imdg = item.ImdgClass.Clean() ?? line.ImdgClass;
+            var un = item.UnNumber?.Trim() is { Length: > 0 } u ? u : line.UnNumber;
+            if (item.UnNumber?.Trim() is { Length: > 0 } typedUn && (typedUn.Length != 4 || !typedUn.All(char.IsAsciiDigit)))
+                errors.Add($"{key}.unNumber", "A UN number is four digits, e.g. 1203.");
+            else if (un is not null && imdg is null) errors.Add($"{key}.imdgClass", "A UN number needs its IMDG class.");
 
             var mode = item.HandoverMode.Clean();
             if (mode is not null)
@@ -584,7 +788,11 @@ internal static class BookingEndpoints
                     errors.Add($"{key}.containerNo", $"{no} {refused}");
             }
 
-            toAdd.Add((new BookingContainer
+            if (Failed()) continue;
+            // Only a box that passed every check holds a place on its line.
+            adding[line.EquipmentRequirementId] = adding.GetValueOrDefault(line.EquipmentRequirementId) + 1;
+
+            toAdd.Add((i, new BookingContainer
             {
                 TenantId = booking.TenantId,
                 BookingId = booking.BookingId,
@@ -594,27 +802,42 @@ internal static class BookingEndpoints
                 IsCheckDigitValid = digitOk,
                 AssignedBy = caller.UserId(),
                 AssignmentSource = source,
+                ClientLineId = item.ClientLineId,
                 DeclaredSealNo = item.DeclaredSealNo.Clean(),
+                CustomerSealNo = item.CustomerSealNo.Clean(),
                 DeclaredVgmKg = item.DeclaredVgmKg,
+                DeclaredVolumeCbm = item.DeclaredVolumeCbm,
+                RequiredDate = item.RequiredDate,
+                CargoCategoryCode = cargoCode,
+                ImdgClass = imdg,
+                UnNumber = un,
+                ReeferSetTempC = setTemp,
+                ReeferVentPct = item.ReeferVentPct ?? line.ReeferVentPct,
+                ReeferHumidityPct = item.ReeferHumidityPct ?? line.ReeferHumidityPct,
+                StowageCode = item.StowageCode.Clean(),
+                StowageNo = string.IsNullOrWhiteSpace(item.StowageNo) ? null : item.StowageNo.Trim(),
+                IsPreCool = item.IsPreCool,
+                Remarks = string.IsNullOrWhiteSpace(item.Remarks) ? null : item.Remarks.Trim(),
                 HandoverModeCode = mode,
-            }, steps));
+            }));
         }
 
-        if (errors.Count > 0)
-            return errors.Values.SelectMany(v => v).Any(m => m.Contains("is active on booking"))
+        if (errors.Count > 0 && !partial)
+            return AssignResult.Failed(errors.Values.SelectMany(v => v).Any(m => m.Contains("is active on booking"))
                    && errors.Count == 1 && errors.Values.Single().Count == 1
                 ? Problem.Of(TosSupport.Conflict(errors.Values.Single().Single()))
-                : Problem.Of(TosSupport.Invalid(errors));
+                : Problem.Of(TosSupport.Invalid(errors)));
 
-        foreach (var (box, _) in toAdd) db.BookingContainers.Add(box);
+        foreach (var (_, box) in toAdd) db.BookingContainers.Add(box);
         try { await db.SaveChangesAsync(ct); }
         catch (DbUpdateException e) when (e.InnerException?.Message.Contains("uq_booking_container__active") == true)
         {
-            return Problem.Of(TosSupport.Conflict("One of these boxes was just assigned to another booking. Reload and try again."));
+            return AssignResult.Failed(Problem.Of(TosSupport.Conflict(
+                "One of these boxes was assigned to another booking a moment ago.", "Reload the booking and send the rows again; rows already saved come back as they are.")));
         }
 
-        foreach (var (box, planSteps) in toAdd)
-            foreach (var step in planSteps)
+        foreach (var (_, box) in toAdd)
+            foreach (var step in steps)
                 db.MovementPlans.Add(new MovementPlan
                 {
                     TenantId = booking.TenantId,
@@ -627,7 +850,7 @@ internal static class BookingEndpoints
                     Status = "PENDING",
                 });
         await db.SaveChangesAsync(ct);
-        return null;
+        return new AssignResult(null, toAdd, replayed, errors);
     }
 
     /// <summary>Boxes that hold a place on each line: active now, or finished. An unassigned box frees its place.</summary>
@@ -896,12 +1119,16 @@ internal static class BookingEndpoints
                 r.MinGradeCode, r.ReeferSetTempC, r.ReeferVentPct, r.ReeferHumidityPct, r.ImdgClass, r.UnNumber,
                 r.OogOverHeightCm, r.OogOverWidthLeftCm, r.OogOverWidthRightCm, r.OogOverLengthFrontCm, r.OogOverLengthBackCm,
                 r.DeclaredGrossWeightKg, r.Remarks)).ToList(),
-            boxes.Select(x => new BookingContainerResponse(
-                x.BookingContainerId, x.EquipmentRequirementId, lineNoOf.GetValueOrDefault(x.EquipmentRequirementId), x.ContainerNo,
-                x.ContainerId is not null, x.IsCheckDigitValid, x.AssignmentSource, x.DeclaredSealNo, x.DeclaredVgmKg,
-                x.AssignedAt, x.EndedAt, x.EndReason,
-                steps[x.BookingContainerId].Select(m => new StepResponse(m.MovementPlanId, m.SequenceNo, m.MovementCode, m.IsRequired, m.Status, m.GateTransactionId, m.SkipReason)).ToList(),
-                x.HandoverModeCode
-            )).ToList());
+            boxes.Select(x => ToResponse(x, lineNoOf.GetValueOrDefault(x.EquipmentRequirementId), steps[x.BookingContainerId])).ToList());
     }
+
+    private static BookingContainerResponse ToResponse(BookingContainer x, short lineNo, IEnumerable<MovementPlan> steps) => new(
+        x.BookingContainerId, x.EquipmentRequirementId, lineNo, x.ContainerNo,
+        x.ContainerId is not null, x.IsCheckDigitValid, x.AssignmentSource, x.DeclaredSealNo, x.DeclaredVgmKg,
+        x.AssignedAt, x.EndedAt, x.EndReason,
+        steps.Select(m => new StepResponse(m.MovementPlanId, m.SequenceNo, m.MovementCode, m.IsRequired, m.Status, m.GateTransactionId, m.SkipReason)).ToList(),
+        x.HandoverModeCode,
+        x.ClientLineId, x.CustomerSealNo, x.DeclaredVolumeCbm, x.RequiredDate, x.CargoCategoryCode, x.ImdgClass, x.UnNumber,
+        x.ReeferSetTempC, x.ReeferVentPct, x.ReeferHumidityPct, x.StowageCode, x.StowageNo, x.IsPreCool, x.Remarks,
+        x.RowVersion is { Length: > 0 } v ? Convert.ToBase64String(v) : null);
 }

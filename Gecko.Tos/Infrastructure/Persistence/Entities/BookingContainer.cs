@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace Gecko.Tos.Infrastructure.Persistence.Entities;
@@ -31,6 +31,35 @@ public partial class BookingContainer
 
     /// <summary>gecko_tos 18: Vector's P/U Mode / D/O Mode / repo mode — who collects or delivers the box. Null = not said.</summary>
     public string? HandoverModeCode { get; set; }
+
+    /// <summary>gecko_tos 20: the UI's own id for the row it keyed — a retry with it gets the same line.</summary>
+    public Guid? ClientLineId { get; set; }
+
+    public string? CustomerSealNo { get; set; }
+
+    public decimal? DeclaredVolumeCbm { get; set; }
+
+    public DateOnly? RequiredDate { get; set; }
+
+    public string? CargoCategoryCode { get; set; }
+
+    public string? ImdgClass { get; set; }
+
+    public string? UnNumber { get; set; }
+
+    public decimal? ReeferSetTempC { get; set; }
+
+    public decimal? ReeferVentPct { get; set; }
+
+    public decimal? ReeferHumidityPct { get; set; }
+
+    public string? StowageCode { get; set; }
+
+    public string? StowageNo { get; set; }
+
+    public bool? IsPreCool { get; set; }
+
+    public string? Remarks { get; set; }
 
     public DateTimeOffset? EndedAt { get; set; }
 

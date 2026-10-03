@@ -12,14 +12,20 @@ public static class CutoffRules
 {
     public static readonly IReadOnlySet<string> Kinds = new HashSet<string>(StringComparer.Ordinal)
     {
-        "PORT_DRY", "PORT_REEFER", "PORT_DG", "YARD_DRY", "YARD_REEFER", "YARD_DG", "VGM", "SI",
+        "PORT_DRY", "PORT_REEFER", "PORT_DG", "YARD_DRY", "YARD_REEFER", "YARD_DG", "CFS_DRY", "CFS_REEFER", "VGM", "SI",
     };
 
     public static bool IsYard(string kind) => kind.StartsWith("YARD_", StringComparison.Ordinal);
+
+    /// <summary>Vector "CFS Cut-off (Dry / Reefer)" (gecko_tos 21): the depot's CFS cut-off.</summary>
+    public static bool IsCfs(string kind) => kind.StartsWith("CFS_", StringComparison.Ordinal);
+
+    /// <summary>A DEPOT's own cut-off (yard or CFS): it may differ by branch and must come before the port's.</summary>
+    public static bool IsDepot(string kind) => IsYard(kind) || IsCfs(kind);
     public static bool IsPort(string kind) => kind.StartsWith("PORT_", StringComparison.Ordinal);
 
-    /// <summary>YARD_DRY → PORT_DRY. The port cut-off a yard cut-off feeds.</summary>
-    public static string PortKindFor(string yardKind) => "PORT_" + yardKind["YARD_".Length..];
+    /// <summary>YARD_DRY → PORT_DRY, CFS_REEFER → PORT_REEFER. The port cut-off a depot cut-off feeds.</summary>
+    public static string PortKindFor(string depotKind) => "PORT_" + depotKind[(depotKind.IndexOf('_') + 1)..];
 
     /// <summary>One cut-off as the rules see it. <see cref="LineCode"/> / <see cref="BranchId"/> null = everyone.</summary>
     public sealed record Cutoff(string Kind, string? LineCode, Guid? BranchId, DateTimeOffset At);
@@ -42,8 +48,8 @@ public static class CutoffRules
                 continue;
             }
             // The port closes for everybody at once; only a depot's own cut-off differs by branch.
-            if (c.BranchId is not null && !IsYard(c.Kind))
-                problems.Add((i, $"{c.Kind} cannot be branch-specific — only YARD_* cut-offs differ by depot."));
+            if (c.BranchId is not null && !IsDepot(c.Kind))
+                problems.Add((i, $"{c.Kind} cannot be branch-specific — only YARD_* and CFS_* cut-offs differ by depot."));
             if (c.LineCode is not null && !lineCodes.Contains(c.LineCode))
                 problems.Add((i, $"{c.Kind} is set for line {c.LineCode}, which is not on this call."));
             if (c.At > etd)
@@ -62,7 +68,7 @@ public static class CutoffRules
         for (var i = 0; i < cutoffs.Count; i++)
         {
             var y = cutoffs[i];
-            if (!IsYard(y.Kind) || !Kinds.Contains(y.Kind)) continue;
+            if (!IsDepot(y.Kind) || !Kinds.Contains(y.Kind)) continue;
             var portKind = PortKindFor(y.Kind);
             foreach (var p in cutoffs.Where(p => p.Kind == portKind && (p.LineCode is null || p.LineCode == y.LineCode)))
                 if (y.At > p.At)

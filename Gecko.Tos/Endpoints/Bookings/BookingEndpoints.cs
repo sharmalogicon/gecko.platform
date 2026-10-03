@@ -157,11 +157,16 @@ internal static class BookingEndpoints
 
         var errors = new Dictionary<string, List<string>>();
         var header = await ResolveHeaderAsync(db, master, clock, request, errors, ct);
+        // Vector BookingEntry.cs:1773: a BLIND GATE IN booking is made by the gate, never by hand.
+        if (string.Equals(request.OrderTypeCode.Clean(), BlindGateIn, StringComparison.Ordinal))
+            errors.Add("orderTypeCode", $"{BlindGateIn} bookings are made by the gate itself, not by hand.");
 
         // 403, not 404: the caller named the branch, so refusing it by name tells them
         // nothing they did not already type.
         if (header is not null && !scope.HasAt(TosPermissions.BookingManage, header.Branch.BranchId))
             return TosScope.OutsideYourBranches($"You cannot raise a booking at {header.Branch.BranchCode}.");
+        if (header is not null && request.AllowLateGateIn == true && !scope.HasAt(TosPermissions.CutoffOverride, header.Branch.BranchId))
+            return TosScope.OutsideYourBranches(LateGateNeedsOverride);
 
         // Header first (owner 2026-10-03): the clerk saves the header, gets the order number,
         // and adds requirement lines and boxes afterwards. No box goes on a booking without a line.
@@ -184,6 +189,7 @@ internal static class BookingEndpoints
             IdempotencyHash = hash,
         };
         ApplyHeader(booking, request, header);
+        if (request.AllowLateGateIn == true) SetLateGate(booking, true, caller);
         db.Bookings.Add(booking);
         try { await db.SaveChangesAsync(ct); }
         catch (DbUpdateException e) when (key is not null && e.InnerException?.Message.Contains("uq_booking__idempotency_key") == true)
@@ -261,7 +267,7 @@ internal static class BookingEndpoints
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
         Guid id, SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
-        ICallerPermissions scope, CancellationToken ct)
+        ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(db, id, ct);
@@ -286,6 +292,11 @@ internal static class BookingEndpoints
         var header = await ResolveHeaderAsync(db, master, clock, request, errors, ct);
         if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
         if (await CarrierRefTakenAsync(db, booking.BranchId, request.CarrierRef, booking.BookingId, ct) is { } taken) return taken;
+        if (request.AllowLateGateIn is { } late && late != booking.AllowLateGateIn)
+        {
+            if (!scope.HasAt(TosPermissions.CutoffOverride, booking.BranchId)) return TosScope.OutsideYourBranches(LateGateNeedsOverride);
+            SetLateGate(booking, late, caller);
+        }
 
         ApplyHeader(booking, request, header);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
@@ -950,6 +961,27 @@ internal static class BookingEndpoints
         if (request.ValidFrom is { } from && request.ValidTo is { } to && to < from)
             errors.Add("validTo", "The release ends before it starts.");
 
+        // Vector BookingEntry.cs:168-207, 2548 — what the desktop makes mandatory (owner 2026-10-03).
+        if (request.CarrierRef.Clean() is null)
+            errors.Add("carrierRef", "The B/L or booking number is required.");
+        if (plan?.BookingTypeCode is ExportBooking or ImportDo && request.CustomerCode.Clean() is null)
+            errors.Add("customerCode", "The customer is required on an export booking or an import D/O.");
+        if (plan?.BookingTypeCode is ExportBooking)
+        {
+            if (request.PolPortCode.Clean() is null) errors.Add("polPortCode", "The loading port is required on an export booking.");
+            if (request.PodPortCode.Clean() is null && request.FpdPortCode.Clean() is null)
+                errors.Add("fpdPortCode", "The destination port is required on an export booking.");
+        }
+
+        // The shipper's declared totals: stored as declared (not the sum of the boxes).
+        if (request.TotalQty is <= 0) errors.Add("totalQty", "A declared quantity is more than zero; leave it out if unknown.");
+        if (request.TotalVolumeCbm is <= 0) errors.Add("totalVolumeCbm", "A declared volume is more than zero; leave it out if unknown.");
+        if (request.TotalWeightKg is <= 0) errors.Add("totalWeightKg", "A declared weight is more than zero; leave it out if unknown.");
+        var uom = request.UomCode.Clean();
+        if (uom is not null && !(await master.CodeListValuesAsync("UOM", [uom], ct)).Contains(uom))
+            errors.Add("uomCode", $"'{uom}' is not a UOM of this depot.");
+        if (request.TotalQty is not null && uom is null) errors.Add("uomCode", "Say what the quantity counts (UOM).");
+
         return branch is null || plan is null || resolved["lineCode"] is null
             ? null
             : new Header(branch, plan, resolved["lineCode"]!, resolved["agentCode"], resolved["customerCode"],
@@ -980,6 +1012,29 @@ internal static class BookingEndpoints
         b.ValidTo = request.ValidTo;
         b.CustomerRef = string.IsNullOrWhiteSpace(request.CustomerRef) ? null : request.CustomerRef.Trim();
         b.Remarks = string.IsNullOrWhiteSpace(request.Remarks) ? null : request.Remarks.Trim();
+        b.PaperlessCode = request.PaperlessCode.Clean();
+        b.SubBlNo = request.SubBlNo.Clean();
+        b.NextPrevLocation = string.IsNullOrWhiteSpace(request.NextPrevLocation) ? null : request.NextPrevLocation.Trim();
+        b.TotalQty = request.TotalQty;
+        b.UomCode = request.UomCode.Clean();
+        b.TotalVolumeCbm = request.TotalVolumeCbm;
+        b.TotalWeightKg = request.TotalWeightKg;
+        b.MarksAndNos = string.IsNullOrWhiteSpace(request.MarksAndNos) ? null : request.MarksAndNos.Trim();
+        b.SpecialInstruction = string.IsNullOrWhiteSpace(request.SpecialInstruction) ? null : request.SpecialInstruction.Trim();
+    }
+
+    private const string BlindGateIn = "BLIND GATE IN";
+    private const string ExportBooking = "EXPORT_BOOKING";
+    private const string ImportDo = "IMPORT_DO";
+    private const string LateGateNeedsOverride =
+        "Only a user who may override cut-offs (tos.cutoff.override) can allow a late gate-in on a booking.";
+
+    /// <summary>Vector "Allow Late Gate-In": who set it and when are kept with it.</summary>
+    private static void SetLateGate(Booking b, bool allow, ITenantContext caller)
+    {
+        b.AllowLateGateIn = allow;
+        b.LateGateSetBy = caller.UserId();
+        b.LateGateSetAt = DateTimeOffset.UtcNow;
     }
 
     private sealed record ResolvedRequirement(RequirementItem Item, EquipmentTypeRef? Type, string? Grade);
@@ -1110,7 +1165,9 @@ internal static class BookingEndpoints
                 b.PolPortCode, b.PodPortCode, b.FpdPortCode, b.CargoCategoryCode, b.CommodityCode, b.ValidFrom, b.ValidTo,
                 b.Status, BookingRules.EffectiveProgress(row.p.ProgressStatus, b.ValidTo, today),
                 b.CancelledAt, b.CancelReason, b.ClosedAt, b.CloseReason, b.Source, b.CustomerRef, b.Remarks, b.CreatedAt,
-                Convert.ToBase64String(b.RowVersion)),
+                Convert.ToBase64String(b.RowVersion),
+                b.AllowLateGateIn, b.LateGateSetAt, b.PaperlessCode, b.SubBlNo, b.NextPrevLocation, b.TotalQty, b.UomCode,
+                b.TotalVolumeCbm, b.TotalWeightKg, b.MarksAndNos, b.SpecialInstruction),
             row.p.QtyRequired, row.p.QtyAssigned, row.p.QtyCompleted, row.p.StepsDone,
             requirements.Select(r => new RequirementResponse(
                 r.EquipmentRequirementId, r.LineNo, r.EquipmentTypeCode, r.Qty,

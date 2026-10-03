@@ -87,13 +87,14 @@ public static class GateRules
     /// §5.2: a FULL export box gating IN after its yard cut-off. Late is allowed,
     /// unaccounted-for late is not — Vector let 686 through on a bit in 2025.
     /// </summary>
-    public static GateFinding? LateGate(DateTimeOffset transactionAt, string cutoffKind, DateTimeOffset cutoffAt, bool covered) =>
+    public static GateFinding? LateGate(DateTimeOffset transactionAt, string cutoffKind, DateTimeOffset cutoffAt, bool covered,
+        string coveredBy = "an approved late gate") =>
         transactionAt <= cutoffAt
             ? null
             : covered
                 ? new GateFinding(
                     "LATE_APPROVED",
-                    $"Gated in after the {cutoffKind} cut-off ({cutoffAt:u}), covered by an approved late gate.",
+                    $"Gated in after the {cutoffKind} cut-off ({cutoffAt:u}), covered by {coveredBy}.",
                     GateSeverity.Info)
                 : new GateFinding(
                     "LATE",

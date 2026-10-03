@@ -24,7 +24,11 @@ public sealed record BookingResponse(
     string? PolPortCode, string? PodPortCode, string? FpdPortCode,
     string? CargoCategoryCode, string? CommodityCode, DateOnly? ValidFrom, DateOnly? ValidTo,
     string Status, string Progress, DateTimeOffset? CancelledAt, string? CancelReason, DateTimeOffset? ClosedAt, string? CloseReason,
-    string Source, string? CustomerRef, string? Remarks, DateTimeOffset CreatedAt, string RowVersion);
+    string Source, string? CustomerRef, string? Remarks, DateTimeOffset CreatedAt, string RowVersion,
+    // gecko_tos 21 — Vector's Vessel & Voyage and Other Information panels.
+    bool AllowLateGateIn = false, DateTimeOffset? LateGateSetAt = null, string? PaperlessCode = null, string? SubBlNo = null,
+    string? NextPrevLocation = null, int? TotalQty = null, string? UomCode = null, decimal? TotalVolumeCbm = null,
+    decimal? TotalWeightKg = null, string? MarksAndNos = null, string? SpecialInstruction = null);
 
 public sealed record RequirementResponse(
     Guid EquipmentRequirementId, short LineNo, string EquipmentTypeCode, short Qty, int QtyAssigned, int QtyCompleted,
@@ -85,7 +89,18 @@ public sealed record SaveBookingRequest(
     [property: MaxLength(1000)] string? Remarks = null,
     IReadOnlyList<RequirementItem>? Requirements = null,
     IReadOnlyList<AssignContainerItem>? Containers = null,
-    string? RowVersion = null);
+    string? RowVersion = null,
+    // gecko_tos 21. AllowLateGateIn: null = leave as it is (false on create); changing it needs tos.cutoff.override.
+    bool? AllowLateGateIn = null,
+    [property: MaxLength(30)] string? PaperlessCode = null,
+    [property: MaxLength(40)] string? SubBlNo = null,
+    [property: MaxLength(50)] string? NextPrevLocation = null,
+    int? TotalQty = null,
+    [property: MaxLength(20)] string? UomCode = null,
+    decimal? TotalVolumeCbm = null,
+    decimal? TotalWeightKg = null,
+    [property: MaxLength(200)] string? MarksAndNos = null,
+    [property: MaxLength(1000)] string? SpecialInstruction = null);
 
 /// <summary><see cref="LineNo"/> null on create = next number; on replace, the line it updates.</summary>
 public sealed record RequirementItem(

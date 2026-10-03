@@ -58,7 +58,7 @@ public sealed class GateOutReleaseApiTests(TosApiFactory api)
             var booking = await client.PostAsJsonAsync("/api/tos/bookings", new
             {
                 branchId = SctLcb01, orderTypeCode = "EXP CY-IN (NOMINATING)", lineCode = "MAEU", customerCode = "CUS-BKF", carrierRef,
-                vesselCallId = callId, podPortCode = "SGSIN",
+                vesselCallId = callId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
                 containers = new object[] { new { containerNo = box } },
             }, ct);

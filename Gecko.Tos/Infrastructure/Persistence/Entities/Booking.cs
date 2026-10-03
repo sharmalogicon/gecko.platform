@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace Gecko.Tos.Infrastructure.Persistence.Entities;
@@ -98,6 +98,31 @@ public partial class Booking
     public string? CustomerRef { get; set; }
 
     public string? Remarks { get; set; }
+
+    // gecko_tos 21 — the rest of Vector's booking header.
+    public bool AllowLateGateIn { get; set; }
+
+    public Guid? LateGateSetBy { get; set; }
+
+    public DateTimeOffset? LateGateSetAt { get; set; }
+
+    public string? PaperlessCode { get; set; }
+
+    public string? SubBlNo { get; set; }
+
+    public string? NextPrevLocation { get; set; }
+
+    public int? TotalQty { get; set; }
+
+    public string? UomCode { get; set; }
+
+    public decimal? TotalVolumeCbm { get; set; }
+
+    public decimal? TotalWeightKg { get; set; }
+
+    public string? MarksAndNos { get; set; }
+
+    public string? SpecialInstruction { get; set; }
 
     public string? LegacyOrderNo { get; set; }
 

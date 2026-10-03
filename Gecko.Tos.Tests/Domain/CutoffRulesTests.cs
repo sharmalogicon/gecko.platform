@@ -28,6 +28,22 @@ public sealed class CutoffRulesTests
         Assert.Empty(problems);
     }
 
+    /// <summary>Vector "CFS Cut-off (Dry / Reefer)" (gecko_tos 21): a depot cut-off, like the yard's.</summary>
+    [Fact]
+    public void A_CFS_cutoff_is_a_depot_cutoff_that_may_differ_by_branch_and_must_beat_the_port()
+    {
+        Assert.Empty(Check(
+            new Cut("PORT_REEFER", null, null, Etd.AddHours(-28)),
+            new Cut("CFS_DRY", null, Guid.NewGuid(), Etd.AddHours(-60)),
+            new Cut("CFS_REEFER", null, null, Etd.AddHours(-50))));
+
+        var (index, message) = Assert.Single(Check(
+            new Cut("PORT_REEFER", null, null, Etd.AddHours(-28)),
+            new Cut("CFS_REEFER", null, null, Etd.AddHours(-20))));
+        Assert.Equal(1, index);
+        Assert.Contains("PORT_REEFER", message);
+    }
+
     [Fact]
     public void Yard_after_port_is_refused()   // V-6: 141 schedules
     {

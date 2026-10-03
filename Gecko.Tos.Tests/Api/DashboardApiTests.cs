@@ -163,7 +163,7 @@ public sealed class DashboardApiTests(TosApiFactory api)
             var booking = await client.PostAsJsonAsync("/api/tos/bookings", new
             {
                 branchId = SctLcb01, orderTypeCode = "EXP CY/CY", lineCode = "MAEU", customerCode = "CUS-BKF", carrierRef,
-                vesselCallId = call.Call.VesselCallId, podPortCode = "SGSIN",
+                vesselCallId = call.Call.VesselCallId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 requirements = new object[] { new { equipmentTypeCode = "40HC", qty = 2 } },
             }, ct);
             Assert.True(booking.StatusCode == HttpStatusCode.Created, await booking.Content.ReadAsStringAsync(ct));

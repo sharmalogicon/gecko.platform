@@ -260,6 +260,18 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.Remarks)
                 .HasMaxLength(1000)
                 .HasColumnName("remarks");
+            entity.Property(e => e.AllowLateGateIn).HasColumnName("allow_late_gate_in");
+            entity.Property(e => e.LateGateSetBy).HasColumnName("late_gate_set_by");
+            entity.Property(e => e.LateGateSetAt).HasColumnName("late_gate_set_at");
+            entity.Property(e => e.PaperlessCode).HasMaxLength(30).IsUnicode(false).HasColumnName("paperless_code");
+            entity.Property(e => e.SubBlNo).HasMaxLength(40).IsUnicode(false).HasColumnName("sub_bl_no");
+            entity.Property(e => e.NextPrevLocation).HasMaxLength(50).HasColumnName("next_prev_location");
+            entity.Property(e => e.TotalQty).HasColumnName("total_qty");
+            entity.Property(e => e.UomCode).HasMaxLength(20).IsUnicode(false).HasColumnName("uom_code");
+            entity.Property(e => e.TotalVolumeCbm).HasColumnType("decimal(12, 3)").HasColumnName("total_volume_cbm");
+            entity.Property(e => e.TotalWeightKg).HasColumnType("decimal(12, 2)").HasColumnName("total_weight_kg");
+            entity.Property(e => e.MarksAndNos).HasMaxLength(200).HasColumnName("marks_and_nos");
+            entity.Property(e => e.SpecialInstruction).HasMaxLength(1000).HasColumnName("special_instruction");
             entity.Property(e => e.RowVersion)
                 .IsRowVersion()
                 .IsConcurrencyToken()

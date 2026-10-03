@@ -204,6 +204,9 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             {
                 var kind = CutoffKindFor(booking, requirement);
                 var effective = await CutoffLookup.EffectiveAsync(db, callId, booking.LinePartyId, booking.BranchId, ct);
+                // A CFS booking works to the CFS cut-off when the call states one, else to the yard's.
+                if (CutoffRules.IsCfs(kind) && effective.All(c => c.Kind != kind))
+                    kind = "YARD_" + kind["CFS_".Length..];
                 if (effective.SingleOrDefault(c => c.Kind == kind) is { } cutoff)
                 {
                     var covering = at > cutoff.At
@@ -213,7 +216,10 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
                             && (e.EquipmentRequirementId == null || e.EquipmentRequirementId == assignment.EquipmentRequirementId), ct)
                         : null;
 
-                    if (GateRules.LateGate(at, kind, cutoff.At, covering is not null) is { } late) findings.Add(late);
+                    // Vector "Allow Late Gate-In": set on the booking by someone who may override cut-offs.
+                    if (GateRules.LateGate(at, kind, cutoff.At, covering is not null || booking.AllowLateGateIn,
+                            covering is null && booking.AllowLateGateIn ? "the booking's Allow Late Gate-In" : "an approved late gate") is { } late)
+                        findings.Add(late);
 
                     return await FinishAsync(new BarrierView
                     {
@@ -275,11 +281,12 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         if (IsDangerous(booking, requirement))
             return "YARD_DG";
 
+        var cfs = booking.OrderTypeCode.Contains("CFS", StringComparison.OrdinalIgnoreCase);
         if (requirement?.ReeferSetTempC is not null
             || booking.CargoClassCode.Contains("REEFER", StringComparison.OrdinalIgnoreCase))
-            return "YARD_REEFER";
+            return cfs ? "CFS_REEFER" : "YARD_REEFER";
 
-        return "YARD_DRY";
+        return cfs ? "CFS_DRY" : "YARD_DRY";
     }
 
     /// <summary>One definition of "this box is dangerous": the cut-off and the price must agree.</summary>

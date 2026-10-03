@@ -464,7 +464,7 @@ public sealed class GateApiTests(TosApiFactory api)
                 lineCode = "MAEU",
                 customerCode = "CUS-TAE",
                 carrierRef,
-                vesselCallId = call.VesselCallId,
+                vesselCallId = call.VesselCallId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
                 requirements = new object[] { new { equipmentTypeCode = "40GP", qty = 1 } },
                 containers = new object[] { new { containerNo = BoxC } },
@@ -502,6 +502,41 @@ public sealed class GateApiTests(TosApiFactory api)
             Assert.NotNull(eir.CutoffAtApplied);
             Assert.Equal("Line agreed by phone; vessel still alongside", eir.LateOverrideReason);
             Assert.Null(eir.CutoffExceptionId);
+        }
+        finally { await TestDatabase.RemoveGateAsync(carrierRef); await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    /// <summary>Vector "Allow Late Gate-In": set on the booking by someone who may override cut-offs, it covers the gate.</summary>
+    [Fact]
+    public async Task A_booking_that_allows_a_late_gate_in_lets_its_box_in_after_the_cut_off()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>(
+                $"/api/tos/vessel-calls?search=BLUEMERIDIAN-2634W", ct))!.Items.Single();
+
+            await BookAsync(client, new
+            {
+                branchId = SctLcb01,
+                orderTypeCode = "LADEN TO FACT 1",
+                lineCode = "MAEU",
+                customerCode = "CUS-TAE",
+                carrierRef,
+                vesselCallId = call.VesselCallId, polPortCode = "THLCH", podPortCode = "SGSIN",
+                validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+                allowLateGateIn = true,
+                requirements = new object[] { new { equipmentTypeCode = "40GP", qty = 1 } },
+                containers = new object[] { new { containerNo = BoxC } },
+            }, ct);
+
+            var view = await PreflightAsync(client, BoxC, "IN", ct);
+            Assert.NotEqual("NEEDS_OVERRIDE", view.Decision);
+            var covered = Assert.Single(view.Findings, f => f.Code == "LATE_APPROVED");
+            Assert.Contains("Allow Late Gate-In", covered.Message);
+            Assert.DoesNotContain(view.Findings, f => f.Code == "LATE");
         }
         finally { await TestDatabase.RemoveGateAsync(carrierRef); await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }

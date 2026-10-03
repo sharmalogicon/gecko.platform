@@ -65,7 +65,7 @@ public sealed class CutoffExceptionApiTests(TosApiFactory api)
             var created = await client.PostAsJsonAsync(Bookings, new
             {
                 branchId = SctLcb01, orderTypeCode = "EXP CY/CY", lineCode = "ONEY", customerCode = "CUS-BKF", carrierRef,
-                vesselCallId = call.VesselCallId, podPortCode = "SGSIN",
+                vesselCallId = call.VesselCallId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 requirements = new object[] { new { equipmentTypeCode = "40HC", qty = 2 } },
             }, ct);
             Assert.Equal(HttpStatusCode.Created, created.StatusCode);

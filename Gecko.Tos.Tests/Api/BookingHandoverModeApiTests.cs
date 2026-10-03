@@ -65,7 +65,7 @@ public sealed class BookingHandoverModeApiTests(TosApiFactory api)
             object Export(string suffix, string? handoverMode) => new
             {
                 branchId = SctLcb01, orderTypeCode = "EXP CY/CY", lineCode = "MAEU", customerCode = "CUS-BKF", carrierRef = carrierRef + suffix,
-                vesselCallId = callId, podPortCode = "SGSIN",
+                vesselCallId = callId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
                 containers = new object[] { new { containerNo = NewBox(), handoverMode } },
             };

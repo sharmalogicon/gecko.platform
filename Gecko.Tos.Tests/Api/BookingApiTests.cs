@@ -161,10 +161,11 @@ public sealed class BookingApiTests(TosApiFactory api)
         var root = NewRef()[..13];
         try
         {
-            // ── no carrier reference (most gate bookings): only the key can tell a repeat from a new booking
-            object NoRef(int qty) => new
+            // ── the key: a repeat of the same request is the same booking (the B/L is required since gecko_tos 21)
+            object NoRef(int qty, string tag = "K1") => new
             {
                 branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE",
+                carrierRef = $"{root}-{tag}",
                 customerRef = root,   // kept on the row so the test can find and remove what it made
                 requirements = new object[] { new { equipmentTypeCode = "20GP", qty } },
             };
@@ -178,7 +179,7 @@ public sealed class BookingApiTests(TosApiFactory api)
             // The same key with a different body is a client bug, not a booking.
             Assert.Contains("different request", await ExpectAsync(await PostWithKeyAsync(client, key, NoRef(2), ct), HttpStatusCode.UnprocessableEntity, ct));
             // Another key is another booking; no key at all behaves as it always did.
-            var other = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, Guid.NewGuid().ToString(), NoRef(1), ct), HttpStatusCode.Created, ct));
+            var other = Read<BookingDetailResponse>(await ExpectAsync(await PostWithKeyAsync(client, Guid.NewGuid().ToString(), NoRef(1, "K2"), ct), HttpStatusCode.Created, ct));
             Assert.NotEqual(first.Booking.OrderNo, other.Booking.OrderNo);
             Assert.Contains("Idempotency-Key", await ExpectAsync(await PostWithKeyAsync(client, new string('k', 101), NoRef(1), ct), HttpStatusCode.BadRequest, ct));
 
@@ -199,7 +200,7 @@ public sealed class BookingApiTests(TosApiFactory api)
             };
             await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{first.Booking.BookingId}", amend, ct), HttpStatusCode.Conflict, ct);
             await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{original.Booking.BookingId}",
-                new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", carrierRef = reference, remarks = "same reference, kept", rowVersion = original.Booking.RowVersion }, ct),
+                new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef = reference, remarks = "same reference, kept", rowVersion = original.Booking.RowVersion }, ct),
                 HttpStatusCode.OK, ct);
 
             // A cancelled booking frees its reference.
@@ -319,7 +320,7 @@ public sealed class BookingApiTests(TosApiFactory api)
             object Export(Guid? callId, string line = "ONEY") => new
             {
                 branchId = SctLcb01, orderTypeCode = "EXP CY/CY", lineCode = line, customerCode = "CUS-BKF", carrierRef,
-                vesselCallId = callId, podPortCode = "SGSIN",
+                vesselCallId = callId, polPortCode = "THLCH", podPortCode = "SGSIN",
                 requirements = new object[] { new { equipmentTypeCode = "40HC", qty = 3 } },
             };
 
@@ -686,6 +687,58 @@ public sealed class BookingApiTests(TosApiFactory api)
                 rowVersion = edited.RowVersion, declaredSealNo = "LS-2", customerSealNo = "CS-9", declaredVgmKg = 20100m, remarks = "Gate noted a dent",
             }, ct), HttpStatusCode.OK, ct));
             Assert.Equal("Gate noted a dent", later.Remarks);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    // ── the rest of Vector's header (BOOKING_VECTOR_PARITY_FOR_API, gecko_tos 21) ──
+
+    [Fact]
+    public async Task The_header_carries_Vectors_other_information_and_refuses_what_the_desktop_refused()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            // What the desktop made mandatory.
+            var noBl = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE" }, ct);
+            Assert.Contains("\"carrierRef\"", await ExpectAsync(noBl, HttpStatusCode.BadRequest, ct));
+            var noCustomer = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", carrierRef }, ct);
+            Assert.Contains("\"customerCode\"", await ExpectAsync(noCustomer, HttpStatusCode.BadRequest, ct));
+            var blind = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "BLIND GATE IN", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef }, ct);
+            Assert.Contains("made by the gate", await ExpectAsync(blind, HttpStatusCode.BadRequest, ct));
+
+            // A count needs its unit, and the unit is a code list.
+            var noUnit = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef, totalQty = 10 }, ct);
+            Assert.Contains("\"uomCode\"", await ExpectAsync(noUnit, HttpStatusCode.BadRequest, ct));
+            var badUnit = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef, totalQty = 10, uomCode = "BUCKETS" }, ct);
+            Assert.Contains("not a UOM", await ExpectAsync(badUnit, HttpStatusCode.BadRequest, ct));
+
+            var created = await CreateAsync(client, new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                subBlNo = "SUB-1", paperlessCode = "E-REL-778", nextPrevLocation = "Bangkok port",
+                totalQty = 1200, uomCode = "ctn", totalVolumeCbm = 66.5m, totalWeightKg = 18500m,
+                marksAndNos = "ACME / BKK / 1-1200", specialInstruction = "Keep dry", remarks = "ops note",
+                allowLateGateIn = true,
+            }, ct);
+            var b = created.Booking;
+            Assert.Equal(("SUB-1", "E-REL-778", "Bangkok port", 1200, "CTN", 66.5m, 18500m, "ACME / BKK / 1-1200", "Keep dry", "ops note"),
+                (b.SubBlNo, b.PaperlessCode, b.NextPrevLocation, b.TotalQty!.Value, b.UomCode, b.TotalVolumeCbm!.Value, b.TotalWeightKg!.Value,
+                 b.MarksAndNos, b.SpecialInstruction, b.Remarks));
+            Assert.True(b.AllowLateGateIn);
+            Assert.NotNull(b.LateGateSetAt);
+
+            // The header PUT leaves the flag alone when it is not sent, and replaces the rest.
+            var amended = Read<BookingDetailResponse>(await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{b.BookingId}", new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                specialInstruction = "Keep dry, stack max 2", rowVersion = b.RowVersion,
+            }, ct), HttpStatusCode.OK, ct)).Booking;
+            Assert.True(amended.AllowLateGateIn);
+            Assert.Equal("Keep dry, stack max 2", amended.SpecialInstruction);
+            Assert.Null(amended.TotalQty);
         }
         finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }

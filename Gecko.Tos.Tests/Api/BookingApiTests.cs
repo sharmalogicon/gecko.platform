@@ -507,4 +507,69 @@ public sealed class BookingApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(second);
         }
     }
+
+    // ── two clerks at once (BOOKING_ENTRY_GAP_ANALYSIS G1) ──────────────────
+
+    /// <summary>
+    /// The last free place on a line, claimed by two clerks at the same instant: one
+    /// gets it, the other is told the line is full. Never two boxes on a one-box line.
+    /// </summary>
+    [Fact]
+    public async Task Two_clerks_filling_the_last_place_on_a_line_do_not_both_get_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var other = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            var booking = await CreateAsync(client, ImportDo(carrierRef, requirements: [new { equipmentTypeCode = "20GP", qty = 1 }]), ct);
+            var id = booking.Booking.BookingId;
+
+            var answers = await Task.WhenAll(
+                AssignAsync(client, id, ct, new { containerNo = Gp20A }),
+                AssignAsync(other, id, ct, new { containerNo = Gp20B }));
+
+            Assert.Equal(1, answers.Count(a => a.StatusCode == HttpStatusCode.OK));
+            var loser = answers.Single(a => a.StatusCode != HttpStatusCode.OK);
+            Assert.Contains("line is full", await ExpectAsync(loser, HttpStatusCode.BadRequest, ct));
+
+            var detail = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{id}", ct))!;
+            Assert.Single(detail.Containers, c => c.EndedAt is null);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    /// <summary>A box assigned while the booking is being cancelled never stays active on the cancelled booking.</summary>
+    [Fact]
+    public async Task A_box_assigned_during_a_cancel_never_stays_on_the_cancelled_booking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var other = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var refs = new List<string>();
+        try
+        {
+            for (var round = 0; round < 3; round++)
+            {
+                var carrierRef = NewRef();
+                refs.Add(carrierRef);
+                var booking = await CreateAsync(client, ImportDo(carrierRef), ct);
+                var id = booking.Booking.BookingId;
+
+                await Task.WhenAll(
+                    AssignAsync(other, id, ct, new { containerNo = Gp20A }),
+                    client.PostAsJsonAsync($"{Bookings}/{id}/cancel", new { reason = "Customer withdrew", rowVersion = booking.Booking.RowVersion }, ct));
+
+                var detail = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{id}", ct))!;
+                if (detail.Booking.Status == "CANCELLED")
+                    Assert.DoesNotContain(detail.Containers, c => c.EndedAt is null);
+                await TestDatabase.RemoveBookingsAsync(carrierRef);   // frees Gp20A for the next round
+            }
+        }
+        finally
+        {
+            foreach (var carrierRef in refs) await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

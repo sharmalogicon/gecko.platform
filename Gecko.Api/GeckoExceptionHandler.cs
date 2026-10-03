@@ -22,6 +22,8 @@ internal sealed class GeckoExceptionHandler(IProblemDetailsService problemDetail
             MissingTenantContextException => (StatusCodes.Status401Unauthorized, "No tenant in the access token."),
             InvalidStateTransitionException e => (StatusCodes.Status409Conflict, e.Message),
             DomainException e => (StatusCodes.Status422UnprocessableEntity, e.Message),
+            // Someone else saved the same row first (row version): re-read, never a 500.
+            DbUpdateConcurrencyException => (StatusCodes.Status409Conflict, "The record changed since you loaded it. Re-read it and try again."),
             DbUpdateException { InnerException: SqlException { Number: 2601 or 2627 } } => (StatusCodes.Status409Conflict, "A record with the same unique value already exists."),
             DbUpdateException { InnerException: SqlException { Number: 547 } } => (StatusCodes.Status422UnprocessableEntity, "The value violates a database rule (CHECK constraint)."),
             DbUpdateException { InnerException: SqlException { Number: 33504 } } => (StatusCodes.Status403Forbidden, "The row does not belong to your tenant."),

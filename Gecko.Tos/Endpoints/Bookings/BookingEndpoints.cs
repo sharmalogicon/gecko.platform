@@ -260,6 +260,8 @@ internal static class BookingEndpoints
         Guid id, SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
         ICallerPermissions scope, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
         var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         if (booking is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
         if (booking.Status != BookingRules.Open) return NotOpen(booking);
@@ -283,7 +285,6 @@ internal static class BookingEndpoints
         if (await CarrierRefTakenAsync(db, booking.BranchId, request.CarrierRef, booking.BookingId, ct) is { } taken) return taken;
 
         ApplyHeader(booking, request, header);
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "HEADER_CHANGED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
@@ -299,6 +300,8 @@ internal static class BookingEndpoints
         Guid id, ReplaceRequirementsRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
         ICallerPermissions scope, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
         var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         if (booking is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
         if (booking.Status != BookingRules.Open) return NotOpen(booking);
@@ -345,7 +348,6 @@ internal static class BookingEndpoints
         }
         booking.UpdatedAt = DateTimeOffset.UtcNow;   // bumps the booking's rowVersion: its lines are part of it
 
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "REQUIREMENTS_CHANGED", booking.UpdatedAt, ct);
         await tx.CommitAsync(ct);
@@ -358,6 +360,10 @@ internal static class BookingEndpoints
         Guid id, AssignContainersRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
     {
+        // Under the lock: the booking is still OPEN, its order type and lines are the
+        // ones these boxes are checked against, and no one else is filling the same line.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
         var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         if (booking is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
         if (booking.Status != BookingRules.Open) return NotOpen(booking);
@@ -366,7 +372,6 @@ internal static class BookingEndpoints
         if (plan is null) return TosSupport.Conflict($"Order type {booking.OrderTypeCode} no longer exists in master data.");
         var requirements = await db.EquipmentRequirements.Where(r => r.BookingId == id).ToListAsync(ct);
 
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         var problem = await AssignBoxesAsync(db, master, caller, booking, plan, requirements, request.Containers, request.Source, ct);
         if (problem?.Invalid is { } invalid) return invalid;
         if (problem?.Refused is { } refused) return refused;
@@ -380,6 +385,8 @@ internal static class BookingEndpoints
         Guid id, Guid bookingContainerId, TosDbContext db, IMasterDataReferences master, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
         var booking = await db.Bookings.AsNoTracking().SingleOrDefaultAsync(b => b.BookingId == id, ct);
         var box = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == bookingContainerId && x.BookingId == id, ct);
         if (booking is null || box is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
@@ -391,8 +398,8 @@ internal static class BookingEndpoints
                 "A box with history stays on the booking; close the booking when the work is over.");
 
         End(box, "UNASSIGNED", steps, caller, time);
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
-        await db.SaveChangesAsync(ct);
+        // The gate may complete a step of this box at the same moment: the row versions decide, and the loser gets a 409.
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_UNASSIGNED", time.GetUtcNow(), ct);
         await tx.CommitAsync(ct);
         return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
@@ -417,6 +424,8 @@ internal static class BookingEndpoints
         // Cancelling needs tos.booking.cancel, closing needs manage — the row check
         // uses the same permission the endpoint asked for, at the booking's branch.
         var permission = cancel ? TosPermissions.BookingCancel : TosPermissions.BookingManage;
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, id, ct);
         var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         if (booking is null || !scope.HasAt(permission, booking.BranchId)) return TypedResults.NotFound();
         if (booking.Status != BookingRules.Open) return NotOpen(booking);
@@ -452,12 +461,22 @@ internal static class BookingEndpoints
         foreach (var box in boxes.Where(b => b.EndedAt is null))
             End(box, cancel ? "BOOKING_CANCELLED" : "BOOKING_CLOSED", steps.Where(s => s.BookingContainerId == box.BookingContainerId), caller, time);
 
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, cancel ? "CANCELLED" : "CLOSED", now, ct);
         await tx.CommitAsync(ct);
         return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
     }
+
+    /// <summary>
+    /// Serialises every change to ONE booking's header, lines and boxes. The database
+    /// reads under READ_COMMITTED_SNAPSHOT, where nothing waits for anything: two clerks
+    /// filling the last place on a line would both see it free, and a box could land on
+    /// a booking being cancelled. An update lock on the booking row, taken first in the
+    /// transaction, makes the second writer wait for the first to commit, and every read
+    /// after it sees that commit. Other bookings are not affected.
+    /// </summary>
+    private static Task LockAsync(TosDbContext db, Guid bookingId, CancellationToken ct) =>
+        db.Database.ExecuteSqlInterpolatedAsync($"SELECT 1 FROM booking.booking WITH (UPDLOCK, HOLDLOCK) WHERE booking_id = {bookingId}", ct);
 
     private static void End(BookingContainer box, string reason, IEnumerable<MovementPlan> steps, ITenantContext caller, TimeProvider time)
     {

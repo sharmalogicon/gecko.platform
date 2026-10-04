@@ -16,7 +16,7 @@ namespace Gecko.MasterData.Endpoints.Commercial;
 public sealed record OrderTypeResponse(
     Guid OrderTypeId, string OrderTypeCode, string DescriptionEn, string? DescriptionLocal,
     string DirectionCode, Guid? ServiceTypeId, string? ServiceCode, string CargoClassCode,
-    string? BookingTypeCode, bool IsActive, string RowVersion);
+    string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false);
 
 public sealed record OrderTypeDetailResponse(
     OrderTypeResponse OrderType,
@@ -45,13 +45,17 @@ public sealed record SaveOrderTypeRequest(
     // would reject every code the customer already has painted on their paperwork.
     [property: Required, RegularExpression("^[A-Z0-9][A-Z0-9 /()._-]{0,49}$", ErrorMessage = "Upper-case letters, digits, spaces and / ( ) . _ - , up to 50 chars — e.g. EXP CY/CY.")] string OrderTypeCode,
     [property: Required, MaxLength(255)] string DescriptionEn,
-    [property: Required, MaxLength(20)] string DirectionCode,
+    // Not on the form any more (owner 2026-10-04): derived from the booking type when left out.
+    [property: MaxLength(20)] string? DirectionCode,
     [property: Required, MaxLength(20)] string CargoClassCode,
     [property: MaxLength(255)] string? DescriptionLocal = null,
     [property: MaxLength(15)] string? ServiceCode = null,
     [property: MaxLength(20)] string? BookingTypeCode = null,
     bool IsActive = true,
-    string? RowVersion = null);
+    string? RowVersion = null,
+    // gecko_master 27: on = a booking needs a vessel call and real ports; off = no vessel / port validation.
+    // Null = leave as it is (off on create).
+    bool? RequiresVesselSchedule = null);
 
 public sealed record OrderTypeMovementItem(
     [property: Required, MaxLength(20)] string MovementCode,
@@ -178,6 +182,10 @@ internal static class OrderTypeEndpoints
         if (!db.TrySetExpectedVersion(orderType, request.RowVersion))
             return MasterDataSupport.InvalidReference("rowVersion", "Send the rowVersion you received when reading the record.");
         if (await ValidateAsync(db, request, ct) is { } problem) return problem;
+        if (request.RequiresVesselSchedule == false
+            && await db.OrderTypeMovements.AnyAsync(m => m.OrderTypeId == orderType.OrderTypeId && m.RequireVesselVoyage, ct))
+            return MasterDataSupport.InvalidReference("requiresVesselSchedule",
+                "A step of this order type requires the vessel/voyage at the gate; untick that step first.");
 
         await ApplyAsync(db, orderType, request, ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
@@ -222,6 +230,8 @@ internal static class OrderTypeEndpoints
                 errors.Add(i, "sequenceNo", $"Two steps share sequence number {m.SequenceNo}.");
             if (m.PudoMode is not null && !modes.Contains(m.PudoMode))
                 errors.Add(i, "pudoMode", $"'{m.PudoMode}' is not a PICKUP_DROPOFF_MODE.");
+            if (m.RequireVesselVoyage && !orderType.RequiresVesselSchedule)
+                errors.Add(i, "requireVesselVoyage", $"{orderType.OrderTypeCode} does not require a vessel schedule; tick that on the order type first.");
         }
 
         // 1, 2, 3 with no gaps: the gate walks the sequence, and a hole in it means
@@ -396,9 +406,12 @@ internal static class OrderTypeEndpoints
     {
         orderType.DescriptionEn = request.DescriptionEn;
         orderType.DescriptionLocal = request.DescriptionLocal;
-        orderType.DirectionCode = request.DirectionCode.ToUpperInvariant();
-        orderType.CargoClassCode = request.CargoClassCode.ToUpperInvariant();
         orderType.BookingTypeCode = request.BookingTypeCode?.ToUpperInvariant();
+        orderType.DirectionCode = request.DirectionCode?.ToUpperInvariant()
+                                  ?? DirectionOf(orderType.BookingTypeCode)
+                                  ?? (string.IsNullOrEmpty(orderType.DirectionCode) ? "DOMESTIC" : orderType.DirectionCode);
+        orderType.CargoClassCode = request.CargoClassCode.ToUpperInvariant();
+        if (request.RequiresVesselSchedule is { } requires) orderType.RequiresVesselSchedule = requires;
         orderType.IsActive = request.IsActive;
         orderType.ServiceTypeId = request.ServiceCode is null
             ? null
@@ -406,11 +419,23 @@ internal static class OrderTypeEndpoints
                 .Select(s => (Guid?)s.ServiceTypeId).SingleOrDefaultAsync(ct);
     }
 
+    /// <summary>
+    /// The direction the gate and the handover-mode lists read, derived from the booking type
+    /// (owner 2026-10-04: no longer typed on the order type form).
+    /// </summary>
+    private static string? DirectionOf(string? bookingTypeCode) => bookingTypeCode switch
+    {
+        "EXPORT_BOOKING" or "EMPTY_RELEASE" => "EXPORT",
+        "IMPORT_DO" or "EMPTY_RETURN" => "IMPORT",
+        null => null,
+        _ => "DOMESTIC",
+    };
+
     private static async Task<ValidationProblem?> ValidateAsync(
         MasterDataDbContext db, SaveOrderTypeRequest request, CancellationToken ct)
     {
-        var direction = request.DirectionCode.ToUpperInvariant();
-        if (!await db.DirectionTypes.AnyAsync(d => d.Code == direction && d.IsActive, ct))
+        if (request.DirectionCode?.ToUpperInvariant() is { } direction
+            && !await db.DirectionTypes.AnyAsync(d => d.Code == direction && d.IsActive, ct))
             return MasterDataSupport.InvalidReference("directionCode", $"Unknown direction '{direction}'.");
 
         var cargoClass = request.CargoClassCode.ToUpperInvariant();
@@ -469,5 +494,5 @@ internal static class OrderTypeEndpoints
         select new OrderTypeResponse(
             o.OrderTypeId, o.OrderTypeCode, o.DescriptionEn, o.DescriptionLocal, o.DirectionCode,
             o.ServiceTypeId, s == null ? null : s.ServiceCode, o.CargoClassCode, o.BookingTypeCode,
-            o.IsActive, Convert.ToBase64String(o.RowVersion));
+            o.IsActive, Convert.ToBase64String(o.RowVersion), o.RequiresVesselSchedule);
 }

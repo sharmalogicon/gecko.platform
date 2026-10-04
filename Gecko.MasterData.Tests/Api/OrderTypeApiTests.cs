@@ -22,7 +22,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
     private static object Header(string code, string description = "Order type test", bool isActive = true, string? rowVersion = null) => new
     {
         orderTypeCode = code, descriptionEn = description, descriptionLocal = "ทดสอบ",
-        directionCode = "EXPORT", cargoClassCode = "GENERAL", serviceCode = "CY-CY", bookingTypeCode = "EXPORT_BOOKING",
+        directionCode = "EXPORT", cargoClassCode = "GENERAL", serviceCode = "CY-CY", bookingTypeCode = "EXPORT_BOOKING", requiresVesselSchedule = true,
         isActive, rowVersion,
     };
 
@@ -73,6 +73,42 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
 
             Assert.Equal(HttpStatusCode.NoContent, (await sct.DeleteAsync(RowVersions.WithVersion(url, inactive.RowVersion), ct)).StatusCode);
             Assert.Equal(HttpStatusCode.NotFound, (await sct.GetAsync(url, ct)).StatusCode);
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, url, ct); }
+    }
+
+    /// <summary>
+    /// Owner 2026-10-04: the direction is no longer typed — it follows the booking type — and
+    /// "requires vessel schedule" is one tick per order type. A step may demand the vessel/voyage
+    /// at the gate only when the order type is tied to a vessel.
+    /// </summary>
+    [Fact]
+    public async Task The_direction_follows_the_booking_type_and_a_vessel_step_needs_the_vessel_schedule_tick()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var code = NewCode();
+        var url = Url(code);
+        try
+        {
+            var created = await Read<Detail>(await sct.PostAsJsonAsync(OrderTypes, new
+            {
+                orderTypeCode = code, descriptionEn = "Domestic move", cargoClassCode = "GENERAL", bookingTypeCode = "STORAGE",
+            }, ct), HttpStatusCode.Created, ct);
+            Assert.Equal(("DOMESTIC", false), (created.OrderType.DirectionCode, created.OrderType.RequiresVesselSchedule));
+
+            var vesselStep = new object[] { new { movementCode = "GIF", sequenceNo = 1, requireVesselVoyage = true } };
+            await ExpectFieldAsync(await sct.PutAsJsonAsync($"{url}/movements",
+                new { rowVersion = created.OrderType.RowVersion, movements = vesselStep }, ct), "movements[0].requireVesselVoyage", ct);
+
+            var tied = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Import, by vessel", cargoClassCode = "GENERAL", bookingTypeCode = "IMPORT_DO",
+                requiresVesselSchedule = true, rowVersion = created.OrderType.RowVersion,
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.Equal(("IMPORT", true), (tied.DirectionCode, tied.RequiresVesselSchedule));
+            await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements",
+                new { rowVersion = tied.RowVersion, movements = vesselStep }, ct), HttpStatusCode.OK, ct);
         }
         finally { await RowVersions.DeleteCurrentAsync(sct, url, ct); }
     }
@@ -283,7 +319,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
     }
 
     private sealed record OrderType(Guid OrderTypeId, string OrderTypeCode, string DescriptionEn, string DirectionCode,
-        string? ServiceCode, string CargoClassCode, string? BookingTypeCode, bool IsActive, string RowVersion);
+        string? ServiceCode, string CargoClassCode, string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false);
     private sealed record Step(string MovementCode, short SequenceNo, bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, string? PudoMode);
     private sealed record Charge(string ChargeCode, string? MovementCode, string PaymentTo, string? PaymentTermCode, bool IsValueAddedService);
     private sealed record Detail(OrderType OrderType, List<Step> Movements, List<Charge> Charges);

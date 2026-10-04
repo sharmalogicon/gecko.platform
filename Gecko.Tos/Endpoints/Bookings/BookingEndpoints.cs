@@ -879,7 +879,9 @@ internal static class BookingEndpoints
         BranchClock.Branch Branch, OrderTypePlanRef Plan, PartyRef Line,
         PartyRef? Agent, PartyRef? Customer, PartyRef? Forwarder, PartyRef? Haulier,
         VesselCall? Call, VesselCallLine? CallLine,
-        PortRef? Pol, PortRef? Pod, PortRef? Fpd, CommodityRef? Commodity, string? CargoCategory);
+        PortRef? Pol, PortRef? Pod, PortRef? Fpd, CommodityRef? Commodity, string? CargoCategory,
+        // An order type that does not require a vessel schedule: the vessel call the clerk entered, stored unchecked.
+        Guid? CallAsEntered = null);
 
     private static async Task<Header?> ResolveHeaderAsync(
         TosDbContext db, IMasterDataReferences master, BranchClock clock, SaveBookingRequest request,
@@ -919,10 +921,14 @@ internal static class BookingEndpoints
             else resolved[field] = party;
         }
 
-        // D-2: the booking POINTS at the call. Required when any step needs a vessel/voyage.
+        // D-2: the booking POINTS at the call. Owner 2026-10-04: the order type's "requires vessel
+        // schedule" decides; when it is off the call is neither required nor checked (kept as entered),
+        // and the ports are optional.
+        var scheduled = plan?.RequiresVesselSchedule ?? true;
         VesselCall? call = null;
         VesselCallLine? callLine = null;
-        if (request.VesselCallId is { } callId)
+        if (!scheduled) { }
+        else if (request.VesselCallId is { } callId)
         {
             call = await db.VesselCalls.AsNoTracking().SingleOrDefaultAsync(c => c.VesselCallId == callId, ct);
             if (call is null) errors.Add("vesselCallId", "Unknown vessel call.");
@@ -935,9 +941,11 @@ internal static class BookingEndpoints
                     errors.Add("vesselCallId", $"{line.PartyCode} is not on {call.CallRef}. Add the line and its voyage to the call first.");
             }
         }
-        else if (plan is { RequiresVesselCall: true })
-            errors.Add("vesselCallId", $"{plan.OrderTypeCode} needs a vessel call: its {string.Join(", ", plan.Steps.Where(s => s.RequireVesselVoyage).Select(s => s.MovementCode))} step(s) require the vessel/voyage.");
+        else if (plan is not null)
+            errors.Add("vesselCallId", $"{plan.OrderTypeCode} requires a vessel schedule: pick the vessel call.");
 
+        // Ports are optional when the order type is not tied to a vessel, but one that IS entered
+        // must be a real port: the booking stores a port as id + code (ck_booking__*_pair).
         var ports = await master.PortsAsync(new[] { request.PolPortCode, request.PodPortCode, request.FpdPortCode }.Select(p => p ?? ""), ct);
         PortRef? Port(string field, string? raw)
         {
@@ -967,7 +975,7 @@ internal static class BookingEndpoints
             errors.Add("carrierRef", "The B/L or booking number is required.");
         if (plan?.BookingTypeCode is ExportBooking or ImportDo && request.CustomerCode.Clean() is null)
             errors.Add("customerCode", "The customer is required on an export booking or an import D/O.");
-        if (plan?.BookingTypeCode is ExportBooking)
+        if (scheduled && plan?.BookingTypeCode is ExportBooking)
         {
             if (request.PolPortCode.Clean() is null) errors.Add("polPortCode", "The loading port is required on an export booking.");
             if (request.PodPortCode.Clean() is null && request.FpdPortCode.Clean() is null)
@@ -986,7 +994,8 @@ internal static class BookingEndpoints
         return branch is null || plan is null || resolved["lineCode"] is null
             ? null
             : new Header(branch, plan, resolved["lineCode"]!, resolved["agentCode"], resolved["customerCode"],
-                resolved["forwarderCode"], resolved["haulierCode"], call, callLine, pol, pod, fpd, commodity, category);
+                resolved["forwarderCode"], resolved["haulierCode"], call, callLine, pol, pod, fpd, commodity, category,
+                scheduled ? null : request.VesselCallId);
     }
 
     private static void ApplyHeader(Booking b, SaveBookingRequest request, Header h)
@@ -1002,7 +1011,7 @@ internal static class BookingEndpoints
         b.CustomerPartyId = h.Customer?.PartyId; b.CustomerPartyCode = h.Customer?.PartyCode;
         b.ForwarderPartyId = h.Forwarder?.PartyId; b.ForwarderPartyCode = h.Forwarder?.PartyCode;
         b.HaulierPartyId = h.Haulier?.PartyId; b.HaulierPartyCode = h.Haulier?.PartyCode;
-        b.VesselCallId = h.Call?.VesselCallId;
+        b.VesselCallId = h.Call?.VesselCallId ?? h.CallAsEntered;
         b.VesselCallLineId = h.CallLine?.VesselCallLineId;
         b.PolPortId = h.Pol?.PortId; b.PolPortCode = h.Pol?.PortCode;
         b.PodPortId = h.Pod?.PortId; b.PodPortCode = h.Pod?.PortCode;

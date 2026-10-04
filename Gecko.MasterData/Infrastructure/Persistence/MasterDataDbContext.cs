@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Gecko.MasterData.Infrastructure.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -2817,6 +2817,7 @@ public partial class MasterDataDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("booking_type_code");
+            entity.Property(e => e.RequiresVesselSchedule).HasColumnName("requires_vessel_schedule");
             entity.Property(e => e.CargoClassCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)

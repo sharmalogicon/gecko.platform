@@ -187,7 +187,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(orderTypeCodes);
         var orderTypes = await db.OrderTypes.AsNoTracking()
             .Where(o => codes.Contains(o.OrderTypeCode))
-            .Select(o => new { o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode, o.BookingTypeCode })
+            .Select(o => new { o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode, o.BookingTypeCode, o.RequiresVesselSchedule })
             .ToListAsync(ct);
         var ids = orderTypes.Select(o => o.OrderTypeId).ToList();
 
@@ -209,7 +209,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         return orderTypes.ToDictionary(
             o => o.OrderTypeCode,
             o => new OrderTypePlanRef(o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode,
-                o.BookingTypeCode, steps[o.OrderTypeId].ToList()),
+                o.BookingTypeCode, steps[o.OrderTypeId].ToList(), o.RequiresVesselSchedule),
             StringComparer.OrdinalIgnoreCase);
     }
 

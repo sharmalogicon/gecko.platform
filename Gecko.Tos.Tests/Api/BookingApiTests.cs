@@ -325,7 +325,7 @@ public sealed class BookingApiTests(TosApiFactory api)
             };
 
             // EXP CY/CY's FULL_IN requires the vessel/voyage (MDM gate rule).
-            Assert.Contains("FULL_IN", await ExpectAsync(await client.PostAsJsonAsync(Bookings, Export(null), ct), HttpStatusCode.BadRequest, ct));
+            Assert.Contains("requires a vessel schedule", await ExpectAsync(await client.PostAsJsonAsync(Bookings, Export(null), ct), HttpStatusCode.BadRequest, ct));
             Assert.Contains("is cancelled", await ExpectAsync(await client.PostAsJsonAsync(Bookings, Export(cancelled.VesselCallId, "RCLU"), ct), HttpStatusCode.BadRequest, ct));
             Assert.Contains("MAEU is not on", await ExpectAsync(await client.PostAsJsonAsync(Bookings, Export(open.VesselCallId, "MAEU"), ct), HttpStatusCode.BadRequest, ct));
 
@@ -748,6 +748,47 @@ public sealed class BookingApiTests(TosApiFactory api)
             Assert.True(amended.AllowLateGateIn);
             Assert.Equal("Keep dry, stack max 2", amended.SpecialInstruction);
             Assert.Null(amended.TotalQty);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
+
+    /// <summary>
+    /// Owner 2026-10-04: the order type's "requires vessel schedule" decides. Off (a depot-only
+    /// or domestic move): no vessel or port validation — what the clerk entered is stored as is.
+    /// On: the vessel call is required and checked.
+    /// </summary>
+    [Fact]
+    public async Task Only_an_order_type_that_requires_a_vessel_schedule_checks_the_vessel_and_the_ports()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            // IMP CY/CY at SCT does not require a vessel schedule (no step needs the vessel/voyage).
+            var enteredCall = Guid.NewGuid();
+            var loose = await CreateAsync(client, new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                vesselCallId = enteredCall, fpdPortCode = "thlch",
+            }, ct);
+            Assert.Equal((enteredCall, (string?)null, "THLCH"), (loose.Booking.VesselCallId!.Value, loose.Booking.PolPortCode, loose.Booking.FpdPortCode));
+
+            // A port that IS entered must still be a real one: the booking keeps a port as id + code.
+            var typo = await client.PostAsJsonAsync(Bookings, new
+            {
+                branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef = carrierRef + "T",
+                polPortCode = "XXNOPE",
+            }, ct);
+            Assert.Contains("\"polPortCode\"", await ExpectAsync(typo, HttpStatusCode.BadRequest, ct));
+
+            // EXP CY/CY does: no call, no booking.
+            var strict = await client.PostAsJsonAsync(Bookings, new
+            {
+                branchId = SctLcb01, orderTypeCode = "EXP CY/CY", lineCode = "MAEU", customerCode = "CUS-BKF", carrierRef = carrierRef + "E",
+                polPortCode = "THLCH", podPortCode = "SGSIN",
+            }, ct);
+            Assert.Contains("requires a vessel schedule", await ExpectAsync(strict, HttpStatusCode.BadRequest, ct));
         }
         finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }

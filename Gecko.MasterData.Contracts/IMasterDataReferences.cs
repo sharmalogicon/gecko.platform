@@ -219,7 +219,9 @@ public sealed record PortRef(Guid PortId, string PortCode, string Name, string? 
 public sealed record OrderTypePlanRef(
     Guid OrderTypeId, string OrderTypeCode, bool IsActive,
     string DirectionCode, string CargoClassCode, string? BookingTypeCode,
-    IReadOnlyList<OrderTypeStepRef> Steps)
+    IReadOnlyList<OrderTypeStepRef> Steps,
+    // gecko_master 27: a booking of this order type needs a vessel call and real ports.
+    bool RequiresVesselSchedule = false)
 {
     /// <summary>Any step demands a vessel call — the booking must then name one.</summary>
     public bool RequiresVesselCall => Steps.Any(s => s.RequireVesselVoyage);

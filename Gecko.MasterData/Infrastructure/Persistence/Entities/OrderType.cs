@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace Gecko.MasterData.Infrastructure.Persistence.Entities;
@@ -22,6 +22,9 @@ public partial class OrderType
     public string CargoClassCode { get; set; } = null!;
 
     public string? BookingTypeCode { get; set; }
+
+    /// <summary>gecko_master 27: a booking of this order type is tied to a vessel (call, ports validated).</summary>
+    public bool RequiresVesselSchedule { get; set; }
 
     public bool IsActive { get; set; }
 

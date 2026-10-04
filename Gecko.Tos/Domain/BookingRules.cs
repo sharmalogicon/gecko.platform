@@ -19,6 +19,12 @@ public static class BookingRules
     public const string Completed = "COMPLETED";
     public const string Expired = "EXPIRED";
 
+    // Booking types: Vector's four (owner 2026-10-04, gecko_master 29).
+    public const string Import = "IMPORT";
+    public const string Export = "EXPORT";
+    public const string Repo = "REPO";
+    public const string Internal = "INTERNAL";
+
     public static readonly IReadOnlySet<string> Statuses = new HashSet<string> { Open, Cancelled, Closed };
     public static readonly IReadOnlySet<string> Progresses = new HashSet<string> { NotStarted, InProgress, Completed, Expired, Cancelled, Closed };
 
@@ -110,4 +116,24 @@ public static class BookingRules
         status != Open ? $"Only an OPEN booking can be cancelled; this one is {status}."
         : stepsDone > 0 ? $"{stepsDone} gate step(s) are already done. Close the booking instead — cancelling would pretend they never happened."
         : null;
+
+    /// <summary>
+    /// What the desktop makes mandatory on the header (Vector BookingEntry.cs:168-207, 2548), on
+    /// Vector's four booking types (owner 2026-10-04): the customer on every booking; the loading
+    /// and destination ports on an IMPORT or EXPORT whose order type requires a vessel schedule.
+    /// </summary>
+    public static IReadOnlyList<(string Field, string Message)> MissingHeaderFields(
+        string? bookingTypeCode, bool requiresVesselSchedule, bool hasCustomer, bool hasLoadingPort, bool hasDestinationPort)
+    {
+        var missing = new List<(string, string)>();
+        if (bookingTypeCode is null) return missing;   // unknown order type: reported on its own
+        if (!hasCustomer) missing.Add(("customerCode", "The customer is required on every booking."));
+        if (requiresVesselSchedule && bookingTypeCode is Import or Export)
+        {
+            var kind = bookingTypeCode == Import ? "an import" : "an export";
+            if (!hasLoadingPort) missing.Add(("polPortCode", $"The loading port is required on {kind} booking."));
+            if (!hasDestinationPort) missing.Add(("fpdPortCode", $"The destination port is required on {kind} booking."));
+        }
+        return missing;
+    }
 }

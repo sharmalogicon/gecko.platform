@@ -236,7 +236,7 @@ public sealed class BookingApiTests(TosApiFactory api)
 
         var dO = await FindAsync("BK-SCT-LCB01-2609-00002");
         var detail = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{dO.BookingId}", ct))!;
-        Assert.Equal(("IMP CY/CY", "IMPORT", "IMPORT_DO"), (detail.Booking.OrderTypeCode, detail.Booking.DirectionCode, detail.Booking.BookingTypeCode));
+        Assert.Equal(("IMP CY/CY", "IMPORT", "IMPORT"), (detail.Booking.OrderTypeCode, detail.Booking.DirectionCode, detail.Booking.BookingTypeCode));
         Assert.Equal(3, detail.Containers.Count);
         Assert.All(detail.Containers, box =>
             Assert.Equal(["FULL_IN", "FULL_OUT", "MTY_IN"], box.Steps.Select(s => s.MovementCode)));
@@ -277,7 +277,7 @@ public sealed class BookingApiTests(TosApiFactory api)
                 [new { containerNo = Gp20A, declaredSealNo = "ML1234567" }, new { containerNo = Gp20B.ToLowerInvariant() }]), ct);
 
             Assert.Matches(@"^BK-SCT-LCB01-\d{4}-\d{5}$", created.Booking.OrderNo);   // the depot's own series (D-9)
-            Assert.Equal(("IMPORT", "IMPORT_DO", "GENERAL"), (created.Booking.DirectionCode, created.Booking.BookingTypeCode, created.Booking.CargoClassCode));
+            Assert.Equal(("IMPORT", "IMPORT", "GENERAL"), (created.Booking.DirectionCode, created.Booking.BookingTypeCode, created.Booking.CargoClassCode));
             Assert.Equal(("OPEN", "NOT_STARTED"), (created.Booking.Status, created.Booking.Progress));
             Assert.Equal((2, 2), (created.QtyRequired, created.QtyAssigned));
 
@@ -706,6 +706,12 @@ public sealed class BookingApiTests(TosApiFactory api)
             Assert.Contains("\"carrierRef\"", await ExpectAsync(noBl, HttpStatusCode.BadRequest, ct));
             var noCustomer = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", carrierRef }, ct);
             Assert.Contains("\"customerCode\"", await ExpectAsync(noCustomer, HttpStatusCode.BadRequest, ct));
+            // Owner 2026-10-04: a customer on every booking type, depot moves included.
+            foreach (var depotMove in new[] { "REPO IN", "INT IN" })
+            {
+                var none = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = depotMove, lineCode = "MAEU", carrierRef }, ct);
+                Assert.Contains("\"customerCode\"", await ExpectAsync(none, HttpStatusCode.BadRequest, ct));
+            }
             var blind = await client.PostAsJsonAsync(Bookings, new { branchId = SctLcb01, orderTypeCode = "BLIND GATE IN", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef }, ct);
             Assert.Contains("made by the gate", await ExpectAsync(blind, HttpStatusCode.BadRequest, ct));
 

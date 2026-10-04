@@ -408,7 +408,7 @@ internal static class OrderTypeEndpoints
         orderType.DescriptionLocal = request.DescriptionLocal;
         orderType.BookingTypeCode = request.BookingTypeCode?.ToUpperInvariant();
         orderType.DirectionCode = request.DirectionCode?.ToUpperInvariant()
-                                  ?? DirectionOf(orderType.BookingTypeCode)
+                                  ?? DirectionOf(orderType.BookingTypeCode, orderType.DirectionCode)
                                   ?? (string.IsNullOrEmpty(orderType.DirectionCode) ? "DOMESTIC" : orderType.DirectionCode);
         orderType.CargoClassCode = request.CargoClassCode.ToUpperInvariant();
         if (request.RequiresVesselSchedule is { } requires) orderType.RequiresVesselSchedule = requires;
@@ -421,14 +421,16 @@ internal static class OrderTypeEndpoints
 
     /// <summary>
     /// The direction the gate and the handover-mode lists read, derived from the booking type
-    /// (owner 2026-10-04: no longer typed on the order type form).
+    /// (owner 2026-10-04: no longer typed on the order type form). Vector's four: EXPORT and IMPORT
+    /// are themselves; REPO and INTERNAL are DOMESTIC, except that an order type already
+    /// INTRA_TERMINAL (a yard move) stays so.
     /// </summary>
-    private static string? DirectionOf(string? bookingTypeCode) => bookingTypeCode switch
+    private static string? DirectionOf(string? bookingTypeCode, string? currentDirection) => bookingTypeCode switch
     {
-        "EXPORT_BOOKING" or "EMPTY_RELEASE" => "EXPORT",
-        "IMPORT_DO" or "EMPTY_RETURN" => "IMPORT",
+        "EXPORT" => "EXPORT",
+        "IMPORT" => "IMPORT",
         null => null,
-        _ => "DOMESTIC",
+        _ => currentDirection == "INTRA_TERMINAL" ? "INTRA_TERMINAL" : "DOMESTIC",
     };
 
     private static async Task<ValidationProblem?> ValidateAsync(

@@ -22,7 +22,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
     private static object Header(string code, string description = "Order type test", bool isActive = true, string? rowVersion = null) => new
     {
         orderTypeCode = code, descriptionEn = description, descriptionLocal = "ทดสอบ",
-        directionCode = "EXPORT", cargoClassCode = "GENERAL", serviceCode = "CY-CY", bookingTypeCode = "EXPORT_BOOKING", requiresVesselSchedule = true,
+        directionCode = "EXPORT", cargoClassCode = "GENERAL", serviceCode = "CY-CY", bookingTypeCode = "EXPORT", requiresVesselSchedule = true,
         isActive, rowVersion,
     };
 
@@ -42,7 +42,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
         try
         {
             var created = await Read<Detail>(await sct.PostAsJsonAsync(OrderTypes, Header(code), ct), HttpStatusCode.Created, ct);
-            Assert.Equal((code, "CY-CY", "EXPORT_BOOKING"), (created.OrderType.OrderTypeCode, created.OrderType.ServiceCode, created.OrderType.BookingTypeCode));
+            Assert.Equal((code, "CY-CY", "EXPORT"), (created.OrderType.OrderTypeCode, created.OrderType.ServiceCode, created.OrderType.BookingTypeCode));
 
             var withSteps = await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements",
                 new { rowVersion = created.OrderType.RowVersion, movements = TwoSteps() }, ct), HttpStatusCode.OK, ct);
@@ -93,7 +93,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
         {
             var created = await Read<Detail>(await sct.PostAsJsonAsync(OrderTypes, new
             {
-                orderTypeCode = code, descriptionEn = "Domestic move", cargoClassCode = "GENERAL", bookingTypeCode = "STORAGE",
+                orderTypeCode = code, descriptionEn = "Domestic move", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL",
             }, ct), HttpStatusCode.Created, ct);
             Assert.Equal(("DOMESTIC", false), (created.OrderType.DirectionCode, created.OrderType.RequiresVesselSchedule));
 
@@ -103,12 +103,37 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
 
             var tied = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
             {
-                orderTypeCode = code, descriptionEn = "Import, by vessel", cargoClassCode = "GENERAL", bookingTypeCode = "IMPORT_DO",
+                orderTypeCode = code, descriptionEn = "Import, by vessel", cargoClassCode = "GENERAL", bookingTypeCode = "IMPORT",
                 requiresVesselSchedule = true, rowVersion = created.OrderType.RowVersion,
             }, ct), HttpStatusCode.OK, ct);
             Assert.Equal(("IMPORT", true), (tied.DirectionCode, tied.RequiresVesselSchedule));
-            await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements",
+            var stepped = await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements",
                 new { rowVersion = tied.RowVersion, movements = vesselStep }, ct), HttpStatusCode.OK, ct);
+
+            // Owner 2026-10-04: Vector's four. The old seven are retired; REPO / INTERNAL are DOMESTIC,
+            // but an order type already INTRA_TERMINAL stays so.
+            await ExpectFieldAsync(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Old code", cargoClassCode = "GENERAL", bookingTypeCode = "STORAGE",
+                rowVersion = stepped.OrderType.RowVersion,
+            }, ct), "bookingTypeCode", ct);
+            var repo = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Repo", cargoClassCode = "GENERAL", bookingTypeCode = "REPO",
+                requiresVesselSchedule = true, rowVersion = stepped.OrderType.RowVersion,
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.Equal("DOMESTIC", repo.DirectionCode);
+            var yard = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Yard move", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL",
+                directionCode = "INTRA_TERMINAL", requiresVesselSchedule = true, rowVersion = repo.RowVersion,
+            }, ct), HttpStatusCode.OK, ct);
+            var kept = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Yard move, renamed", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL",
+                requiresVesselSchedule = true, rowVersion = yard.RowVersion,
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.Equal("INTRA_TERMINAL", kept.DirectionCode);
         }
         finally { await RowVersions.DeleteCurrentAsync(sct, url, ct); }
     }
@@ -292,7 +317,7 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
 
         Assert.Contains("EXPORT", v.Directions.Select(d => d.Code));
         Assert.Contains("GENERAL", v.CargoClasses.Select(c => c.Code));
-        Assert.Contains("EXPORT_BOOKING", v.BookingTypes.Select(b => b.Code));
+        Assert.Equal(["EXPORT", "IMPORT", "INTERNAL", "REPO"], v.BookingTypes.Select(b => b.Code).Order());
         Assert.Contains("CY-CY", v.ServiceTypes.Select(s => s.Code));
         Assert.Equal(["DROPOFF", "NONE", "PICKUP", "PICKUP_DROPOFF"], v.PudoModes.Select(p => p.Code).Order());
         Assert.Contains(v.Movements, m => m is { Code: "GIF", Direction: "IN", FullEmpty: "FULL" });

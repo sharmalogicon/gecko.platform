@@ -1038,14 +1038,11 @@ internal static class BookingEndpoints
         // Vector BookingEntry.cs:168-207, 2548 — what the desktop makes mandatory (owner 2026-10-03).
         if (request.CarrierRef.Clean() is null)
             errors.Add("carrierRef", "The B/L or booking number is required.");
-        if (plan?.BookingTypeCode is ExportBooking or ImportDo && request.CustomerCode.Clean() is null)
-            errors.Add("customerCode", "The customer is required on an export booking or an import D/O.");
-        if (scheduled && plan?.BookingTypeCode is ExportBooking)
-        {
-            if (request.PolPortCode.Clean() is null) errors.Add("polPortCode", "The loading port is required on an export booking.");
-            if (request.PodPortCode.Clean() is null && request.FpdPortCode.Clean() is null)
-                errors.Add("fpdPortCode", "The destination port is required on an export booking.");
-        }
+        foreach (var (field, message) in BookingRules.MissingHeaderFields(plan?.BookingTypeCode, scheduled,
+                     hasCustomer: request.CustomerCode.Clean() is not null,
+                     hasLoadingPort: request.PolPortCode.Clean() is not null,
+                     hasDestinationPort: request.PodPortCode.Clean() is not null || request.FpdPortCode.Clean() is not null))
+            errors.Add(field, message);
 
         // The shipper's declared totals: stored as declared (not the sum of the boxes).
         if (request.TotalQty is <= 0) errors.Add("totalQty", "A declared quantity is more than zero; leave it out if unknown.");
@@ -1099,8 +1096,6 @@ internal static class BookingEndpoints
     }
 
     private const string BlindGateIn = "BLIND GATE IN";
-    private const string ExportBooking = "EXPORT_BOOKING";
-    private const string ImportDo = "IMPORT_DO";
     private const string LateGateNeedsOverride =
         "Only a user who may override cut-offs (tos.cutoff.override) can allow a late gate-in on a booking.";
 

@@ -200,7 +200,7 @@ internal static class ContainerEndpoints
             .Select(t => t.TypeCode)
             .SingleOrDefaultAsync(ct);
 
-        var enforceCheckDigit = await settings.GetBoolAsync(MasterDataSettings.EnforceCheckDigit, branchId, true, ct);
+        var enforceCheckDigit = await settings.GetBoolAsync(MasterDataSettings.EnforceCheckDigit, branchId, false, ct);
         var enforcePrefix = await settings.GetBoolAsync(MasterDataSettings.EnforceContainerPrefix, branchId, false, ct);
 
         var accepted = wellFormed
@@ -352,7 +352,7 @@ internal static class ContainerEndpoints
         if (!ContainerNumber.IsWellFormed(number))
             return MasterDataSupport.InvalidReference("containerNo", "Not an ISO 6346 container number.");
 
-        if (!checkDigitValid && await settings.GetBoolAsync(MasterDataSettings.EnforceCheckDigit, null, true, ct))
+        if (!checkDigitValid && await settings.GetBoolAsync(MasterDataSettings.EnforceCheckDigit, null, false, ct))
             return MasterDataSupport.InvalidReference("containerNo",
                 $"Check digit is wrong; expected {ContainerNumber.CheckDigitOf(number)}. " +
                 $"Set {MasterDataSettings.EnforceCheckDigit} = false if this depot accepts mis-stencilled boxes.");

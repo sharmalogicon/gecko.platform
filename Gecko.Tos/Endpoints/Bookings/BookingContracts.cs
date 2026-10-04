@@ -178,9 +178,12 @@ public sealed record LineFillResponse(short LineNo, string EquipmentTypeCode, sh
 
 /// <param name="Outcome">CREATED (saved now), REPLAYED (saved by an earlier try of the same clientLineId), REJECTED (see <see cref="Errors"/>).</param>
 /// <param name="Errors">Field (containerNo, lineNo, clientLineId, reeferSetTempC…; "" = the row) → messages. Null unless REJECTED.</param>
+/// <param name="Warnings">Same shape: things to look at on a row that WAS saved (e.g. containerNo: a wrong ISO 6346 check
+/// digit when the depot does not enforce it). Null when there are none.</param>
 public sealed record ContainerBatchItemResponse(
     int Index, Guid? ClientLineId, string? ContainerNo, string Outcome,
-    BookingContainerResponse? Line, IReadOnlyDictionary<string, string[]>? Errors);
+    BookingContainerResponse? Line, IReadOnlyDictionary<string, string[]>? Errors,
+    IReadOnlyDictionary<string, string[]>? Warnings = null);
 
 public sealed record ContainerBatchResponse(
     Guid BookingId, string OrderNo, int Created, int Replayed, int Rejected,

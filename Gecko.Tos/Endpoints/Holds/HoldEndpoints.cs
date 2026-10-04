@@ -165,7 +165,7 @@ internal static class HoldEndpoints
             if (!ContainerNumber.IsWellFormed(box))
                 errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
             else if (!ContainerNumber.IsValid(box)
-                     && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, null, true, ct))
+                     && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, null, false, ct))
                 errors.Add("containerNo",
                     $"{box} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(box)}). A hold on a mistyped number stops the wrong box — or nothing at all.");
         }

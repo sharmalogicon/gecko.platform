@@ -441,7 +441,8 @@ internal static class BookingEndpoints
             var box = created.GetValueOrDefault(i) ?? replayed.GetValueOrDefault(i);
             return box is not null
                 ? new ContainerBatchItemResponse(i, c.ClientLineId, box.ContainerNo, created.ContainsKey(i) ? "CREATED" : "REPLAYED",
-                    ToResponse(box, lineNoOf.GetValueOrDefault(box.EquipmentRequirementId), steps[box.BookingContainerId]), null)
+                    ToResponse(box, lineNoOf.GetValueOrDefault(box.EquipmentRequirementId), steps[box.BookingContainerId]), null,
+                    created.ContainsKey(i) ? assigned.WarningsOf(i) : null)
                 : new ContainerBatchItemResponse(i, c.ClientLineId, c.ContainerNo, "REJECTED", null, assigned.ErrorsOf(i));
         }).ToList();
 
@@ -489,7 +490,7 @@ internal static class BookingEndpoints
             else
             {
                 nominatedDigitOk = ContainerNumber.IsValid(nominate);
-                if (!nominatedDigitOk && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, true, ct))
+                if (!nominatedDigitOk && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, false, ct))
                     errors.Add("containerNo", $"{nominate} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(nominate)}).");
                 nominatedBox = (await master.ContainersAsync([nominate], ct)).GetValueOrDefault(nominate);
                 if (nominatedBox is null && !await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, booking.BranchId, true, ct))
@@ -687,9 +688,19 @@ internal static class BookingEndpoints
         Problem? Problem,
         List<(int Index, BookingContainer Box)> Created,
         List<(int Index, BookingContainer Box)> Replayed,
-        Dictionary<string, List<string>> Errors)
+        Dictionary<string, List<string>> Errors,
+        Dictionary<string, List<string>>? Warnings = null)
     {
         public static AssignResult Failed(Problem problem) => new(problem, [], [], []);
+
+        /// <summary>The warnings of item <paramref name="index"/>, keyed by field; null when there are none.</summary>
+        public Dictionary<string, string[]>? WarningsOf(int index)
+        {
+            var prefix = $"containers[{index}].";
+            var found = (Warnings ?? []).Where(e => e.Key.StartsWith(prefix, StringComparison.Ordinal))
+                .ToDictionary(e => e.Key[prefix.Length..], e => e.Value.ToArray());
+            return found.Count == 0 ? null : found;
+        }
 
         /// <summary>The errors of item <paramref name="index"/>, keyed by its field ("containerNo", "lineNo"...).</summary>
         public Dictionary<string, string[]> ErrorsOf(int index)
@@ -713,6 +724,7 @@ internal static class BookingEndpoints
         IReadOnlyList<EquipmentRequirement> requirements, IReadOnlyList<AssignContainerItem> items, string source, bool partial, CancellationToken ct)
     {
         var errors = new Dictionary<string, List<string>>();
+        var warnings = new Dictionary<string, List<string>>();
         var steps = BookingRules.PlanFor(plan);
         if (steps.Count == 0)
             return AssignResult.Failed(Problem.Of(TosSupport.Conflict($"Order type {plan.OrderTypeCode} has no steps in master data — the gate would not know what to do with a box.")));
@@ -723,7 +735,7 @@ internal static class BookingEndpoints
         var numbers = items.Select(i => ContainerNumber.Normalise(i.ContainerNo ?? "")).ToList();
         var registry = await master.ContainersAsync(numbers.Where(ContainerNumber.IsWellFormed), ct);
         var allowUnknown = await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, booking.BranchId, true, ct);
-        var enforceDigit = await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, true, ct);
+        var enforceDigit = await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, false, ct);
 
         var clientIds = items.Select(i => i.ClientLineId).OfType<Guid>().ToList();
         var already = clientIds.Count == 0 ? []
@@ -783,8 +795,10 @@ internal static class BookingEndpoints
                 if (numbers.Take(i).Contains(no)) { errors.Add($"{key}.containerNo", $"{no} is listed twice."); continue; }
 
                 digitOk = ContainerNumber.IsValid(no);
-                if (!digitOk && enforceDigit)
-                    errors.Add($"{key}.containerNo", $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
+                // Owner 2026-10-04: warn, do not refuse — unless the depot sets gate.enforce_check_digit.
+                if (!digitOk)
+                    (enforceDigit ? errors : warnings).Add($"{key}.containerNo",
+                        $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
 
                 known = registry.GetValueOrDefault(no);
                 if (known is null && !allowUnknown)
@@ -913,7 +927,7 @@ internal static class BookingEndpoints
                     Status = "PENDING",
                 });
         await db.SaveChangesAsync(ct);
-        return new AssignResult(null, toAdd, replayed, errors);
+        return new AssignResult(null, toAdd, replayed, errors, warnings);
     }
 
     /// <summary>Boxes that hold a place on each line: active now, or finished. An unassigned box frees its place.</summary>

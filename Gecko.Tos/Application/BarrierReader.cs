@@ -65,7 +65,7 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         }
 
         var checkDigitValid = ContainerNumber.IsValid(containerNo);
-        var enforceDigit = await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, branchId, true, ct);
+        var enforceDigit = await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, branchId, false, ct);
         if (GateRules.CheckDigit(containerNo, checkDigitValid, enforceDigit, ContainerNumber.CheckDigitOf(containerNo)) is { } digit)
             findings.Add(digit);
 

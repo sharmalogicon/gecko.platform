@@ -839,4 +839,34 @@ public sealed class BookingApiTests(TosApiFactory api)
         }
         finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }
+
+    /// <summary>Owner 2026-10-04 (CHECKDIGIT_WARNING_FOR_API): where the depot does not enforce it, a wrong check digit is saved with a warning.</summary>
+    [Fact]
+    public async Task A_wrong_check_digit_is_saved_with_a_warning_where_the_depot_does_not_enforce_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        await TestDatabase.SetSctSettingAsync("gate.enforce_check_digit", null, "false");
+        try
+        {
+            var booking = await CreateAsync(client, ImportDo(carrierRef), ct);
+            var misread = Gp20A[..10] + ((Gp20A[10] - '0' + 1) % 10);
+            var rows = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, booking.Booking.BookingId, ct,
+                new { clientLineId = Guid.NewGuid(), containerNo = misread },
+                new { clientLineId = Guid.NewGuid(), containerNo = "NOTABOX" }), HttpStatusCode.OK, ct));
+
+            var saved = rows.Items[0];
+            Assert.Equal("CREATED", saved.Outcome);
+            Assert.False(saved.Line!.IsCheckDigitValid);
+            Assert.Contains("check digit", Assert.Single(saved.Warnings!["containerNo"]));
+            // Not a container number at all is still a typo, refused.
+            Assert.Equal("REJECTED", rows.Items[1].Outcome);
+        }
+        finally
+        {
+            await TestDatabase.SetSctSettingAsync("gate.enforce_check_digit", null, "true");
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

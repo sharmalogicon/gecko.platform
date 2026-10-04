@@ -5,6 +5,7 @@ using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
 using Gecko.Tos.Application;
 using Gecko.Tos.Domain;
+using Gecko.Tos.Endpoints.Bookings;
 using Gecko.Tos.Infrastructure.Persistence;
 using Gecko.Tos.Infrastructure.Persistence.Entities;
 using Microsoft.AspNetCore.Builder;
@@ -57,6 +58,17 @@ internal static class GateEndpoints
             .WithSummary("Void an EIR and re-open the step it completed")
             .WithDescription("The number is kept and never reused (Q4). Reissue by recording the move again; the new EIR points back at this one.");
 
+        // Owner 2026-10-04 (GATE_IN_VECTOR_PARITY_FOR_API §1–§2): raise, pay, then gate.
+        gate.MapPost("/blind-orders", BookingEndpoints.RaiseBlindOrderAsync)
+            .RequireBranchPermission(TosPermissions.GateCreate)
+            .Validate<BlindOrderRequest>()
+            .WithSummary("Raise a BLIND GATE IN order for a box that came with no paperwork")
+            .WithDescription("One transaction: the booking, its line and the box. A retry for the same box answers 200 with the same order. Then price and pay at the window, then POST the gate move.");
+        gate.MapGet("/bookable-boxes", BookableBoxesAsync)
+            .RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("The boxes a gate clerk can pick, each with its next step")
+            .WithDescription("Open bookings at the depot; filter by the next step's direction (IN/OUT) and full/empty, leave out the boxes already on this truck. Search matches the order no, B/L, customer ref or container no.");
+
         gate.MapGet("/visits", ListVisitsAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("Trucks at the depot");
         gate.MapGet("/visits/{id:guid}", GetVisitAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("One truck visit and its boxes");
         gate.MapPost("/visits/{id:guid}/depart", DepartAsync).RequireBranchPermission(TosPermissions.GateCreate)
@@ -71,6 +83,64 @@ internal static class GateEndpoints
 
         return tos;
     }
+
+    // ── the box picker ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Vector's gate booking search (GateIn.cs:555) as a grid of boxes: open bookings at this depot,
+    /// each active box with its next step — the lowest PENDING step, the one the gate would complete.
+    /// The direction / full-empty filters read that step's MDM rules; <paramref name="excludeBookingContainerIds"/>
+    /// leaves out the boxes already on this truck.
+    /// </summary>
+    private static async Task<Results<Ok<PagedResult<BookableBoxResponse>>, ValidationProblem, ProblemHttpResult>> BookableBoxesAsync(
+        [AsParameters] ListQuery query, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, string? direction = null, string? fullEmpty = null, Guid[]? excludeBookingContainerIds = null)
+    {
+        if (branchId is null) return TosSupport.Invalid("branchId", "Which gate? A barrier belongs to a depot.");
+        if (!scope.HasAt(TosPermissions.GateView, branchId.Value)) return TosScope.OutsideYourBranches("You cannot read that depot's gate.");
+        var way = direction.Clean();
+        if (way is not null && way is not (GateRules.In or GateRules.Out)) return TosSupport.Invalid("direction", "Use IN (a drop-off) or OUT (a pick-up).");
+        var load = fullEmpty.Clean();
+        if (load is not null && load is not (GateRules.Full or GateRules.Empty)) return TosSupport.Invalid("fullEmpty", "Use FULL or EMPTY.");
+        var excluded = excludeBookingContainerIds ?? [];
+
+        var rows =
+            from x in db.BookingContainers.AsNoTracking()
+            join b in db.Bookings on x.BookingId equals b.BookingId
+            join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+            let next = db.MovementPlans.Where(p => p.BookingContainerId == x.BookingContainerId && p.Status == "PENDING")
+                .OrderBy(p => p.SequenceNo).FirstOrDefault()
+            where b.BranchId == branchId && b.Status == BookingRules.Open && x.EndedAt == null && next != null
+                  && !excluded.Contains(x.BookingContainerId)
+            select new { x, b, r.EquipmentTypeCode, next };
+
+        if (query.Search.Clean() is { } q)
+        {
+            var box = ContainerNumber.Normalise(q);
+            rows = rows.Where(r => r.b.OrderNo.Contains(q) || r.b.CarrierRef!.Contains(q) || r.b.CustomerRef!.Contains(q) || r.x.ContainerNo == box);
+        }
+
+        // The step's direction and full/empty are MDM rules: read them per order type, then filter.
+        var candidates = await rows.OrderByDescending(r => r.b.CreatedAt).ThenBy(r => r.x.ContainerNo).Take(MaxBookableBoxes).ToListAsync(ct);
+        var plans = await master.OrderTypePlansAsync(candidates.Select(r => r.b.OrderTypeCode).Distinct(), ct);
+        var picked = candidates
+            .Select(r => (Row: r, Rules: plans.GetValueOrDefault(r.b.OrderTypeCode)?.Steps.FirstOrDefault(s => s.OrderTypeMovementId == r.next!.OrderTypeMovementId)))
+            .Where(r => r.Rules is not null && (way is null || r.Rules.Direction == way) && (load is null || r.Rules.FullEmpty == load))
+            .ToList();
+
+        var page = Math.Max(query.Page ?? 1, 1);
+        var size = Math.Clamp(query.PageSize ?? 50, 1, 200);
+        var items = picked.Skip((page - 1) * size).Take(size).Select(p => new BookableBoxResponse(
+            p.Row.x.BookingContainerId, p.Row.b.BookingId, p.Row.b.OrderNo, p.Row.b.CarrierRef,
+            p.Row.b.BookingTypeCode, p.Row.b.OrderTypeCode, p.Row.b.LinePartyCode, p.Row.b.AgentPartyCode, p.Row.b.CustomerPartyCode,
+            p.Row.x.ContainerNo, p.Row.EquipmentTypeCode,
+            new BookableStepResponse(p.Row.next!.MovementPlanId, p.Row.next.SequenceNo, p.Row.next.MovementCode, p.Rules!.Direction, p.Rules.FullEmpty)))
+            .ToList();
+        return TypedResults.Ok(new PagedResult<BookableBoxResponse>(items, page, size, picked.Count));
+    }
+
+    /// <summary>The picker searches at most this many boxes, newest bookings first: the clerk types a B/L to narrow it.</summary>
+    private const int MaxBookableBoxes = 500;
 
     // ── preflight ───────────────────────────────────────────────────────────
 

@@ -149,6 +149,34 @@ public sealed record GateTransactionRequest(
     [property: MaxLength(40)] string? PaperlessCode = null,
     [property: MaxLength(20)] string? NextLocationCode = null);
 
+/// <summary>
+/// A box that arrives with no order (owner 2026-10-04, GATE_IN_VECTOR_PARITY_FOR_API §1): the gate
+/// raises a BLIND GATE IN order for it, the window prices and takes the cash, then the box gates in
+/// as usual. <see cref="EquipmentTypeCode"/> null = the registry's type for the box. The B/L is
+/// optional on BLIND GATE IN (Vector GateIn.cs:146); the customer is not (owner 2026-10-04).
+/// </summary>
+public sealed record BlindOrderRequest(
+    [property: Required] Guid? BranchId,
+    [property: Required, MaxLength(11)] string ContainerNo,
+    [property: Required, MaxLength(30)] string LineCode,
+    [property: MaxLength(30)] string? CustomerCode = null,
+    [property: MaxLength(20)] string? EquipmentTypeCode = null,
+    [property: MaxLength(40)] string? CarrierRef = null,
+    [property: MaxLength(30)] string? AgentCode = null,
+    [property: MaxLength(30)] string? HaulierCode = null,
+    [property: MaxLength(1000)] string? Remarks = null);
+
+/// <summary>
+/// One box the gate clerk can pick (GATE_IN_VECTOR_PARITY_FOR_API §2): the booking it is on and the
+/// step it would do next. <see cref="ContainerNo"/> null = a booked place not nominated yet.
+/// </summary>
+public sealed record BookableBoxResponse(
+    Guid BookingContainerId, Guid BookingId, string OrderNo, string? CarrierRef,
+    string BookingTypeCode, string OrderTypeCode, string LineCode, string? AgentCode, string? CustomerCode,
+    string? ContainerNo, string? EquipmentTypeCode, BookableStepResponse NextStep);
+
+public sealed record BookableStepResponse(Guid MovementPlanId, short SequenceNo, string MovementCode, string Direction, string FullEmpty);
+
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,
     string? RowVersion = null);

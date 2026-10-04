@@ -4,6 +4,7 @@ using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
 using Gecko.Tos.Application;
 using Gecko.Tos.Domain;
+using Gecko.Tos.Endpoints.Gate;
 using Gecko.Tos.Infrastructure.Persistence;
 using Gecko.Tos.Infrastructure.Persistence.Entities;
 using Microsoft.AspNetCore.Builder;
@@ -222,6 +223,75 @@ internal static class BookingEndpoints
             if (assigned.Problem?.Invalid is { } invalid) return invalid;
             if (assigned.Problem?.Refused is { } refused) return refused;
         }
+
+        await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
+        await tx.CommitAsync(ct);
+        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, users, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
+    }
+
+    /// <summary>
+    /// A box that came with no paperwork (owner 2026-10-04, GATE_IN_VECTOR_PARITY_FOR_API §1): the GATE
+    /// raises a BLIND GATE IN order for it — booking, one line and the box, in one transaction — so the
+    /// window can price it before the barrier (raise, pay, then gate). A retry for a box already on an
+    /// open BLIND GATE IN order at this depot answers 200 with that order. The booking page still refuses
+    /// BLIND GATE IN: only the gate knows a box arrived blind.
+    /// </summary>
+    internal static async Task<Results<CreatedAtRoute<BookingDetailResponse>, Ok<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>> RaiseBlindOrderAsync(
+        BlindOrderRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock, ITenantContext caller,
+        ICallerPermissions scope, CancellationToken ct)
+    {
+        var branchId = request.BranchId!.Value;
+        if (!scope.HasAt(TosPermissions.GateCreate, branchId))
+            return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
+
+        var containerNo = ContainerNumber.Normalise(request.ContainerNo);
+        if (!ContainerNumber.IsWellFormed(containerNo))
+            return TosSupport.Invalid("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+
+        var prior = await (
+            from x in db.BookingContainers.AsNoTracking()
+            join b in db.Bookings on x.BookingId equals b.BookingId
+            where x.ContainerNo == containerNo && x.EndedAt == null
+            select new { b.BookingId, b.OrderTypeCode, b.BranchId, b.Status }).FirstOrDefaultAsync(ct);
+        if (prior is not null && prior.OrderTypeCode == BlindGateIn && prior.Status == BookingRules.Open && prior.BranchId == branchId)
+            return TypedResults.Ok((await DetailAsync(db, clock, master, users, prior.BookingId, ct))!);
+
+        var equipmentType = request.EquipmentTypeCode.Clean()
+                            ?? (await master.ContainersAsync([containerNo], ct)).GetValueOrDefault(containerNo)?.EquipmentTypeCode;
+        var save = new SaveBookingRequest(request.BranchId, BlindGateIn, request.LineCode,
+            CarrierRef: request.CarrierRef, AgentCode: request.AgentCode, CustomerCode: request.CustomerCode,
+            HaulierCode: request.HaulierCode, Remarks: request.Remarks);
+
+        var errors = new Dictionary<string, List<string>>();
+        var header = await ResolveHeaderAsync(db, master, clock, save, errors, ct);
+        if (equipmentType is null)
+            errors.Add("equipmentTypeCode", $"{containerNo} is not in the registry: say what type of box it is.");
+        var requirements = equipmentType is null ? []
+            : await ResolveRequirementsAsync(master, [new RequirementItem(equipmentType, 1)], errors, ct);
+        if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
+        if (await CarrierRefTakenAsync(db, branchId, request.CarrierRef, null, ct) is { } taken) return taken;
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var booking = new Booking
+        {
+            TenantId = caller.TenantId(),
+            BranchId = branchId,
+            OrderNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.Booking, branchId, header.Branch.BranchCode, clock.LocalNow(header.Branch), ct),
+            Status = BookingRules.Open,
+            Source = "WALK_IN",
+        };
+        ApplyHeader(booking, save, header);
+        db.Bookings.Add(booking);
+        await db.SaveChangesAsync(ct);
+
+        var line = new EquipmentRequirement { TenantId = booking.TenantId, BookingId = booking.BookingId, LineNo = 1 };
+        ApplyRequirement(line, requirements.Single());
+        db.EquipmentRequirements.Add(line);
+        await db.SaveChangesAsync(ct);
+
+        var assigned = await AssignBoxesAsync(db, master, caller, booking, header.Plan, [line], [new AssignContainerItem(containerNo)], "GATE", partial: false, ct);
+        if (assigned.Problem?.Invalid is { } invalid) return invalid;
+        if (assigned.Problem?.Refused is { } refused) return refused;
 
         await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
@@ -1036,7 +1106,8 @@ internal static class BookingEndpoints
             errors.Add("validTo", "The release ends before it starts.");
 
         // Vector BookingEntry.cs:168-207, 2548 — what the desktop makes mandatory (owner 2026-10-03).
-        if (request.CarrierRef.Clean() is null)
+        // Vector GateIn.cs:146: on BLIND GATE IN (raised by the gate) the B/L stops being mandatory.
+        if (request.CarrierRef.Clean() is null && plan?.OrderTypeCode != BlindGateIn)
             errors.Add("carrierRef", "The B/L or booking number is required.");
         foreach (var (field, message) in BookingRules.MissingHeaderFields(plan?.BookingTypeCode, scheduled,
                      hasCustomer: request.CustomerCode.Clean() is not null,

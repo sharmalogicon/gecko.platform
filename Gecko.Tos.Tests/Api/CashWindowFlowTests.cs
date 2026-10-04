@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using Gecko.Revenue.Endpoints.Charges;
 using Gecko.Revenue.Endpoints.Window;
 using Gecko.Tos.Endpoints.Bookings;
 using Gecko.Tos.Endpoints.Gate;
@@ -82,6 +83,12 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
                 q => q.Boxes.Single().NextMovementCode == "FULL_OUT", "Revenue to see the gate-in", ct);
             var due = Assert.Single(quote.Boxes.Single().Due);
             Assert.Equal(("GATEFEE", "CUSTOMER", 150.00m, 10.50m), (due.ChargeCode, due.BillTo, due.Amount, due.TaxAmount));
+
+            // gecko_revenue 23: the booking statement already shows what this box will be charged, per movement.
+            var expected = (await client.GetFromJsonAsync<BookingStatementResponse>($"/api/revenue/charges/statement?orderNo={Uri.EscapeDataString(booking.Booking.OrderNo)}", ct))!;
+            var quoted = Assert.Single(expected.Boxes.Single().Lines, l => l.Charge.Status == "QUOTED");
+            Assert.Equal(("GATEFEE", "FULL_OUT", 150.00m), (quoted.Charge.ChargeCode, quoted.Charge.MovementCode, quoted.Charge.Amount));
+            Assert.Equal(160.50m, expected.Totals.ExpectedCash);
             Assert.Equal(160.50m, quote.Total);
 
             // "Today" is the DEPOT's day (Laem Chabang, +07:00), not the server's or the browser's.
@@ -156,6 +163,10 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
                 async () => (await client.GetFromJsonAsync<WindowBookingResponse>($"{Window}/bookings?orderNo={Uri.EscapeDataString(booking.Booking.OrderNo)}", ct))!,
                 q => q.Boxes.Single().Settled.Any(c => c.Status == "EARNED"), "the charge to be earned", ct);
             var earned = Assert.Single(settled.Boxes.Single().Settled);
+            // Paid and earned: the quote is retired, the statement shows the real line.
+            var after = (await client.GetFromJsonAsync<BookingStatementResponse>($"/api/revenue/charges/statement?orderNo={Uri.EscapeDataString(booking.Booking.OrderNo)}", ct))!;
+            Assert.DoesNotContain(after.Boxes.SelectMany(b => b.Lines), l => l.Charge.Status == "QUOTED");
+            Assert.Contains(after.Boxes.SelectMany(b => b.Lines), l => l.Charge.Status == "EARNED" && l.Charge.ChargeCode == "GATEFEE");
             Assert.Equal(("GATEFEE", 160.50m, coupon.CouponRef), (earned.ChargeCode, earned.Total, earned.CouponRef));
             Assert.Equal(gateOut.GateTransactionId, await TestDatabase.StayClosedByAsync(Box));
 

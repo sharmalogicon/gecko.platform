@@ -502,6 +502,7 @@ internal sealed class AutomaticCoupons(
 
         var orderType = (await master.OrderTypePlansAsync([plan.OrderTypeCode], ct)).GetValueOrDefault(plan.OrderTypeCode);
         var now = calendar.Now;
+        await RefreshQuotesAsync(plan, branch, orderType, now, ct);
 
         foreach (var box in boxes)
         {
@@ -533,6 +534,64 @@ internal sealed class AutomaticCoupons(
                     TruckCategoryCode: quote.Terms?.TruckCategoryCode, HaulierCode: quote.Terms?.HaulierCode),
                 ct);
         }
+    }
+
+    /// <summary>
+    /// The booking statement's expected charges (gecko_revenue 23, owner 2026-10-04): every current
+    /// box x every PENDING billable movement x its order-type charges, cash and credit, priced like
+    /// the window prices them (quotation, else the standard tariff), written as billing.charge rows
+    /// source QUOTE / status QUOTED. A cash charge no tariff prices is quoted at 0 with no schedule.
+    /// What is no longer expected — paid, billed at the gate, movement done, box gone — is CANCELLED
+    /// with its reason (DELETE is denied). Runs with the caller's SaveChanges / transaction.
+    /// </summary>
+    private async Task RefreshQuotesAsync(BookingPlan plan, BranchClockInfo branch, OrderTypePlanRef? orderType, DateTimeOffset now, CancellationToken ct)
+    {
+        if (orderType is null) return;
+        var boxes = await db.BookingPlanContainers.Where(b => b.BookingId == plan.BookingId && b.IsCurrent && b.EndReason == null).ToListAsync(ct);
+        var existing = await db.Charges.Where(c => c.BookingId == plan.BookingId && c.Source == ChargeSource.Quote && c.Status == ChargeStatus.Quoted).ToListAsync(ct);
+
+        var wanted = new Dictionary<(Guid, string, string, string, string), Charge>();
+        foreach (var box in boxes)
+            foreach (var step in CashQuoter.Steps(box).Where(st => st.Status == "PENDING"))
+            {
+                var rules = orderType.Steps.FirstOrDefault(r => string.Equals(r.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase));
+                if (rules is not { IsBillable: true }) continue;
+                var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);
+                var lines = quote.Lines.Where(l => l.Kind is QuoteLine.Movement or QuoteLine.Vas)
+                    .Concat(quote.BilledLater).Concat(quote.NoPrice);
+                foreach (var line in lines)
+                {
+                    var key = (box.BookingContainerId, step.MovementCode, line.ChargeCode, line.BillTo, line.PaymentTermCode);
+                    wanted.TryAdd(key, CashQuoter.ChargeFrom(plan, box, step.MovementCode, null, line, ChargeSource.Quote, ChargeStatus.Quoted, now));
+                }
+            }
+
+        foreach (var row in existing)
+        {
+            var key = (row.BookingContainerId!.Value, row.MovementCode!, row.ChargeCode!, row.BillTo!, row.PaymentTermCode!);
+            if (wanted.Remove(key, out var fresh))
+            {
+                // Same line, new price: keep the row, take the new figures and snapshot.
+                row.Quantity = fresh.Quantity; row.UnitRate = fresh.UnitRate; row.Amount = fresh.Amount;
+                row.TaxCode = fresh.TaxCode; row.TaxRate = fresh.TaxRate; row.TaxAmount = fresh.TaxAmount;
+                row.PricedForDate = fresh.PricedForDate; row.ScheduleId = fresh.ScheduleId; row.ScheduleNo = fresh.ScheduleNo;
+                row.ScheduleVersionNo = fresh.ScheduleVersionNo; row.ScheduleType = fresh.ScheduleType; row.ScopeRank = fresh.ScopeRank;
+                row.TosRateId = fresh.TosRateId; row.RateRowVersion = fresh.RateRowVersion; row.Specificity = fresh.Specificity;
+                row.PricingMethod = fresh.PricingMethod; row.BillingUnitCode = fresh.BillingUnitCode; row.PricesIncludeTax = fresh.PricesIncludeTax;
+                row.BaseRate = fresh.BaseRate; row.FreeUnits = fresh.FreeUnits; row.ChargeableQuantity = fresh.ChargeableQuantity;
+                row.ResolvedAt = fresh.ResolvedAt; row.PriceSnapshotJson = fresh.PriceSnapshotJson; row.PayerPartyCode = fresh.PayerPartyCode;
+                row.ContainerNo = fresh.ContainerNo; row.UpdatedAt = now;
+            }
+            else
+            {
+                row.Status = ChargeStatus.Cancelled;
+                row.CancelledAt = now;
+                row.CancelReason = "Quote no longer due: paid, billed at the gate, movement done or box removed.";
+                row.UpdatedAt = now;
+            }
+        }
+        db.Charges.AddRange(wanted.Values);
+        await db.SaveChangesAsync(ct);
     }
 
     /// <summary>The same box and movement always yield the same coupon id — TOS dedupes on it.</summary>

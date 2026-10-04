@@ -337,7 +337,8 @@ internal static class TestDatabase
             SELECT c.source, c.status, c.charge_code, c.container_no, c.payment_term_code, c.amount, c.tax_amount,
                    c.gate_transaction_id, c.truck_visit_id, c.is_trip_charge, c.cancel_reason
             FROM gecko_revenue.billing.charge c
-            WHERE c.booking_id IN (SELECT booking_id FROM booking.booking WHERE carrier_ref LIKE @prefix + '%');
+            WHERE c.booking_id IN (SELECT booking_id FROM booking.booking WHERE carrier_ref LIKE @prefix + '%')
+              AND c.source <> 'QUOTE';   -- the expected (quoted) lines are not charges raised (gecko_revenue 23)
             """;
         command.Parameters.AddWithValue("@prefix", carrierRefPrefix);
         var rows = new List<ChargeRow>();

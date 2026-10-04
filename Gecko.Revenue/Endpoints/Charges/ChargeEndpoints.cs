@@ -137,8 +137,18 @@ internal static class ChargeEndpoints
 
         var boxes = await db.BookingPlanContainers.AsNoTracking().Where(b => b.BookingId == plan.BookingId)
             .OrderBy(b => b.ContainerNo).ToListAsync(ct);
-        var lines = await db.Charges.AsNoTracking().Where(c => c.BookingId == plan.BookingId)
-            .OrderBy(c => c.CreatedAt).ThenBy(c => c.ChargeCode).ToListAsync(ct);
+        // gecko_revenue 23: the expected (QUOTED) lines of an open booking, next to what was paid / billed.
+        // A quote that no longer applies (CANCELLED) is history, not a line.
+        var open = plan.Status == "OPEN";
+        var lines = await db.Charges.AsNoTracking()
+            .Where(c => c.BookingId == plan.BookingId
+                        && !(c.Source == ChargeSource.Quote && (c.Status == ChargeStatus.Cancelled || !open)))
+            .OrderBy(c => c.MovementCode).ThenBy(c => c.CreatedAt).ThenBy(c => c.ChargeCode).ToListAsync(ct);
+        // Paid or billed before the quote was refreshed: the real line stands, the quote steps aside.
+        var settledKeys = lines.Where(c => c.Source != ChargeSource.Quote && c.Status != ChargeStatus.Cancelled)
+            .Select(c => (c.BookingContainerId, c.MovementCode, c.ChargeCode, c.BillTo)).ToHashSet();
+        lines = lines.Where(c => c.Source != ChargeSource.Quote
+                                 || !settledKeys.Contains((c.BookingContainerId, c.MovementCode, c.ChargeCode, c.BillTo))).ToList();
         var receipts = await db.Receipts.AsNoTracking().Where(r => r.BookingId == plan.BookingId)
             .OrderBy(r => r.ReceiptAt).ToListAsync(ct);
         var receiptNo = receipts.ToDictionary(r => r.ReceiptId, r => r.ReceiptNo);
@@ -149,7 +159,11 @@ internal static class ChargeEndpoints
         {
             var list = set.ToList();
             decimal Sum(params string[] statuses) => list.Where(c => statuses.Contains(c.Status)).Sum(c => c.Amount + c.TaxAmount);
-            return new StatementTotals(Sum("PAID", "EARNED"), Sum("WAIVED"), Sum("UNBILLED"), Sum("INVOICED"), Sum("CANCELLED"));
+            var quoted = list.Where(c => c.Status == ChargeStatus.Quoted).ToList();
+            return new StatementTotals(Sum("PAID", "EARNED"), Sum("WAIVED"), Sum("UNBILLED"), Sum("INVOICED"), Sum("CANCELLED"),
+                quoted.Where(c => c.PaymentTermCode == "CASH").Sum(c => c.Amount + c.TaxAmount),
+                quoted.Where(c => c.PaymentTermCode != "CASH").Sum(c => c.Amount + c.TaxAmount),
+                quoted.Count(c => c.ScheduleId is null));
         }
 
         StatementLineResponse Line(Charge c) => new(ToResponse(c, names),
@@ -257,7 +271,11 @@ public sealed record UnbilledPayerResponse(
     int Lines, int Boxes, decimal Amount, decimal Tax, decimal Total, DateTimeOffset Oldest, DateTimeOffset Newest);
 
 /// <summary>Money on a booking by where it is: paid (incl. earned), waived, unbilled, invoiced, cancelled — each with VAT.</summary>
-public sealed record StatementTotals(decimal Paid, decimal Waived, decimal Unbilled, decimal Invoiced, decimal Cancelled);
+/// <param name="ExpectedCash">QUOTED cash still to be paid at the window (gecko_revenue 23).</param>
+/// <param name="ExpectedCredit">QUOTED credit still to be billed.</param>
+/// <param name="NoPrice">QUOTED lines no tariff prices (amount 0, no schedule): a rate is missing.</param>
+public sealed record StatementTotals(decimal Paid, decimal Waived, decimal Unbilled, decimal Invoiced, decimal Cancelled,
+    decimal ExpectedCash = 0, decimal ExpectedCredit = 0, int NoPrice = 0);
 
 /// <summary>A charge line, and the number of the receipt that paid it (a voided one included).</summary>
 public sealed record StatementLineResponse(ChargeResponse Charge, string? ReceiptNo);

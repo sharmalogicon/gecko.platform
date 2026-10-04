@@ -495,6 +495,8 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
 internal static class ChargeStatus
 {
+    /// <summary>gecko_revenue 23: expected, not yet paid or billed (source QUOTE).</summary>
+    public const string Quoted = "QUOTED";
     public const string Paid = "PAID";
     public const string Earned = "EARNED";
     public const string Unbilled = "UNBILLED";
@@ -507,4 +509,6 @@ internal static class ChargeSource
 {
     public const string Window = "WINDOW";
     public const string Gate = "GATE";
+    /// <summary>gecko_revenue 23: the expected charge of a booked box, status QUOTED.</summary>
+    public const string Quote = "QUOTE";
 }

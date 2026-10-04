@@ -505,6 +505,9 @@ internal sealed class AutomaticCoupons(
 
         foreach (var box in boxes)
         {
+            // A booked box not nominated yet (gecko_tos 22) has nothing the barrier could match a
+            // coupon to; it gets one when its number arrives (the change is a BookingChanged too).
+            if (string.IsNullOrEmpty(box.ContainerNo)) continue;
             if (CashQuoter.NextStep(box, orderType) is not ({ } step, { IsBillable: true } rules)) continue;
 
             var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);

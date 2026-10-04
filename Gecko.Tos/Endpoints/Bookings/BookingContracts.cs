@@ -46,7 +46,7 @@ public sealed record StepResponse(Guid MovementPlanId, short SequenceNo, string 
 
 /// <summary><see cref="InRegistry"/> false = a box MDM does not know yet (allowed by gate.allow_unknown_container).</summary>
 public sealed record BookingContainerResponse(
-    Guid BookingContainerId, Guid EquipmentRequirementId, short LineNo, string ContainerNo, bool InRegistry, bool IsCheckDigitValid,
+    Guid BookingContainerId, Guid EquipmentRequirementId, short LineNo, string? ContainerNo, bool InRegistry, bool IsCheckDigitValid,
     string Source, string? DeclaredSealNo, decimal? DeclaredVgmKg, DateTimeOffset AssignedAt,
     DateTimeOffset? EndedAt, string? EndReason, IReadOnlyList<StepResponse> Steps,
     // Vector's P/U Mode / D/O Mode / repo mode: who collects or delivers this box. Null = not said.
@@ -136,7 +136,9 @@ public sealed record ReplaceRequirementsRequest(
 /// requirement line. <see cref="DeclaredSealNo"/> is the line's / agent's seal, <see cref="DeclaredVgmKg"/> the weight.
 /// </summary>
 public sealed record AssignContainerItem(
-    string ContainerNo,
+    // Null or "" = a booked box not nominated yet (owner 2026-10-04): it holds its place on the line;
+    // a number given later (PUT …/containers/{id}) nominates it. A number that IS given is checked as always.
+    string? ContainerNo,
     short? LineNo = null,
     string? DeclaredSealNo = null,
     decimal? DeclaredVgmKg = null,
@@ -193,6 +195,8 @@ public sealed record ContainerBatchResponse(
 /// </summary>
 public sealed record UpdateContainerLineRequest(
     [property: Required] string RowVersion,
+    // Nominates (or, before the gate, changes) the box. Null or "" = leave the number as it is.
+    [property: MaxLength(15)] string? ContainerNo = null,
     [property: MaxLength(20)] string? DeclaredSealNo = null,
     [property: MaxLength(20)] string? CustomerSealNo = null,
     decimal? DeclaredVgmKg = null,

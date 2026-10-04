@@ -475,6 +475,37 @@ internal static class BookingEndpoints
         var started = steps.Any(s => s.Status == "DONE");
 
         var errors = new Dictionary<string, List<string>>();
+
+        // Nominating the box (owner 2026-10-04): the same checks as assigning one by number.
+        var nominate = ContainerNumber.Normalise(request.ContainerNo ?? "") is { Length: > 0 } wanted && wanted != box.ContainerNo ? wanted : null;
+        ContainerRef? nominatedBox = null;
+        var nominatedDigitOk = false;
+        if (nominate is not null)
+        {
+            if (started)
+                errors.Add("containerNo", $"{box.ContainerNo} has already passed the gate on this booking; the box can no longer change.");
+            else if (!ContainerNumber.IsWellFormed(nominate))
+                errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+            else
+            {
+                nominatedDigitOk = ContainerNumber.IsValid(nominate);
+                if (!nominatedDigitOk && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, booking.BranchId, true, ct))
+                    errors.Add("containerNo", $"{nominate} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(nominate)}).");
+                nominatedBox = (await master.ContainersAsync([nominate], ct)).GetValueOrDefault(nominate);
+                if (nominatedBox is null && !await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, booking.BranchId, true, ct))
+                    errors.Add("containerNo", $"{nominate} is not in the container registry, and this depot does not accept unknown boxes.");
+                if (BookingRules.CannotAssign(line.Qty, 0, line.EquipmentTypeCode, nominatedBox?.EquipmentTypeCode) is { } wrongType)
+                    errors.Add("containerNo", $"{nominate}: {wrongType}");
+                var elsewhere = await (
+                    from x in db.BookingContainers.AsNoTracking()
+                    join b in db.Bookings on x.BookingId equals b.BookingId
+                    where x.ContainerNo == nominate && x.EndedAt == null && x.BookingContainerId != box.BookingContainerId
+                    select b.OrderNo).FirstOrDefaultAsync(ct);
+                if (elsewhere is not null)
+                    errors.Add("containerNo", $"{nominate} is active on booking {elsewhere}. A box is on one booking at a time.");
+            }
+        }
+
         if (request.DeclaredVgmKg is <= 0) errors.Add("declaredVgmKg", "A weight is positive; leave it out if unknown.");
         if (request.DeclaredVolumeCbm is <= 0) errors.Add("declaredVolumeCbm", "A volume is positive; leave it out if unknown.");
         var cargoCode = request.CargoCategoryCode.Clean();
@@ -507,6 +538,12 @@ internal static class BookingEndpoints
                     errors.Add(field, $"{box.ContainerNo} has already passed the gate on this booking; this can no longer change.");
         if (errors.Count > 0) return TosSupport.Invalid(errors);
 
+        if (nominate is not null)
+        {
+            box.ContainerNo = nominate;
+            box.ContainerId = nominatedBox?.ContainerId;
+            box.IsCheckDigitValid = nominatedDigitOk;
+        }
         box.DeclaredSealNo = seal;
         box.CustomerSealNo = customerSeal;
         box.DeclaredVgmKg = request.DeclaredVgmKg;
@@ -524,7 +561,14 @@ internal static class BookingEndpoints
         box.Remarks = string.IsNullOrWhiteSpace(request.Remarks) ? null : request.Remarks.Trim();
         box.HandoverModeCode = mode;
 
-        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        try
+        {
+            if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        }
+        catch (DbUpdateException e) when (e.InnerException?.Message.Contains("uq_booking_container__active") == true)
+        {
+            return TosSupport.Conflict($"{nominate} was put on another booking a moment ago.", "Reload the booking.");
+        }
         await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_CHANGED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
         return TypedResults.Ok(ToResponse(box, line.LineNo, steps));
@@ -689,7 +733,7 @@ internal static class BookingEndpoints
         var activeElsewhere = await (
             from x in db.BookingContainers
             join b in db.Bookings on x.BookingId equals b.BookingId
-            where numbers.Contains(x.ContainerNo) && x.EndedAt == null
+            where x.ContainerNo != null && numbers.Contains(x.ContainerNo) && x.EndedAt == null
             select new { x.ContainerNo, b.OrderNo, x.BookingId, x.ClientLineId }).ToListAsync(ct);
 
         // Where each box stands now, for the checks a handover mode switches on (Vector BookingEntry.cs:626-655).
@@ -721,7 +765,7 @@ internal static class BookingEndpoints
                 if (!seenClientIds.Add(clientId)) { errors.Add($"{key}.clientLineId", "This clientLineId is listed twice in the request."); continue; }
                 if (already.TryGetValue(clientId, out var prior))
                 {
-                    if (prior.ContainerNo != no)
+                    if ((prior.ContainerNo ?? "") != no)
                         errors.Add($"{key}.clientLineId", $"This clientLineId is already line {prior.ContainerNo} on this booking; a new row needs a new id.");
                     else
                         replayed.Add((i, prior));
@@ -729,23 +773,30 @@ internal static class BookingEndpoints
                 }
             }
 
-            if (!ContainerNumber.IsWellFormed(no)) { errors.Add($"{key}.containerNo", $"'{item.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits)."); continue; }
-            if (numbers.Take(i).Contains(no)) { errors.Add($"{key}.containerNo", $"{no} is listed twice."); continue; }
-
-            var digitOk = ContainerNumber.IsValid(no);
-            if (!digitOk && enforceDigit)
-                errors.Add($"{key}.containerNo", $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
-
-            var known = registry.GetValueOrDefault(no);
-            if (known is null && !allowUnknown)
-                errors.Add($"{key}.containerNo", $"{no} is not in the container registry, and this depot does not accept unknown boxes.");
-
-            if (activeElsewhere.FirstOrDefault(a => a.ContainerNo == no) is { } other)
+            // No number yet (owner 2026-10-04): the row is the promise of a box of the line's type.
+            var nominated = no.Length > 0;
+            var digitOk = false;
+            ContainerRef? known = null;
+            if (nominated)
             {
-                errors.Add($"{key}.containerNo", other.BookingId == booking.BookingId
-                    ? $"{no} is already on this booking."
-                    : $"{no} is active on booking {other.OrderNo}. A box is on one booking at a time.");
-                continue;
+                if (!ContainerNumber.IsWellFormed(no)) { errors.Add($"{key}.containerNo", $"'{item.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits)."); continue; }
+                if (numbers.Take(i).Contains(no)) { errors.Add($"{key}.containerNo", $"{no} is listed twice."); continue; }
+
+                digitOk = ContainerNumber.IsValid(no);
+                if (!digitOk && enforceDigit)
+                    errors.Add($"{key}.containerNo", $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
+
+                known = registry.GetValueOrDefault(no);
+                if (known is null && !allowUnknown)
+                    errors.Add($"{key}.containerNo", $"{no} is not in the container registry, and this depot does not accept unknown boxes.");
+
+                if (activeElsewhere.FirstOrDefault(a => a.ContainerNo == no) is { } other)
+                {
+                    errors.Add($"{key}.containerNo", other.BookingId == booking.BookingId
+                        ? $"{no} is already on this booking."
+                        : $"{no} is active on booking {other.OrderNo}. A box is on one booking at a time.");
+                    continue;
+                }
             }
 
             // Which line: the one named, else the only line of the box's type, else the only line.
@@ -764,7 +815,7 @@ internal static class BookingEndpoints
             var onLine = used.GetValueOrDefault(line.EquipmentRequirementId) + adding.GetValueOrDefault(line.EquipmentRequirementId);
             if (BookingRules.CannotAssign(line.Qty, onLine, line.EquipmentTypeCode, known?.EquipmentTypeCode) is { } refusal)
             {
-                errors.Add($"{key}.containerNo", $"{no}: {refusal}");
+                errors.Add($"{key}.containerNo", nominated ? $"{no}: {refusal}" : $"Line {line.LineNo}: {refusal}");
                 continue;
             }
 
@@ -795,7 +846,7 @@ internal static class BookingEndpoints
             {
                 if (BookingRules.HandoverModeProblem(booking.DirectionCode, mode) is { } wrongList)
                     errors.Add($"{key}.handoverMode", wrongList);
-                else if (BookingRules.HandoverRefusal(booking.DirectionCode, mode, inYard.Any(v => v.ContainerNo == no),
+                else if (nominated && BookingRules.HandoverRefusal(booking.DirectionCode, mode, inYard.Any(v => v.ContainerNo == no),
                              inYard.FirstOrDefault(v => v.ContainerNo == no)?.FullEmpty) is { } refused)
                     errors.Add($"{key}.containerNo", $"{no} {refused}");
             }
@@ -809,7 +860,7 @@ internal static class BookingEndpoints
                 TenantId = booking.TenantId,
                 BookingId = booking.BookingId,
                 EquipmentRequirementId = line.EquipmentRequirementId,
-                ContainerNo = no,
+                ContainerNo = nominated ? no : null,
                 ContainerId = known?.ContainerId,
                 IsCheckDigitValid = digitOk,
                 AssignedBy = caller.UserId(),

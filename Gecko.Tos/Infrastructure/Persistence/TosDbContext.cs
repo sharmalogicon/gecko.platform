@@ -320,7 +320,7 @@ public partial class TosDbContext : DbContext
 
             entity.HasIndex(e => new { e.TenantId, e.ContainerNo }, "uq_booking_container__active")
                 .IsUnique()
-                .HasFilter("([ended_at] IS NULL AND [deleted_at] IS NULL)");
+                .HasFilter("([ended_at] IS NULL AND [deleted_at] IS NULL AND [container_no] IS NOT NULL)");
 
             entity.Property(e => e.BookingContainerId)
                 .HasDefaultValueSql("(newsequentialid())", "df_booking_container__id")

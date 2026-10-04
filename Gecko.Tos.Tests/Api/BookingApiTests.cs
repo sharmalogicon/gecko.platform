@@ -792,4 +792,51 @@ public sealed class BookingApiTests(TosApiFactory api)
         }
         finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }
+
+    /// <summary>
+    /// Owner 2026-10-04 (UNNOMINATED_BOX_FOR_API): a booked box may have no number yet. It holds
+    /// its place on the line, is edited and unassigned like any row, and a PUT nominates it with
+    /// the same checks as assigning by number.
+    /// </summary>
+    [Fact]
+    public async Task A_booked_box_may_wait_for_its_number_and_is_nominated_later()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        try
+        {
+            var booking = await CreateAsync(client, ImportDo(carrierRef), ct);   // 2 x 20GP
+            var id = booking.Booking.BookingId;
+
+            var rows = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, id, ct,
+                new { clientLineId = Guid.NewGuid(), containerNo = (string?)null, lineNo = 1 },
+                new { clientLineId = Guid.NewGuid(), containerNo = "", lineNo = 1, declaredSealNo = "LS-9" },
+                new { clientLineId = Guid.NewGuid(), containerNo = (string?)null, lineNo = 1 }), HttpStatusCode.OK, ct));
+            Assert.Equal(["CREATED", "CREATED", "REJECTED"], rows.Items.Select(r => r.Outcome));   // they count: the line is full
+            Assert.Contains("line is full", rows.Items[2].Errors!["containerNo"].Single());
+            Assert.All(rows.Items.Take(2), r => Assert.Null(r.Line!.ContainerNo));
+            Assert.Equal(2, Assert.Single(rows.Lines).Assigned);
+
+            // Nominate the first: checked like any number.
+            var first = rows.Items[0].Line!;
+            var url = $"{Bookings}/{id}/containers/{first.BookingContainerId}";
+            var misread = Gp20A[..10] + ((Gp20A[10] - '0' + 1) % 10);
+            Assert.Contains("check digit", await ExpectAsync(await client.PutAsJsonAsync(url, new { rowVersion = first.RowVersion, containerNo = misread }, ct), HttpStatusCode.BadRequest, ct));
+            var named = Read<BookingContainerResponse>(await ExpectAsync(await client.PutAsJsonAsync(url,
+                new { rowVersion = first.RowVersion, containerNo = Gp20A }, ct), HttpStatusCode.OK, ct));
+            Assert.Equal((Gp20A, true), (named.ContainerNo, named.InRegistry));
+
+            // The same box cannot be named twice; the second row stays unnominated.
+            var second = rows.Items[1].Line!;
+            Assert.Contains("is active on booking", await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{id}/containers/{second.BookingContainerId}",
+                new { rowVersion = second.RowVersion, containerNo = Gp20A, declaredSealNo = "LS-9" }, ct), HttpStatusCode.BadRequest, ct));
+
+            // A nameless row is unassigned like any other, and frees its place.
+            var off = Read<BookingDetailResponse>(await ExpectAsync(
+                await client.DeleteAsync($"{Bookings}/{id}/containers/{second.BookingContainerId}", ct), HttpStatusCode.OK, ct));
+            Assert.Equal(1, off.QtyAssigned);
+        }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+    }
 }

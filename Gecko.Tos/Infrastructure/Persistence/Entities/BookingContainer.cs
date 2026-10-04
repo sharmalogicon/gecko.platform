@@ -13,7 +13,8 @@ public partial class BookingContainer
 
     public Guid EquipmentRequirementId { get; set; }
 
-    public string ContainerNo { get; set; } = null!;
+    /// <summary>Null = a booked box not nominated yet (gecko_tos 22).</summary>
+    public string? ContainerNo { get; set; }
 
     public Guid? ContainerId { get; set; }
 

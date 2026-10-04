@@ -1,4 +1,5 @@
 using Gecko.Data;
+using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
 using Gecko.Tos.Application;
@@ -124,13 +125,13 @@ internal static class BookingEndpoints
     }
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound>> GetAsync(
-        Guid id, TosDbContext db, BranchClock clock, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct)
+        Guid id, TosDbContext db, BranchClock clock, IMasterDataReferences master, IUserDirectory users, ICallerPermissions scope, CancellationToken ct)
     {
         // Another branch's booking reads as NOT FOUND, the same answer another tenant
         // gets: a read never confirms the existence of a row it may not show.
         if (!await AllowedAsync(db, scope, TosPermissions.BookingView, id, ct)) return TypedResults.NotFound();
 
-        return await DetailAsync(db, clock, master, id, ct) is { } detail ? TypedResults.Ok(detail) : TypedResults.NotFound();
+        return await DetailAsync(db, clock, master, users, id, ct) is { } detail ? TypedResults.Ok(detail) : TypedResults.NotFound();
     }
 
     /// <summary>The booking's own branch must be one the caller's permission covers.</summary>
@@ -145,7 +146,7 @@ internal static class BookingEndpoints
     // ── create / update ─────────────────────────────────────────────────────
 
     private static async Task<Results<CreatedAtRoute<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
-        SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock, ITenantContext caller,
+        SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock, ITenantContext caller,
         ICallerPermissions scope, HttpContext http, CancellationToken ct)
     {
         // A repeated request (double-click, retry after a lost answer) carries the same
@@ -153,7 +154,7 @@ internal static class BookingEndpoints
         var (key, badKey) = Idempotency.KeyOf(http.Request);
         if (badKey is not null) return TosSupport.Invalid(Idempotency.Header, badKey);
         var hash = key is null ? null : Idempotency.HashOf(request);
-        if (key is not null && await ReplayAsync(db, clock, master, key, hash!, ct) is { } replay) return replay;
+        if (key is not null && await ReplayAsync(db, clock, master, users, key, hash!, ct) is { } replay) return replay;
 
         var errors = new Dictionary<string, List<string>>();
         var header = await ResolveHeaderAsync(db, master, clock, request, errors, ct);
@@ -197,7 +198,7 @@ internal static class BookingEndpoints
             // The same key arrived twice at once and the other request won: answer with its booking.
             await tx.RollbackAsync(ct);
             db.ChangeTracker.Clear();
-            return await ReplayAsync(db, clock, master, key, hash!, ct)
+            return await ReplayAsync(db, clock, master, users, key, hash!, ct)
                    ?? TosSupport.Conflict($"A request with {Idempotency.Header} {key} is still being processed.", "Repeat it in a moment.");
         }
 
@@ -224,7 +225,7 @@ internal static class BookingEndpoints
 
         await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
-        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
+        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, users, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
     }
 
     /// <summary>
@@ -233,13 +234,13 @@ internal static class BookingEndpoints
     /// a different body. Null when the key is new.
     /// </summary>
     private static async Task<Results<CreatedAtRoute<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>?> ReplayAsync(
-        TosDbContext db, BranchClock clock, IMasterDataReferences master, string key, byte[] hash, CancellationToken ct)
+        TosDbContext db, BranchClock clock, IMasterDataReferences master, IUserDirectory users, string key, byte[] hash, CancellationToken ct)
     {
         var made = await db.Bookings.AsNoTracking().Where(b => b.IdempotencyKey == key)
             .Select(b => new { b.BookingId, b.IdempotencyHash }).SingleOrDefaultAsync(ct);
         if (made is null) return null;
         if (!Idempotency.SameRequest(made.IdempotencyHash, hash)) return Idempotency.DifferentRequest(key);
-        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, made.BookingId, ct))!, "GetBooking", new { id = made.BookingId });
+        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, users, made.BookingId, ct))!, "GetBooking", new { id = made.BookingId });
     }
 
     /// <summary>
@@ -266,7 +267,7 @@ internal static class BookingEndpoints
     }
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
-        Guid id, SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, SaveBookingRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -302,7 +303,7 @@ internal static class BookingEndpoints
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "HEADER_CHANGED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
-        return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
     /// <summary>
@@ -311,7 +312,7 @@ internal static class BookingEndpoints
     /// type, and cannot disappear.
     /// </summary>
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> ReplaceRequirementsAsync(
-        Guid id, ReplaceRequirementsRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, ReplaceRequirementsRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ICallerPermissions scope, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -365,13 +366,13 @@ internal static class BookingEndpoints
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "REQUIREMENTS_CHANGED", booking.UpdatedAt, ct);
         await tx.CommitAsync(ct);
-        return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
     // ── boxes ───────────────────────────────────────────────────────────────
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> AssignAsync(
-        Guid id, AssignContainersRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, AssignContainersRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
     {
         // Under the lock: the booking is still OPEN, its order type and lines are the
@@ -392,7 +393,7 @@ internal static class BookingEndpoints
         if (assigned.Created.Count > 0) await BookingEvents.QueueChangedAsync(db, id, "CONTAINERS_ASSIGNED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
 
-        return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
     /// <summary>
@@ -530,7 +531,7 @@ internal static class BookingEndpoints
     }
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ProblemHttpResult>> UnassignAsync(
-        Guid id, Guid bookingContainerId, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, Guid bookingContainerId, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -550,23 +551,23 @@ internal static class BookingEndpoints
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_UNASSIGNED", time.GetUtcNow(), ct);
         await tx.CommitAsync(ct);
-        return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
     // ── cancel / close ──────────────────────────────────────────────────────
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CancelAsync(
-        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct) =>
-        await EndAsync(id, request, db, master, clock, caller, scope, time, cancel: true, ct);
+        await EndAsync(id, request, db, master, users, clock, caller, scope, time, cancel: true, ct);
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CloseAsync(
-        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct) =>
-        await EndAsync(id, request, db, master, clock, caller, scope, time, cancel: false, ct);
+        await EndAsync(id, request, db, master, users, clock, caller, scope, time, cancel: false, ct);
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> EndAsync(
-        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, BranchClock clock,
+        Guid id, EndBookingRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, bool cancel, CancellationToken ct)
     {
         // Cancelling needs tos.booking.cancel, closing needs manage — the row check
@@ -612,7 +613,7 @@ internal static class BookingEndpoints
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, cancel ? "CANCELLED" : "CLOSED", now, ct);
         await tx.CommitAsync(ct);
-        return TypedResults.Ok((await DetailAsync(db, clock, master, id, ct))!);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
     /// <summary>
@@ -1123,7 +1124,7 @@ internal static class BookingEndpoints
     // ── projection ──────────────────────────────────────────────────────────
 
     private static async Task<BookingDetailResponse?> DetailAsync(
-        TosDbContext db, BranchClock clock, IMasterDataReferences master, Guid id, CancellationToken ct)
+        TosDbContext db, BranchClock clock, IMasterDataReferences master, IUserDirectory users, Guid id, CancellationToken ct)
     {
         var row = await (
             from bk in db.Bookings.AsNoTracking()
@@ -1148,6 +1149,12 @@ internal static class BookingEndpoints
         var branch = (await clock.BranchesAsync([b.BranchId], ct)).GetValueOrDefault(b.BranchId);
         var today = (await clock.TodayForAsync([b.BranchId], ct))(b.BranchId);
 
+        // Vector showed these, never stored them: the line's operator code and the destination's trade mode.
+        var owner = (await master.PartiesAsync([b.LinePartyCode], ct)).GetValueOrDefault(b.LinePartyCode)?.OperatorCode;
+        var destination = b.FpdPortCode ?? b.PodPortCode;
+        var tradeMode = destination is null ? null : (await master.PortsAsync([destination], ct)).GetValueOrDefault(destination)?.TradeMode;
+        var names = await users.DisplayNamesAsync(new[] { b.CreatedBy, b.UpdatedBy }.OfType<Guid>().Distinct(), ct);
+
         var requirements = await db.EquipmentRequirements.AsNoTracking().Where(r => r.BookingId == id).OrderBy(r => r.LineNo).ToListAsync(ct);
         var boxes = await db.BookingContainers.AsNoTracking().Where(x => x.BookingId == id)
             .OrderBy(x => x.EndedAt != null).ThenBy(x => x.AssignedAt).ThenBy(x => x.ContainerNo).ToListAsync(ct);
@@ -1167,7 +1174,10 @@ internal static class BookingEndpoints
                 b.CancelledAt, b.CancelReason, b.ClosedAt, b.CloseReason, b.Source, b.CustomerRef, b.Remarks, b.CreatedAt,
                 Convert.ToBase64String(b.RowVersion),
                 b.AllowLateGateIn, b.LateGateSetAt, b.PaperlessCode, b.SubBlNo, b.NextPrevLocation, b.TotalQty, b.UomCode,
-                b.TotalVolumeCbm, b.TotalWeightKg, b.MarksAndNos, b.SpecialInstruction),
+                b.TotalVolumeCbm, b.TotalWeightKg, b.MarksAndNos, b.SpecialInstruction,
+                owner, tradeMode,
+                b.CreatedBy, b.CreatedBy is { } cb ? names.GetValueOrDefault(cb) : null,
+                b.UpdatedAt, b.UpdatedBy, b.UpdatedBy is { } ub ? names.GetValueOrDefault(ub) : null),
             row.p.QtyRequired, row.p.QtyAssigned, row.p.QtyCompleted, row.p.StepsDone,
             requirements.Select(r => new RequirementResponse(
                 r.EquipmentRequirementId, r.LineNo, r.EquipmentTypeCode, r.Qty,

@@ -202,8 +202,9 @@ public sealed record CodeRef(Guid Id, string Code, bool IsActive);
 
 public sealed record BranchRef(Guid BranchId, string BranchCode, string? TimeZone);
 
+/// <param name="OperatorCode">A shipping line's operator code (MDM shipping_line_extension): Vector's booking "Owner Code".</param>
 public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool IsActive,
-    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier);
+    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null);
 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 
@@ -212,7 +213,8 @@ public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, str
 
 public sealed record VesselRef(Guid VesselId, string VesselCode, string VesselName, string? ImoNumber, bool IsActive);
 
-public sealed record PortRef(Guid PortId, string PortCode, string Name, string? UnLocode, string? TimeZone, bool IsActive);
+/// <param name="TradeMode">MDM logistics.port.trade_mode — what Vector's booking showed as "Trade Mode" for the destination.</param>
+public sealed record PortRef(Guid PortId, string PortCode, string Name, string? UnLocode, string? TimeZone, bool IsActive, string? TradeMode = null);
 
 public sealed record OrderTypePlanRef(
     Guid OrderTypeId, string OrderTypeCode, bool IsActive,

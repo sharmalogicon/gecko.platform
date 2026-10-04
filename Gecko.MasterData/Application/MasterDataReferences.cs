@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Linq.Expressions;
 using Gecko.MasterData.Contracts;
 using Gecko.MasterData.Infrastructure.Persistence;
@@ -36,7 +36,8 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
                 db.CustomerExtensions.Any(x => x.PartyId == p.PartyId),
                 db.ShippingLineExtensions.Any(x => x.PartyId == p.PartyId),
                 db.ForwarderExtensions.Any(x => x.PartyId == p.PartyId),
-                db.HaulierExtensions.Any(x => x.PartyId == p.PartyId)))
+                db.HaulierExtensions.Any(x => x.PartyId == p.PartyId),
+                db.ShippingLineExtensions.Where(x => x.PartyId == p.PartyId).Select(x => x.OperatorCode).FirstOrDefault()))
             .ToDictionaryAsync(p => p.PartyCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 
@@ -168,7 +169,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(portCodes);
         return await db.Ports.AsNoTracking()
             .Where(p => codes.Contains(p.PortCode))
-            .Select(p => new PortRef(p.PortId, p.PortCode, p.PortNameEn, p.UnLocode, p.Timezone, p.IsActive))
+            .Select(p => new PortRef(p.PortId, p.PortCode, p.PortNameEn, p.UnLocode, p.Timezone, p.IsActive, p.TradeMode))
             .ToDictionaryAsync(p => p.PortCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 

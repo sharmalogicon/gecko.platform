@@ -718,6 +718,7 @@ public sealed class BookingApiTests(TosApiFactory api)
             var created = await CreateAsync(client, new
             {
                 branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                podPortCode = "SGSIN",
                 subBlNo = "SUB-1", paperlessCode = "E-REL-778", nextPrevLocation = "Bangkok port",
                 totalQty = 1200, uomCode = "ctn", totalVolumeCbm = 66.5m, totalWeightKg = 18500m,
                 marksAndNos = "ACME / BKK / 1-1200", specialInstruction = "Keep dry", remarks = "ops note",
@@ -729,6 +730,14 @@ public sealed class BookingApiTests(TosApiFactory api)
                  b.MarksAndNos, b.SpecialInstruction, b.Remarks));
             Assert.True(b.AllowLateGateIn);
             Assert.NotNull(b.LateGateSetAt);
+
+            // Step 1 (STEP1_BOOKING_HEADER_FOR_API): derived as Vector showed them, and who made it.
+            Assert.Equal(("MAEU", "INTERNATIONAL"), (b.ContainerOwnerCode, b.TradeModeCode));
+            Assert.False(string.IsNullOrWhiteSpace(b.CreatedByName));
+            Assert.NotNull(b.UpdatedAt);
+            // The 201 is the booking exactly as GET returns it: the UI need not re-read.
+            var read = (await client.GetFromJsonAsync<BookingDetailResponse>($"{Bookings}/{b.BookingId}", ct))!.Booking;
+            Assert.Equal(read, b);
 
             // The header PUT leaves the flag alone when it is not sent, and replaces the rest.
             var amended = Read<BookingDetailResponse>(await ExpectAsync(await client.PutAsJsonAsync($"{Bookings}/{b.BookingId}", new

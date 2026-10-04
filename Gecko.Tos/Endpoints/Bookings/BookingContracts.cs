@@ -28,7 +28,11 @@ public sealed record BookingResponse(
     // gecko_tos 21 — Vector's Vessel & Voyage and Other Information panels.
     bool AllowLateGateIn = false, DateTimeOffset? LateGateSetAt = null, string? PaperlessCode = null, string? SubBlNo = null,
     string? NextPrevLocation = null, int? TotalQty = null, string? UomCode = null, decimal? TotalVolumeCbm = null,
-    decimal? TotalWeightKg = null, string? MarksAndNos = null, string? SpecialInstruction = null);
+    decimal? TotalWeightKg = null, string? MarksAndNos = null, string? SpecialInstruction = null,
+    // Derived, read-only (as Vector showed them): the line's operator code ("Owner Code") and the destination port's trade mode.
+    string? ContainerOwnerCode = null, string? TradeModeCode = null,
+    // Who made it and who last changed it, with names for the screen.
+    Guid? CreatedBy = null, string? CreatedByName = null, DateTimeOffset? UpdatedAt = null, Guid? UpdatedBy = null, string? UpdatedByName = null);
 
 public sealed record RequirementResponse(
     Guid EquipmentRequirementId, short LineNo, string EquipmentTypeCode, short Qty, int QtyAssigned, int QtyCompleted,

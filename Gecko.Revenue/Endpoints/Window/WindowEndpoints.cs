@@ -47,6 +47,8 @@ internal static class WindowEndpoints
 
         window.MapGet("/bookings", QuoteAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("What a booking's boxes owe for their next movement — cash lines, storage to a date, what is already paid");
+        window.MapGet("/preview", PreviewAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
+            .WithSummary("What a box on NO order yet would owe for its first movement (a blind gate-in) — nothing is created");
         window.MapGet("/quote-visit", QuoteVisitAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("What one truck visit was charged — per box and charge line, cash paid now against credit billed later");
         window.MapPost("/shifts", OpenShiftAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
@@ -139,6 +141,90 @@ internal static class WindowEndpoints
                 later.Select(l => l.CurrencyCode).FirstOrDefault()),
             carriedBy,
             await window.WithholdingOfferedAsync(plan.BranchId, lines.Sum(l => l.Total), ct)
+                ? new WithholdingTaxResponse(WithholdingTax.Rate, WithholdingTax.Amount(lines.Sum(l => l.Amount)),
+                    lines.Sum(l => l.Total) - WithholdingTax.Amount(lines.Sum(l => l.Amount)))
+                : null));
+    }
+
+    // ── a box on no order yet, priced ───────────────────────────────────────
+
+    /// <summary>
+    /// Record on a BLIND GATE IN row (owner 2026-10-04, GATE_IN_BIG_SAVE.md §1; Vector GateIn.cs:1494
+    /// GetGateChargesListForBLINDGateIn): the order type's FIRST movement priced for this customer, agent,
+    /// box type and truck, exactly as the window would price it once the order exists — the same quoter,
+    /// on a plan that is never saved. Same response as <c>GET /window/bookings</c>, with no booking id
+    /// and no order number, so the gate card shows it the same way.
+    /// </summary>
+    private static async Task<Results<Ok<WindowBookingResponse>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>> PreviewAsync(
+        Guid? branchId, string? orderTypeCode, RevenueDbContext db, WindowService window, CashQuoter quoter, IMasterDataReferences master,
+        ITenantContext caller, ICallerPermissions permissions, CancellationToken ct,
+        string? lineCode = null, string? customerCode = null, string? agentCode = null, string? forwarderCode = null,
+        string? equipmentTypeCode = null, string? containerNo = null,
+        string? truckCategoryCode = null, string? haulierCode = null, string[]? vas = null, string[]? sameTruckAs = null)
+    {
+        if (branchId is not { } branch) return RevenueSupport.Invalid("branchId", "Which depot?");
+        if (string.IsNullOrWhiteSpace(orderTypeCode)) return RevenueSupport.Invalid("orderTypeCode", "Required.");
+        if (!permissions.HasAt(RevenuePermissions.CashCollect, branch)) return TypedResults.Forbid();
+
+        var code = orderTypeCode.Trim().ToUpperInvariant();
+        var orderType = (await master.OrderTypePlansAsync([code], ct)).GetValueOrDefault(code);
+        if (orderType is not { IsActive: true }) return RevenueSupport.Invalid("orderTypeCode", $"'{code}' is not an active order type.");
+        var first = orderType.Steps.OrderBy(s => s.SequenceNo).FirstOrDefault();
+        if (first is null) return RevenueSupport.Invalid("orderTypeCode", $"{code} has no steps in master data.");
+
+        var type = equipmentTypeCode?.Trim().ToUpperInvariant();
+        if (!string.IsNullOrEmpty(type) && !(await master.EquipmentTypesAsync([type], ct)).ContainsKey(type))
+            return RevenueSupport.Invalid("equipmentTypeCode", $"Unknown equipment type '{type}'.");
+
+        static string? Code(string? raw) => string.IsNullOrWhiteSpace(raw) ? null : raw.Trim().ToUpperInvariant();
+        var plan = new BookingPlan
+        {
+            BookingId = Guid.Empty, TenantId = caller.TenantId(), BranchId = branch, OrderNo = "", Status = "OPEN",
+            OrderTypeCode = code, BookingTypeCode = orderType.BookingTypeCode, DirectionCode = orderType.DirectionCode,
+            CargoClassCode = orderType.CargoClassCode, LineCode = Code(lineCode), AgentPartyCode = Code(agentCode),
+            CustomerPartyCode = Code(customerCode), ForwarderPartyCode = Code(forwarderCode), HaulierPartyCode = Code(haulierCode),
+        };
+        var box = new BookingPlanContainer
+        {
+            BookingContainerId = Guid.Empty, TenantId = plan.TenantId, BookingId = Guid.Empty,
+            ContainerNo = Code(containerNo), EquipmentTypeCode = type, IsCurrent = true, StepsJson = "[]",
+        };
+
+        var context = await window.ContextAsync(plan, ct);
+        if (context is null) return RevenueSupport.Invalid("branchId", "Unknown depot.");
+        var (terms, invalid) = await window.GateTermsAsync(context, truckCategoryCode, haulierCode, vas, ct);
+        if (invalid is not null) return invalid;
+        if (terms.Vas is { Count: > 0 } && !(first.IsBillable && CashQuoter.OffersVas(first)))
+            return RevenueSupport.Invalid("vas", "Gate VAS is offered on an empty drop-off or a pick-up only; this box is not one.");
+        var (carriedBy, notABooking, payOtherFirst) = await window.TruckCarrierAsync(context, terms, sameTruckAs, ct);
+        if (notABooking is not null) return notABooking;
+        if (payOtherFirst is not null) return payOtherFirst;
+
+        var quote = first.IsBillable
+            ? await quoter.QuoteAsync(plan, box, first, context.Branch, null, context.Now, ct, terms with { TripChargeCarriedBy = carriedBy })
+            : null;
+        var note = quote is null ? $"{first.MovementCode} is not billable."
+            : quote.NoPrice.Count > 0 ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {first.MovementCode} (contract or standard tariff)."
+            : quote.Lines.Count > 0 ? null
+            : $"Nothing is charged in cash for {first.MovementCode}.";
+        var lines = quote?.Lines ?? [];
+        var later = quote?.BilledLater ?? [];
+        var response = new WindowBoxResponse(
+            Guid.Empty, box.ContainerNo, box.EquipmentTypeCode, first.MovementCode, first.Direction, first.IsBillable,
+            null, null, lines.Select(ToResponse).ToList(), [],
+            (quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
+                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" ? t.Trail.FirstOrDefault() : null)).ToList(),
+            quote?.Total ?? 0, note, later.Select(ToResponse).ToList(), CashQuoter.OffersVas(first),
+            (quote?.NoPrice ?? []).Select(ToResponse).ToList());
+
+        return TypedResults.Ok(new WindowBookingResponse(
+            Guid.Empty, branch, "", "PREVIEW", code, plan.CustomerPartyCode, plan.AgentPartyCode, plan.LineCode,
+            null, context.Branch.LocalDate(context.Now), [response],
+            lines.Sum(l => l.Amount), lines.Sum(l => l.TaxAmount), lines.Sum(l => l.Total), lines.Select(l => l.CurrencyCode).FirstOrDefault(),
+            [], terms.TruckCategoryCode, terms.HaulierCode,
+            new BilledLaterResponse(later.Sum(l => l.Amount), later.Sum(l => l.TaxAmount), later.Sum(l => l.Total), later.Select(l => l.CurrencyCode).FirstOrDefault()),
+            carriedBy,
+            await window.WithholdingOfferedAsync(branch, lines.Sum(l => l.Total), ct)
                 ? new WithholdingTaxResponse(WithholdingTax.Rate, WithholdingTax.Amount(lines.Sum(l => l.Amount)),
                     lines.Sum(l => l.Total) - WithholdingTax.Amount(lines.Sum(l => l.Amount)))
                 : null));
@@ -701,27 +787,40 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         return result;
     }
 
-    public async Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(WindowContext context, Shift shift, List<QuotedBox> payable,
+    public Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(WindowContext context, Shift shift, List<QuotedBox> payable,
+        IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct,
+        decimal withheld = 0m, string? idempotencyKey = null, byte[]? idempotencyHash = null) =>
+        IssueReceiptAsync([(context, payable)], shift, payments, payerName, payer, cashier, replacesReceiptId, ct, withheld, idempotencyKey, idempotencyHash);
+
+    /// <summary>
+    /// One receipt for boxes of one or MORE bookings (owner 2026-10-04: one receipt per truck at the gate,
+    /// GATE_IN_BIG_SAVE §2). Each charge keeps its own booking; the receipt names a booking only when there
+    /// is one. Every box gets its coupon, numbered across the whole receipt.
+    /// </summary>
+    public async Task<(Receipt Receipt, List<CouponIssuedPayload> Coupons)> IssueReceiptAsync(
+        IReadOnlyList<(WindowContext Context, List<QuotedBox> Payable)> groups, Shift shift,
         IReadOnlyList<PaymentRequest> payments, string payerName, PayerRequest? payer, Guid cashier, Guid? replacesReceiptId, CancellationToken ct,
         decimal withheld = 0m, string? idempotencyKey = null, byte[]? idempotencyHash = null)
     {
-        var plan = context.Plan;
-        var now = context.Now;
+        var (first, _) = groups[0];
+        var single = groups.Count == 1 ? first.Plan : null;
+        var now = first.Now;
+        var all = groups.SelectMany(g => g.Payable).ToList();
         var channels = payments.Select(p => p.Channel.Trim().ToUpperInvariant()).Distinct().ToList();
 
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
-        var receiptNo = await RevenueNumberSeries.NextAsync(db, RevenueNumberSeries.Receipt, plan.BranchId, context.Branch.BranchCode,
-            context.Branch.Local(now), ct);
+        var receiptNo = await RevenueNumberSeries.NextAsync(db, RevenueNumberSeries.Receipt, first.Plan.BranchId, first.Branch.BranchCode,
+            first.Branch.Local(now), ct);
 
         var receipt = new Receipt
         {
-            ReceiptId = Guid.CreateVersion7(), TenantId = plan.TenantId, BranchId = plan.BranchId, ReceiptNo = receiptNo,
-            ReceiptAt = now, ShiftId = shift.ShiftId, CashierUserId = cashier, BookingId = plan.BookingId, OrderNo = plan.OrderNo,
-            PayerPartyCode = plan.CustomerPartyCode, PayerName = payerName, PayerTaxId = payer?.TaxId?.Trim(),
+            ReceiptId = Guid.CreateVersion7(), TenantId = first.Plan.TenantId, BranchId = first.Plan.BranchId, ReceiptNo = receiptNo,
+            ReceiptAt = now, ShiftId = shift.ShiftId, CashierUserId = cashier, BookingId = single?.BookingId, OrderNo = single?.OrderNo,
+            PayerPartyCode = single?.CustomerPartyCode, PayerName = payerName, PayerTaxId = payer?.TaxId?.Trim(),
             PayerBranchNo = payer?.BranchNo?.Trim(), PayerAddress = payer?.Address?.Trim(),
-            CurrencyCode = payable.Select(b => b.Quote!.CurrencyCode).First() ?? "THB",
-            SubtotalAmount = payable.Sum(b => b.Quote!.Subtotal), TaxAmount = payable.Sum(b => b.Quote!.Tax),
+            CurrencyCode = all.Select(b => b.Quote!.CurrencyCode).First() ?? "THB",
+            SubtotalAmount = all.Sum(b => b.Quote!.Subtotal), TaxAmount = all.Sum(b => b.Quote!.Tax),
             Status = "ISSUED", ReplacesReceiptId = replacesReceiptId,
             WithholdingTaxRate = withheld > 0 ? WithholdingTax.Rate : null, WithholdingTaxAmount = withheld,
             IdempotencyKey = idempotencyKey, IdempotencyHash = idempotencyHash,
@@ -732,8 +831,10 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         var coupons = new List<CouponIssuedPayload>();
         short lineNo = 0;
         var boxIndex = 0;
+        foreach (var (context, payable) in groups)
         foreach (var box in payable)
         {
+            var plan = context.Plan;
             var quote = box.Quote!;
             var couponRef = $"{receiptNo}-{++boxIndex}";
             foreach (var line in quote.Lines)
@@ -765,14 +866,14 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         foreach (var p in payments)
             db.ReceiptPayments.Add(new ReceiptPayment
             {
-                TenantId = plan.TenantId, ReceiptId = receipt.ReceiptId, Channel = p.Channel.Trim().ToUpperInvariant(),
+                TenantId = receipt.TenantId, ReceiptId = receipt.ReceiptId, Channel = p.Channel.Trim().ToUpperInvariant(),
                 Amount = CashQuoter.Money(p.Amount), TenderedAmount = p.TenderedAmount is { } t ? CashQuoter.Money(t) : null,
                 ReferenceNo = p.ReferenceNo?.Trim(), BankName = p.BankName?.Trim(),
             });
 
         await db.SaveChangesAsync(ct);
         foreach (var coupon in coupons)
-            await RevenueOutbox.EnqueueAsync(db, plan.TenantId, "RECEIPT", receipt.ReceiptId, RevenueOutbox.CouponIssued, coupon, ct);
+            await RevenueOutbox.EnqueueAsync(db, receipt.TenantId, "RECEIPT", receipt.ReceiptId, RevenueOutbox.CouponIssued, coupon, ct);
         await transaction.CommitAsync(ct);
         return (receipt, coupons);
     }

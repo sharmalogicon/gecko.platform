@@ -146,4 +146,10 @@ public partial class GateTransaction
     public string? PaperlessCode { get; set; }
 
     public string? NextLocationCode { get; set; }
+
+    /// <summary>gecko_tos 24: the Idempotency-Key the recording request carried; unique per tenant.</summary>
+    public string? IdempotencyKey { get; set; }
+
+    /// <summary>gecko_tos 24: SHA-256 of that request — the same key with another body is refused.</summary>
+    public byte[]? IdempotencyHash { get; set; }
 }

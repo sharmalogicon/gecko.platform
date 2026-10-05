@@ -148,6 +148,39 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>Removes every gate hold (gecko_tos 24) on these boxes — test boxes only.</summary>
+    public static async Task RemoveBoxReservationsAsync(params string[] containerNos)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gate.box_reservation
+            WHERE container_no IN (SELECT value FROM STRING_SPLIT(@numbers, ','))
+               OR booking_container_id IN (SELECT booking_container_id FROM booking.booking_container
+                                           WHERE container_no IN (SELECT value FROM STRING_SPLIT(@numbers, ',')));
+            """;
+        command.Parameters.AddWithValue("@numbers", string.Join(',', containerNos));
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Makes a box's live gate holds lapse now, as 15 minutes passing would.</summary>
+    public static async Task LapseBoxReservationsAsync(string containerNo)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE gate.box_reservation
+               SET reserved_at = DATEADD(MINUTE, -30, reserved_at), expires_at = DATEADD(SECOND, -1, SYSUTCDATETIME() AT TIME ZONE 'UTC')
+            WHERE container_no = @number AND released_at IS NULL;
+            """;
+        command.Parameters.AddWithValue("@number", containerNo);
+        await command.ExecuteNonQueryAsync();
+    }
+
     /// <summary>
     /// The outbox message a gate event queued. Read through the sysadmin door:
     /// gecko_app is DENIED SELECT on outbox.* by design (11_outbox) — the module
@@ -450,6 +483,37 @@ internal static class TestDatabase
     /// SCT's IMP CY/CY in gecko_master, for the length of one test. VASSEAL has a cash
     /// variant and no rate in any SCT tariff: the "missing price" case. Test-only.
     /// </summary>
+    /// <summary>
+    /// Adds (or removes) SCT's GATETRIP gate charge, customer cash, on BLIND GATE IN's first step (MTY_IN):
+    /// the fixture's BLIND GATE IN charges nothing, and a blind price preview needs something to price
+    /// (PUB-LCB: ฿100 any truck, ฿140 18_WHEEL).
+    /// </summary>
+    public static async Task GateChargeOnBlindGateInAsync(bool add)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DECLARE @ot UNIQUEIDENTIFIER = (SELECT order_type_id FROM gecko_master.commercial.order_type
+                                            WHERE tenant_id = @tenant AND order_type_code = 'BLIND GATE IN' AND deleted_at IS NULL);
+            DECLARE @cc UNIQUEIDENTIFIER = (SELECT charge_code_id FROM gecko_master.commercial.charge_code
+                                            WHERE tenant_id = @tenant AND charge_code = 'GATETRIP' AND deleted_at IS NULL);
+            DECLARE @mv UNIQUEIDENTIFIER = (SELECT movement_id FROM gecko_master.commercial.movement
+                                            WHERE tenant_id = @tenant AND movement_code = 'MTY_IN' AND deleted_at IS NULL);
+            DELETE FROM gecko_master.commercial.order_type_charge
+             WHERE tenant_id = @tenant AND order_type_id = @ot AND charge_code_id = @cc AND movement_id = @mv;
+            IF @add = 1
+                INSERT INTO gecko_master.commercial.order_type_charge
+                    (tenant_id, order_type_id, charge_code_id, movement_id, payment_to, payment_term_code,
+                     is_default, is_optional, is_cargo_charge, is_value_added_service, raise_at_gate_in)
+                VALUES (@tenant, @ot, @cc, @mv, 'CUSTOMER', 'CASH', 1, 0, 0, 0, 0);
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@add", add);
+        await command.ExecuteNonQueryAsync();
+    }
+
     public static async Task UnpricedChargeOnImpCyCyAsync(string movementCode, bool add)
     {
         await using var connection = new SqlConnection(AdminConnection);

@@ -18,6 +18,8 @@ public partial class TosDbContext : DbContext
 
     public virtual DbSet<BookingContainer> BookingContainers { get; set; }
 
+    public virtual DbSet<BoxReservation> BoxReservations { get; set; }
+
     public virtual DbSet<ContainerHold> ContainerHolds { get; set; }
 
     public virtual DbSet<ContainerVisit> ContainerVisits { get; set; }
@@ -29,6 +31,8 @@ public partial class TosDbContext : DbContext
     public virtual DbSet<GateAuthorization> GateAuthorizations { get; set; }
 
     public virtual DbSet<GateTransaction> GateTransactions { get; set; }
+
+    public virtual DbSet<TripSave> TripSaves { get; set; }
 
     public virtual DbSet<GateTransactionSeal> GateTransactionSeals { get; set; }
 
@@ -388,6 +392,57 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_booking_container__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<BoxReservation>(entity =>
+        {
+            entity.HasKey(e => e.BoxReservationId).HasName("pk_box_reservation");
+
+            entity.ToTable("box_reservation", "gate");
+
+            entity.HasIndex(e => new { e.TenantId, e.DraftId }, "ix_box_reservation__draft").HasFilter("([released_at] IS NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.BookingContainerId }, "uq_box_reservation__live_box")
+                .IsUnique()
+                .HasFilter("([released_at] IS NULL AND [booking_container_id] IS NOT NULL)");
+
+            entity.HasIndex(e => new { e.TenantId, e.ContainerNo }, "uq_box_reservation__live_number")
+                .IsUnique()
+                .HasFilter("([released_at] IS NULL AND [container_no] IS NOT NULL)");
+
+            entity.Property(e => e.BoxReservationId)
+                .HasDefaultValueSql("(newsequentialid())", "df_box_reservation__id")
+                .HasColumnName("box_reservation_id");
+            entity.Property(e => e.BookingContainerId).HasColumnName("booking_container_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.ContainerNo)
+                .HasMaxLength(11)
+                .IsUnicode(false)
+                .HasColumnName("container_no");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_box_reservation__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DraftId).HasColumnName("draft_id");
+            entity.Property(e => e.ExpiresAt).HasColumnName("expires_at");
+            entity.Property(e => e.GateTransactionId).HasColumnName("gate_transaction_id");
+            entity.Property(e => e.ReleaseReason)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("release_reason");
+            entity.Property(e => e.ReleasedAt).HasColumnName("released_at");
+            entity.Property(e => e.ReleasedBy).HasColumnName("released_by");
+            entity.Property(e => e.ReservedAt).HasColumnName("reserved_at");
+            entity.Property(e => e.ReservedBy).HasColumnName("reserved_by");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_box_reservation__updated_at")
                 .HasColumnName("updated_at");
             entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });
@@ -812,6 +867,19 @@ public partial class TosDbContext : DbContext
             entity.HasKey(e => e.GateTransactionId).HasName("pk_gate_transaction");
 
             entity.ToTable("gate_transaction", "gate");
+
+            entity.HasIndex(e => new { e.TenantId, e.IdempotencyKey }, "uq_gate_transaction__idempotency_key")
+                .IsUnique()
+                .HasFilter("([idempotency_key] IS NOT NULL)");
+
+            entity.Property(e => e.IdempotencyHash)
+                .HasMaxLength(32)
+                .IsFixedLength()
+                .HasColumnName("idempotency_hash");
+            entity.Property(e => e.IdempotencyKey)
+                .HasMaxLength(100)
+                .IsUnicode(false)
+                .HasColumnName("idempotency_key");
 
             entity.HasIndex(e => new { e.TenantId, e.BookingId }, "ix_gate_transaction__booking").HasFilter("([deleted_at] IS NULL)");
 
@@ -1910,6 +1978,53 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("vessel_code");
+        });
+
+        modelBuilder.Entity<TripSave>(entity =>
+        {
+            entity.HasKey(e => e.TripSaveId).HasName("pk_trip_save");
+
+            entity.ToTable("trip_save", "gate");
+
+            entity.HasIndex(e => new { e.TenantId, e.IdempotencyKey }, "uq_trip_save__idempotency_key").IsUnique();
+
+            entity.Property(e => e.TripSaveId)
+                .HasDefaultValueSql("(newsequentialid())", "df_trip_save__id")
+                .HasColumnName("trip_save_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_trip_save__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.DraftId).HasColumnName("draft_id");
+            entity.Property(e => e.IdempotencyHash)
+                .HasMaxLength(32)
+                .IsFixedLength()
+                .HasColumnName("idempotency_hash");
+            entity.Property(e => e.IdempotencyKey)
+                .HasMaxLength(100)
+                .IsUnicode(false)
+                .HasColumnName("idempotency_key");
+            entity.Property(e => e.ReceiptId).HasColumnName("receipt_id");
+            entity.Property(e => e.ReceiptNo)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("receipt_no");
+            entity.Property(e => e.ResultJson).HasColumnName("result_json");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.Status)
+                .HasMaxLength(12)
+                .IsUnicode(false)
+                .HasColumnName("status");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.TruckVisitId).HasColumnName("truck_visit_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_trip_save__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });
 
         OnModelCreatingPartial(modelBuilder);

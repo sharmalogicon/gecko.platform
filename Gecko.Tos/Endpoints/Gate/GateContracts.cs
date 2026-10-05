@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using Gecko.Revenue.Contracts;
 
 namespace Gecko.Tos.Endpoints.Gate;
 
@@ -147,7 +148,10 @@ public sealed record GateTransactionRequest(
     [property: MaxLength(20)] string? ClipOnNo = null,
     [property: MaxLength(40)] string? CustomsPermitNo = null,
     [property: MaxLength(40)] string? PaperlessCode = null,
-    [property: MaxLength(20)] string? NextLocationCode = null);
+    [property: MaxLength(20)] string? NextLocationCode = null,
+    // The screen's draft (GATE_IN_BIG_SAVE §1): a box another draft holds is refused (BOX_RESERVED);
+    // this draft's own hold is consumed by the move.
+    Guid? DraftId = null);
 
 /// <summary>
 /// A box that arrives with no order (owner 2026-10-04, GATE_IN_VECTOR_PARITY_FOR_API §1): the gate
@@ -164,7 +168,24 @@ public sealed record BlindOrderRequest(
     [property: MaxLength(40)] string? CarrierRef = null,
     [property: MaxLength(30)] string? AgentCode = null,
     [property: MaxLength(30)] string? HaulierCode = null,
-    [property: MaxLength(1000)] string? Remarks = null);
+    [property: MaxLength(1000)] string? Remarks = null,
+    // The screen's draft (GATE_IN_BIG_SAVE §1): a box another draft holds is refused (BOX_RESERVED).
+    Guid? DraftId = null);
+
+/// <summary>
+/// Record (GATE_IN_BIG_SAVE §1): hold a box for the truck being keyed. <see cref="DraftId"/> is the
+/// screen's id for that truck — the same draft holding the same box again is the same hold.
+/// Name a booked box by <see cref="BookingContainerId"/>; a box on no order yet by <see cref="ContainerNo"/>.
+/// </summary>
+public sealed record ReserveBoxRequest(
+    [property: Required] Guid? BranchId,
+    [property: Required] Guid? DraftId,
+    Guid? BookingContainerId = null,
+    [property: MaxLength(11)] string? ContainerNo = null);
+
+public sealed record BoxReservationResponse(
+    Guid BoxReservationId, Guid BranchId, Guid DraftId, Guid? BookingContainerId, string? ContainerNo,
+    Guid ReservedBy, string? ReservedByName, DateTimeOffset ReservedAt, DateTimeOffset ExpiresAt);
 
 /// <summary>
 /// One box the gate clerk can pick (GATE_IN_VECTOR_PARITY_FOR_API §2): the booking it is on and the
@@ -176,6 +197,58 @@ public sealed record BookableBoxResponse(
     string? ContainerNo, string? EquipmentTypeCode, BookableStepResponse NextStep);
 
 public sealed record BookableStepResponse(Guid MovementPlanId, short SequenceNo, string MovementCode, string Direction, string FullEmpty);
+
+// ── the big Save (GATE_IN_BIG_SAVE §2) ──────────────────────────────────────
+
+/// <summary>
+/// The whole truck in one Save (Vector GateIn.cs btnSave_Click). Header <c>Idempotency-Key</c> required.
+/// <see cref="Payment"/> null = take no money (a truck whose boxes owe no cash, or are on credit).
+/// <see cref="Vas"/>: the gate VAS the clerk ticked; each booking takes the codes its order type offers.
+/// </summary>
+public sealed record TripSaveRequest(
+    [property: Required] Guid? BranchId,
+    [property: Required] Guid? DraftId,
+    [property: Required] TruckRequest? Truck,
+    [property: Required, MinLength(1), MaxLength(4)] IReadOnlyList<TripRowRequest>? Rows,
+    IReadOnlyList<string>? Vas = null,
+    TripPaymentRequest? Payment = null);
+
+/// <summary>
+/// One box: a booked one (<see cref="BookingContainerId"/>) or one on no order (<see cref="Blind"/>, a BLIND GATE IN),
+/// and its gate fields as on <c>POST /gate/transactions</c> (<see cref="Move"/>; its branch, draft and truck are the Save's).
+/// </summary>
+public sealed record TripRowRequest(
+    Guid? BookingContainerId = null,
+    TripBlindRequest? Blind = null,
+    GateTransactionRequest? Move = null);
+
+public sealed record TripBlindRequest(
+    [property: Required, MaxLength(11)] string? ContainerNo,
+    [property: Required, MaxLength(30)] string? LineCode,
+    [property: MaxLength(30)] string? CustomerCode = null,
+    [property: MaxLength(20)] string? EquipmentTypeCode = null,
+    [property: MaxLength(40)] string? CarrierRef = null,
+    [property: MaxLength(30)] string? AgentCode = null,
+    [property: MaxLength(1000)] string? Remarks = null);
+
+/// <param name="ExpectedTotal">The cash total the card showed (VAT included); a different total now is 409 "The price changed".</param>
+public sealed record TripPaymentRequest(
+    TruckPayer? Payer, IReadOnlyList<TruckPaymentLine>? Payments, decimal ExpectedTotal, bool WithholdingTax = false);
+
+/// <summary>What the clerk prints: the receipt (one per truck) and an EIR per box that went through.</summary>
+public sealed record TripSaveResponse(
+    Guid TripSaveId, Guid? TruckVisitId, string? VisitNo, TripReceiptResponse? Receipt, IReadOnlyList<TripRowResponse> Rows);
+
+/// <param name="Nett">What was paid: the total less withholding tax.</param>
+public sealed record TripReceiptResponse(
+    Guid ReceiptId, string ReceiptNo, decimal Subtotal, decimal Tax, decimal Total, decimal WithholdingTax, decimal Nett,
+    string CurrencyCode, string PdfUrl);
+
+/// <param name="Status">GATED (an EIR) or NOT_GATED (<see cref="Reason"/> says why; a paid box keeps its coupon).</param>
+public sealed record TripRowResponse(
+    int Index, string ContainerNo, Guid BookingContainerId, string OrderNo, string Status,
+    string? EirNo, Guid? GateTransactionId, string? EirPdfUrl, string? CouponRef, string? Reason,
+    IReadOnlyList<GateFindingResponse> Findings);
 
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,

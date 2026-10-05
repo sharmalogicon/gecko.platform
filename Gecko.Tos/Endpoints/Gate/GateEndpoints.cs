@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Gecko.Data;
+using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
 using Gecko.Tos.Application;
@@ -93,8 +94,8 @@ internal static class GateEndpoints
     /// leaves out the boxes already on this truck.
     /// </summary>
     private static async Task<Results<Ok<PagedResult<BookableBoxResponse>>, ValidationProblem, ProblemHttpResult>> BookableBoxesAsync(
-        [AsParameters] ListQuery query, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct,
-        Guid? branchId = null, string? direction = null, string? fullEmpty = null, Guid[]? excludeBookingContainerIds = null)
+        [AsParameters] ListQuery query, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
+        Guid? branchId = null, string? direction = null, string? fullEmpty = null, Guid[]? excludeBookingContainerIds = null, Guid? draftId = null)
     {
         if (branchId is null) return TosSupport.Invalid("branchId", "Which gate? A barrier belongs to a depot.");
         if (!scope.HasAt(TosPermissions.GateView, branchId.Value)) return TosScope.OutsideYourBranches("You cannot read that depot's gate.");
@@ -122,6 +123,15 @@ internal static class GateEndpoints
 
         // The step's direction and full/empty are MDM rules: read them per order type, then filter.
         var candidates = await rows.OrderByDescending(r => r.b.CreatedAt).ThenBy(r => r.x.ContainerNo).Take(MaxBookableBoxes).ToListAsync(ct);
+        // A box another truck's clerk holds (Record, GATE_IN_BIG_SAVE §1) is not offered.
+        var now = time.GetUtcNow();
+        var ids = candidates.Select(r => r.x.BookingContainerId).ToList();
+        var numbers = candidates.Select(r => r.x.ContainerNo).OfType<string>().ToList();
+        var held = await db.BoxReservations.AsNoTracking()
+            .Where(h => h.ReleasedAt == null && h.ExpiresAt > now && h.DraftId != draftId
+                        && ((h.BookingContainerId != null && ids.Contains(h.BookingContainerId.Value)) || (h.ContainerNo != null && numbers.Contains(h.ContainerNo))))
+            .Select(h => new { h.BookingContainerId, h.ContainerNo }).ToListAsync(ct);
+        candidates = candidates.Where(r => !held.Any(h => h.BookingContainerId == r.x.BookingContainerId || (h.ContainerNo != null && h.ContainerNo == r.x.ContainerNo))).ToList();
         var plans = await master.OrderTypePlansAsync(candidates.Select(r => r.b.OrderTypeCode).Distinct(), ct);
         var picked = candidates
             .Select(r => (Row: r, Rules: plans.GetValueOrDefault(r.b.OrderTypeCode)?.Steps.FirstOrDefault(s => s.OrderTypeMovementId == r.next!.OrderTypeMovementId)))
@@ -147,7 +157,8 @@ internal static class GateEndpoints
     private static async Task<Results<Ok<GatePreflightResponse>, ValidationProblem, ProblemHttpResult>> PreflightAsync(
         BarrierReader barrier, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
         Guid? branchId = null, string? containerNo = null, string? direction = null, DateTimeOffset? at = null,
-        Guid? truckVisitId = null, string? truckCategoryCode = null, string? haulierCode = null)
+        Guid? truckVisitId = null, string? truckCategoryCode = null, string? haulierCode = null, Guid? draftId = null,
+        IUserDirectory? users = null)
     {
         if (branchId is null) return TosSupport.Invalid("branchId", "Which gate? A barrier belongs to a depot.");
         if (string.IsNullOrWhiteSpace(containerNo)) return TosSupport.Invalid("containerNo", "The number the camera or the clerk read.");
@@ -158,6 +169,7 @@ internal static class GateEndpoints
             return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
 
         var view = await barrier.ReadAsync(branchId.Value, containerNo, way, at ?? time.GetUtcNow(), ct);
+        if (await HeldFindingAsync(db, users, view, draftId, time.GetUtcNow(), ct) is { } held) view.Findings.Add(held);
 
         // The truck, when the clerk has named it: is it the truck that was paid for (§7.4, §7.5)?
         var (category, haulier) = (truckCategoryCode.Clean(), haulierCode.Clean());
@@ -193,12 +205,31 @@ internal static class GateEndpoints
 
     private static async Task<Results<Created<GateTransactionResponse>, ValidationProblem, ProblemHttpResult>> RecordAsync(
         GateTransactionRequest request, TosDbContext db, BarrierReader barrier, IMasterDataReferences master,
-        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, IUserDirectory users,
+        HttpContext http, CancellationToken ct)
+    {
+        // A repeated request with the same Idempotency-Key (a retry after a lost answer) gets the EIR
+        // the first one recorded — not "nothing pending", and never a second move (gecko_tos 24).
+        var (key, badKey) = Idempotency.KeyOf(http.Request);
+        if (badKey is not null) return TosSupport.Invalid(Idempotency.Header, badKey);
+        return await RecordCoreAsync(request, key, db, barrier, master, clock, caller, scope, time, users, ct);
+    }
+
+    /// <summary>
+    /// The gate move itself — the endpoint above, and each row of the big Save (TripEndpoints), which gives
+    /// every row its own key so a resumed Save answers with the EIRs already recorded.
+    /// </summary>
+    internal static async Task<Results<Created<GateTransactionResponse>, ValidationProblem, ProblemHttpResult>> RecordCoreAsync(
+        GateTransactionRequest request, string? key, TosDbContext db, BarrierReader barrier, IMasterDataReferences master,
+        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, IUserDirectory users, CancellationToken ct)
     {
         var branchId = request.BranchId!.Value;
         var way = request.Direction.Clean()!;
         if (!scope.HasAt(TosPermissions.GateCreate, branchId))
             return TosScope.OutsideYourBranches("That gate is at a depot you do not cover.");
+
+        var hash = key is null ? null : Idempotency.HashOf(request);
+        if (key is not null && await ReplayAsync(db, key, hash!, ct) is { } replay) return replay;
 
         var branch = (await clock.BranchesAsync([branchId], ct)).GetValueOrDefault(branchId);
         if (branch is null) return TosSupport.Invalid("branchId", "Unknown branch.");
@@ -234,6 +265,8 @@ internal static class GateEndpoints
 
         var findings = view.Findings.ToList();
         findings.AddRange(GateRules.Observations(view.StepRules, request.GrossWeightKg, seals.Count));
+        // Another truck's clerk holds this box (Record, GATE_IN_BIG_SAVE §1).
+        if (await HeldFindingAsync(db, users, view, request.DraftId, now, ct) is { } held) findings.Add(held);
 
         if (findings.Any(f => f.Severity == GateSeverity.Block)) return Refused(view with { Findings = findings });
 
@@ -375,9 +408,19 @@ internal static class GateEndpoints
             CustomsPermitNo = request.CustomsPermitNo.Clean(),
             PaperlessCode = request.PaperlessCode.Clean(),
             NextLocationCode = request.NextLocationCode.Clean(),
+            IdempotencyKey = key,
+            IdempotencyHash = hash,
         };
         db.GateTransactions.Add(transaction);
-        await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
+        try { await db.SaveChangesAsync(ct); }   // the id comes from NEWSEQUENTIALID()
+        catch (DbUpdateException e) when (key is not null && e.InnerException?.Message.Contains("uq_gate_transaction__idempotency_key") == true)
+        {
+            // The same key arrived twice at once and the other request won: answer with its EIR.
+            await tx.RollbackAsync(ct);
+            db.ChangeTracker.Clear();
+            return await ReplayAsync(db, key, hash!, ct)
+                   ?? TosSupport.Conflict($"A request with {Idempotency.Header} {key} is still being processed.", "Repeat it in a moment.");
+        }
 
         foreach (var seal in seals)
             db.GateTransactionSeals.Add(new GateTransactionSeal
@@ -468,6 +511,9 @@ internal static class GateEndpoints
             couponRow.ConsumedAt = at;
         }
 
+        // ── the holds on the box are done: it went through ─────────────────
+        await BoxReservations.ConsumeAsync(db, view.Assignment.BookingContainerId, view.ContainerNo, transaction.GateTransactionId, caller.UserId(), now, ct);
+
         // ── the outbox: the LINE message leaves from here, not from the barrier ─
         await QueueAsync(db, transaction, view, visit, taken, completed, ct);
 
@@ -476,6 +522,33 @@ internal static class GateEndpoints
 
         var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct, findings);
         return TypedResults.Created($"/api/tos/gate/transactions/{transaction.GateTransactionId}", response);
+    }
+
+    /// <summary>The EIR an earlier request with this key recorded, answered as that request was (201); a 422 for another body; null when the key is new.</summary>
+    private static async Task<Results<Created<GateTransactionResponse>, ValidationProblem, ProblemHttpResult>?> ReplayAsync(
+        TosDbContext db, string key, byte[] hash, CancellationToken ct)
+    {
+        var made = await db.GateTransactions.AsNoTracking().Where(g => g.IdempotencyKey == key)
+            .Select(g => new { g.GateTransactionId, g.IdempotencyHash, g.BookingContainerId }).SingleOrDefaultAsync(ct);
+        if (made is null) return null;
+        if (!Idempotency.SameRequest(made.IdempotencyHash, hash)) return Idempotency.DifferentRequest(key);
+        var visitId = await db.ContainerVisits.AsNoTracking()
+            .Where(v => v.GateInTransactionId == made.GateTransactionId || v.GateOutTransactionId == made.GateTransactionId)
+            .Select(v => (Guid?)v.ContainerVisitId).FirstOrDefaultAsync(ct);
+        var completed = await db.BookingContainers.AsNoTracking()
+            .AnyAsync(x => x.BookingContainerId == made.BookingContainerId && x.EndReason == "COMPLETED", ct);
+        return TypedResults.Created($"/api/tos/gate/transactions/{made.GateTransactionId}",
+            await ProjectAsync(db, made.GateTransactionId, visitId, completed, ct));
+    }
+
+    /// <summary>BOX_RESERVED when another draft holds the box the barrier is reading (GATE_IN_BIG_SAVE §1).</summary>
+    private static async Task<GateFinding?> HeldFindingAsync(TosDbContext db, IUserDirectory? users, BarrierView view, Guid? draftId,
+        DateTimeOffset now, CancellationToken ct)
+    {
+        var hold = await BoxReservations.HeldByOtherAsync(db, view.Assignment?.BookingContainerId, view.ContainerNo, draftId, now, ct);
+        if (hold is null) return null;
+        var name = users is null ? null : (await users.DisplayNamesAsync([hold.ReservedBy], ct)).GetValueOrDefault(hold.ReservedBy);
+        return BoxReservations.Finding(hold, name);
     }
 
     // ── void ────────────────────────────────────────────────────────────────

@@ -79,6 +79,44 @@ public sealed class GateBlindOrderApiTests(TosApiFactory api)
         }
     }
 
+    /// <summary>
+    /// Record on a blind row (GATE_IN_BIG_SAVE §1): the first movement priced as the window will price it
+    /// once the order exists — and nothing is created.
+    /// </summary>
+    [Fact]
+    public async Task A_blind_box_is_priced_before_any_order_exists()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        await TestDatabase.GateChargeOnBlindGateInAsync(add: true);
+        try
+        {
+            async Task<Gecko.Revenue.Endpoints.Window.WindowBookingResponse> PreviewAsync(string truck) =>
+                (await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Window.WindowBookingResponse>(
+                    $"/api/revenue/window/preview?branchId={SctLcb01}&orderTypeCode=BLIND%20GATE%20IN&lineCode=MAEU&customerCode=CUS-TAE&equipmentTypeCode=40GP&containerNo={BoxC}{truck}", ct))!;
+
+            var anyTruck = await PreviewAsync("");
+            var box = Assert.Single(anyTruck.Boxes);
+            Assert.Equal(("MTY_IN", "IN", BoxC), (box.NextMovementCode, box.Direction, box.ContainerNo));
+            var line = Assert.Single(box.Due);
+            Assert.Equal(("GATETRIP", 100m), (line.ChargeCode, line.Amount));
+            Assert.Equal((line.Amount + line.TaxAmount, anyTruck.Total), (line.Total, line.Total));
+            Assert.Equal(("", Guid.Empty), (anyTruck.OrderNo, anyTruck.BookingId));
+
+            // The truck category is a tariff axis, as at the window.
+            Assert.Equal(140m, Assert.Single(Assert.Single((await PreviewAsync("&truckCategoryCode=18_WHEEL")).Boxes).Due).Amount);
+
+            // Nothing was created: the box is still on no order.
+            var preflight = (await client.GetFromJsonAsync<GatePreflightResponse>(
+                $"{Gate}/preflight?branchId={SctLcb01}&containerNo={BoxC}&direction=IN", ct))!;
+            Assert.Contains(preflight.Findings, f => f.Code == "NO_ASSIGNMENT");
+
+            var bad = await client.GetAsync($"/api/revenue/window/preview?branchId={SctLcb01}&orderTypeCode=NO%20SUCH", ct);
+            Assert.Equal(HttpStatusCode.BadRequest, bad.StatusCode);
+        }
+        finally { await TestDatabase.GateChargeOnBlindGateInAsync(add: false); }
+    }
+
     [Fact]
     public async Task A_blind_order_needs_a_customer_and_a_box_that_is_on_no_other_order()
     {

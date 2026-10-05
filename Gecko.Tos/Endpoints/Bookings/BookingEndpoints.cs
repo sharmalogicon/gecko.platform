@@ -256,6 +256,13 @@ internal static class BookingEndpoints
         if (prior is not null && prior.OrderTypeCode == BlindGateIn && prior.Status == BookingRules.Open && prior.BranchId == branchId)
             return TypedResults.Ok((await DetailAsync(db, clock, master, users, prior.BookingId, ct))!);
 
+        // Another truck's clerk holds this box (Record, GATE_IN_BIG_SAVE §1).
+        if (await BoxReservations.HeldByOtherAsync(db, null, containerNo, request.DraftId, DateTimeOffset.UtcNow, ct) is { } held)
+        {
+            var name = (await users.DisplayNamesAsync([held.ReservedBy], ct)).GetValueOrDefault(held.ReservedBy);
+            return TosSupport.Conflict(BoxReservations.Finding(held, name).Message, "Pick another box, or ask that clerk to remove it from their truck.");
+        }
+
         var equipmentType = request.EquipmentTypeCode.Clean()
                             ?? (await master.ContainersAsync([containerNo], ct)).GetValueOrDefault(containerNo)?.EquipmentTypeCode;
         var save = new SaveBookingRequest(request.BranchId, BlindGateIn, request.LineCode,

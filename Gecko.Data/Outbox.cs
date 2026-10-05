@@ -58,9 +58,26 @@ public sealed class OutboxOptions
 /// backoff, the dead letter that is kept rather than deleted) live in the
 /// procedures where they can be tested without a host.
 /// </summary>
+/// <summary>
+/// Ends every idle dispatcher's wait at once. A request that has just queued a message another
+/// context must act on before it can answer (the gate's big Save: a blind order Revenue must know,
+/// a receipt whose coupons the barrier must hold) wakes the dispatchers instead of sitting out the
+/// poll interval. Waking is a hint, never a requirement: a missed wake costs one poll, nothing more.
+/// </summary>
+public sealed class OutboxWake
+{
+    private TaskCompletionSource _next = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Wake() => Interlocked.Exchange(ref _next, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
+
+    /// <summary>Completes on the next <see cref="Wake"/>.</summary>
+    public Task NextAsync() => Volatile.Read(ref _next).Task;
+}
+
 public sealed class OutboxDispatcher(
     IServiceScopeFactory scopes,
     OutboxOptions settings,
+    OutboxWake wake,
     ILogger<OutboxDispatcher> log) : BackgroundService
 {
     private readonly string _workerId = $"{settings.Context}:{Environment.MachineName}:{Environment.ProcessId}";
@@ -78,6 +95,8 @@ public sealed class OutboxDispatcher(
         while (!stoppingToken.IsCancellationRequested)
         {
             var handled = 0;
+            // Taken BEFORE draining: a wake while this pass runs ends the next wait at once.
+            var woken = wake.NextAsync();
             try
             {
                 handled = await DrainAsync(stoppingToken);
@@ -92,9 +111,9 @@ public sealed class OutboxDispatcher(
                 log.LogError(ex, "Outbox dispatcher for {Context} could not reach the queue.", settings.Context);
             }
 
-            // A busy queue is drained without pausing; an idle one is polled.
+            // A busy queue is drained without pausing; an idle one is polled — or woken.
             if (handled == 0)
-                await Task.Delay(settings.PollInterval, stoppingToken).ConfigureAwait(false);
+                await Task.WhenAny(Task.Delay(settings.PollInterval, stoppingToken), woken).ConfigureAwait(false);
         }
     }
 
@@ -233,6 +252,7 @@ public static class OutboxRegistration
     {
         services.TryAddSingleton<IOutboxConnectionSource, ConfigurationOutboxConnections>();
         services.TryAddScoped<OutboxTenantScope>();
+        services.TryAddSingleton<OutboxWake>();
         var options = new OutboxOptions { Context = context, ConnectionName = connectionName };
         configure?.Invoke(options);
         services.AddSingleton<IHostedService>(sp => ActivatorUtilities.CreateInstance<OutboxDispatcher>(sp, options));

@@ -48,6 +48,7 @@ public static class TosModule
 
         services.AddScoped<BranchClock>();
         services.AddScoped<BarrierReader>();
+        services.AddScoped<Gecko.Tos.Contracts.ITosBookingHeaders, TosBookingHeaders>();
         services.AddScoped<EirDocument>();
         services.AddGeckoFileStore(configuration);
 
@@ -66,6 +67,8 @@ public static class TosModule
             .MapHoldEndpoints()
             .MapReeferEndpoints()
             .MapGateEndpoints()
+            .MapReservationEndpoints()
+            .MapTripEndpoints()
             .MapContainerStoryEndpoints()
             .MapYardStockEndpoints()
             .MapReportEndpoints()

@@ -75,7 +75,9 @@ public sealed record GateTransactionResponse(
     string? CustomsPermitNo = null, string? PaperlessCode = null, string? NextLocationCode = null,
     // What the barrier said as the move was recorded (warnings and notes — a refusal never gets
     // this far), e.g. a truck that is not the one paid for. Not stored: null when an EIR is read back.
-    IReadOnlyList<GateFindingResponse>? Findings = null);
+    IReadOnlyList<GateFindingResponse>? Findings = null,
+    // gecko_tos 26 (A5): the height stored on the move. Appended, so existing readers are unaffected.
+    string? HeightCode = null);
 
 public sealed record GateSealResponse(string SealNo, string SealType, bool IsIntact, bool? MatchesDeclared);
 
@@ -151,7 +153,9 @@ public sealed record GateTransactionRequest(
     [property: MaxLength(20)] string? NextLocationCode = null,
     // The screen's draft (GATE_IN_BIG_SAVE §1): a box another draft holds is refused (BOX_RESERVED);
     // this draft's own hold is consumed by the move.
-    Guid? DraftId = null);
+    Guid? DraftId = null,
+    // GATE_IN_COMPLETION_PLAN A5 (Vector GateIn.cs:3352): null = the equipment type's height class.
+    [property: AllowedValues(null, "STANDARD", "HIGH_CUBE", "HALF")] string? HeightCode = null);
 
 /// <summary>
 /// A box that arrives with no order (owner 2026-10-04, GATE_IN_VECTOR_PARITY_FOR_API §1): the gate
@@ -198,6 +202,22 @@ public sealed record BookableBoxResponse(
 
 public sealed record BookableStepResponse(Guid MovementPlanId, short SequenceNo, string MovementCode, string Direction, string FullEmpty);
 
+/// <summary>
+/// One gate VAS an order type offers (GATE_IN_COMPLETION_PLAN A3): the clerk ticks it on an EMPTY drop-off or a
+/// pick-up, and the Save prices it (<c>vas</c>). <see cref="PaymentTermCode"/> null = CASH or CREDIT, as the
+/// truck's terms say. <see cref="OfferedOnMovements"/>: this order type's steps where it can be ticked.
+/// </summary>
+public sealed record GateVasResponse(
+    string ChargeCode, string Description, string? DescriptionLocal, string BillTo, string? PaymentTermCode,
+    string OfferedOn, IReadOnlyList<string> OfferedOnMovements);
+
+/// <summary>The gate's damage panel (GATE_IN_COMPLETION_PLAN A4): MDM's CEDEX codes, read under tos.gate.view.</summary>
+public sealed record GateDamageCodesResponse(
+    IReadOnlyList<GateDamageCodeResponse> DamageCodes, IReadOnlyList<string> Locations, IReadOnlyList<string> Components);
+
+/// <param name="MakesUnserviceable">Ticking it makes the box unserviceable and puts on the depot's damage hold.</param>
+public sealed record GateDamageCodeResponse(string DamageCode, string Description, byte Severity, bool MakesUnserviceable);
+
 // ── the big Save (GATE_IN_BIG_SAVE §2) ──────────────────────────────────────
 
 /// <summary>
@@ -216,11 +236,19 @@ public sealed record TripSaveRequest(
 /// <summary>
 /// One box: a booked one (<see cref="BookingContainerId"/>) or one on no order (<see cref="Blind"/>, a BLIND GATE IN),
 /// and its gate fields as on <c>POST /gate/transactions</c> (<see cref="Move"/>; its branch, draft and truck are the Save's).
+/// <see cref="Damages"/> (A4, a drop-off only): saved with the move as its GATE_IN survey, with the move's condition and
+/// grade (Vector GateIn.cs:1091, 2079); an unserviceable code puts on the depot's damage hold.
+/// <see cref="EquipmentTypeCode"/> (A11, a booked box): the type the clerk sees. Another type than booked is 409
+/// TYPE_MISMATCH; on an IMPORT FULL drop-off, <see cref="AcceptTypeChange"/> moves the box to the booking's line of
+/// that type first (Vector GateIn.cs:1123, owner D3).
 /// </summary>
 public sealed record TripRowRequest(
     Guid? BookingContainerId = null,
     TripBlindRequest? Blind = null,
-    GateTransactionRequest? Move = null);
+    GateTransactionRequest? Move = null,
+    IReadOnlyList<SurveyDamageRequest>? Damages = null,
+    [property: MaxLength(20)] string? EquipmentTypeCode = null,
+    bool AcceptTypeChange = false);
 
 public sealed record TripBlindRequest(
     [property: Required, MaxLength(11)] string? ContainerNo,
@@ -236,19 +264,24 @@ public sealed record TripPaymentRequest(
     TruckPayer? Payer, IReadOnlyList<TruckPaymentLine>? Payments, decimal ExpectedTotal, bool WithholdingTax = false);
 
 /// <summary>What the clerk prints: the receipt (one per truck) and an EIR per box that went through.</summary>
+/// <param name="TruckInPdfUrl">The truck-in form (A10), once a box went through.</param>
 public sealed record TripSaveResponse(
-    Guid TripSaveId, Guid? TruckVisitId, string? VisitNo, TripReceiptResponse? Receipt, IReadOnlyList<TripRowResponse> Rows);
+    Guid TripSaveId, Guid? TruckVisitId, string? VisitNo, TripReceiptResponse? Receipt, IReadOnlyList<TripRowResponse> Rows,
+    string? TruckInPdfUrl = null);
 
 /// <param name="Nett">What was paid: the total less withholding tax.</param>
+/// <param name="CouponPdfUrl">The coupon slips, one per box (A10).</param>
 public sealed record TripReceiptResponse(
     Guid ReceiptId, string ReceiptNo, decimal Subtotal, decimal Tax, decimal Total, decimal WithholdingTax, decimal Nett,
-    string CurrencyCode, string PdfUrl);
+    string CurrencyCode, string PdfUrl, string? CouponPdfUrl = null);
 
 /// <param name="Status">GATED (an EIR) or NOT_GATED (<see cref="Reason"/> says why; a paid box keeps its coupon).</param>
+/// <param name="SurveyId">The GATE_IN survey of the row's damages (A4); <see cref="HoldsApplied"/>: the holds it put on.</param>
 public sealed record TripRowResponse(
     int Index, string ContainerNo, Guid BookingContainerId, string OrderNo, string Status,
     string? EirNo, Guid? GateTransactionId, string? EirPdfUrl, string? CouponRef, string? Reason,
-    IReadOnlyList<GateFindingResponse> Findings);
+    IReadOnlyList<GateFindingResponse> Findings,
+    Guid? SurveyId = null, IReadOnlyList<string>? HoldsApplied = null);
 
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,

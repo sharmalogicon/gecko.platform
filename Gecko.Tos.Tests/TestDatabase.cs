@@ -260,6 +260,7 @@ internal static class TestDatabase
             DELETE FROM yard.container_visit   WHERE container_visit_id IN (SELECT id FROM @cv);
             DELETE FROM gate.gate_authorization WHERE booking_id IN (SELECT id FROM @b);
             DELETE FROM gate.attachment WHERE owner_id IN (SELECT id FROM @g) OR owner_id IN (SELECT id FROM @v);
+            DELETE FROM gate.gate_transaction_correction WHERE gate_transaction_id IN (SELECT id FROM @g);
             DELETE FROM gate.gate_transaction_seal WHERE gate_transaction_id IN (SELECT id FROM @g);
             DELETE FROM outbox.message         WHERE aggregate_id IN (SELECT id FROM @g);
             DELETE FROM gate.gate_transaction  WHERE gate_transaction_id IN (SELECT id FROM @g);

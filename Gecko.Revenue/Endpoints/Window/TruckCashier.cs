@@ -24,6 +24,15 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
         return await db.BookingPlans.AsNoTracking().CountAsync(p => wanted.Contains(p.BookingId), ct) == wanted.Count;
     }
 
+    public async Task<bool> KnowsBoxTypesAsync(IReadOnlyDictionary<Guid, string> typeByBookingContainerId, CancellationToken ct)
+    {
+        var ids = typeByBookingContainerId.Keys.ToList();
+        var known = await db.BookingPlanContainers.AsNoTracking().Where(c => ids.Contains(c.BookingContainerId))
+            .Select(c => new { c.BookingContainerId, c.EquipmentTypeCode }).ToListAsync(ct);
+        return known.Count == ids.Count
+               && known.All(c => string.Equals(c.EquipmentTypeCode, typeByBookingContainerId[c.BookingContainerId], StringComparison.OrdinalIgnoreCase));
+    }
+
     public async Task<TruckPaymentResult> PayAsync(TruckPaymentRequest request, CancellationToken ct)
     {
         var hash = Idempotency.HashOf(request with { CashierUserId = Guid.Empty });
@@ -97,7 +106,8 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
         if (shift is null) return Refused(409, "Your drawer is not open at this branch.", "Open it (POST /api/revenue/window/shifts) before taking payment.");
 
         var payerName = request.Payer?.Name?.Trim();
-        if (string.IsNullOrEmpty(payerName) && payable.Count == 1 && payable[0].Context.Plan.CustomerPartyCode is { } customer)
+        // Vector GateIn.cs:2342: the invoice is made out to the first box's customer unless the clerk names a payer.
+        if (string.IsNullOrEmpty(payerName) && groups[0].Context.Plan.CustomerPartyCode is { } customer)
             payerName = (await master.PartiesAsync([customer], ct)).GetValueOrDefault(customer)?.Name;
 
         try

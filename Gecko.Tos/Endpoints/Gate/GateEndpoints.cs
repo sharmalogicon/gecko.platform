@@ -70,8 +70,19 @@ internal static class GateEndpoints
             .WithSummary("The boxes a gate clerk can pick, each with its next step")
             .WithDescription("Open bookings at the depot; filter by the next step's direction (IN/OUT) and full/empty, leave out the boxes already on this truck. Search matches the order no, B/L, customer ref or container no.");
 
+        gate.MapGet("/vas", VasAsync)
+            .RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("The gate VAS an order type offers (the clerk's VAS panel)")
+            .WithDescription("Offered on an EMPTY drop-off or a pick-up. Tick them into the Save's vas; the window prices them.");
+
+        gate.MapGet("/damage-codes", DamageCodesAsync)
+            .RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("The CEDEX damage codes, locations and components (the clerk's damage panel)");
+
         gate.MapGet("/visits", ListVisitsAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("Trucks at the depot");
         gate.MapGet("/visits/{id:guid}", GetVisitAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("One truck visit and its boxes");
+        gate.MapGet("/visits/{id:guid}/truck-in.pdf", TruckInPdfAsync).RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("The truck-in form: the truck, driver, haulier and every box with movement, seals and weights (Vector TMS_TruckInForm)");
         gate.MapPost("/visits/{id:guid}/depart", DepartAsync).RequireBranchPermission(TosPermissions.GateCreate)
             .WithSummary("The truck leaves — closes the visit and stops the dwell clock");
 
@@ -93,6 +104,44 @@ internal static class GateEndpoints
     /// The direction / full-empty filters read that step's MDM rules; <paramref name="excludeBookingContainerIds"/>
     /// leaves out the boxes already on this truck.
     /// </summary>
+    /// <summary>The damage panel's lists, for a clerk who cannot read MDM's equipment screens (A4).</summary>
+    private static async Task<Ok<GateDamageCodesResponse>> DamageCodesAsync(IMasterDataReferences master, CancellationToken ct)
+    {
+        var codes = await master.SurveyCodesAsync(ct);
+        return TypedResults.Ok(new GateDamageCodesResponse(
+            codes.DamageCodes.Values.OrderBy(d => d.DamageCode)
+                .Select(d => new GateDamageCodeResponse(d.DamageCode, d.DescriptionEn, d.Severity, d.MakesUnserviceable)).ToList(),
+            codes.Locations.Order().ToList(),
+            codes.Components.Order().ToList()));
+    }
+
+    /// <summary>
+    /// GATE_IN_COMPLETION_PLAN A3: an order type's gate VAS (value-added, raised at the gate), for a clerk who has no
+    /// commercial master-data permission. The same rule the window prices by (CashQuoter.OffersVas).
+    /// </summary>
+    private static async Task<Results<Ok<List<GateVasResponse>>, ValidationProblem>> VasAsync(
+        IMasterDataReferences master, CancellationToken ct, string? orderTypeCode = null)
+    {
+        var code = orderTypeCode.Clean();
+        if (code is null) return TosSupport.Invalid("orderTypeCode", "Which order type? The VAS come from the box's order.");
+        var plan = (await master.OrderTypePlansAsync([code], ct)).GetValueOrDefault(code);
+        if (plan is not { IsActive: true }) return TosSupport.Invalid("orderTypeCode", $"'{code}' is not an active order type.");
+
+        var offered = plan.Steps.Where(s => s.Direction == GateRules.Out || (s.Direction == GateRules.In && s.FullEmpty == GateRules.Empty))
+            .OrderBy(s => s.SequenceNo).Select(s => s.MovementCode).ToList();
+        var vas = (await master.OrderTypeChargesAsync(code, ct)).Where(c => c.IsValueAddedService && c.RaiseAtGateIn).ToList();
+        var names = (await master.ChargeVariantsAsync(vas.Select(v => v.ChargeCode).Distinct(), ct))
+            .GroupBy(v => v.ChargeCode, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        return TypedResults.Ok(vas
+            .DistinctBy(v => (v.ChargeCode, v.BillTo, v.PaymentTermCode))
+            .OrderBy(v => v.ChargeCode).ThenBy(v => v.BillTo).ThenBy(v => v.PaymentTermCode)
+            .Select(v => new GateVasResponse(v.ChargeCode, names.GetValueOrDefault(v.ChargeCode)?.DescriptionEn ?? v.ChargeCode,
+                names.GetValueOrDefault(v.ChargeCode)?.DescriptionLocal, v.BillTo, v.PaymentTermCode,
+                "An EMPTY drop-off or a pick-up", offered))
+            .ToList());
+    }
+
     private static async Task<Results<Ok<PagedResult<BookableBoxResponse>>, ValidationProblem, ProblemHttpResult>> BookableBoxesAsync(
         [AsParameters] ListQuery query, TosDbContext db, IMasterDataReferences master, ICallerPermissions scope, TimeProvider time, CancellationToken ct,
         Guid? branchId = null, string? direction = null, string? fullEmpty = null, Guid[]? excludeBookingContainerIds = null, Guid? draftId = null)
@@ -408,6 +457,9 @@ internal static class GateEndpoints
             CustomsPermitNo = request.CustomsPermitNo.Clean(),
             PaperlessCode = request.PaperlessCode.Clean(),
             NextLocationCode = request.NextLocationCode.Clean(),
+            HeightCode = request.HeightCode.Clean() ?? (view.Requirement?.EquipmentTypeCode is { } typeCode
+                ? (await master.EquipmentTypesAsync([typeCode], ct)).GetValueOrDefault(typeCode)?.HeightClass
+                : null),
             IdempotencyKey = key,
             IdempotencyHash = hash,
         };
@@ -539,6 +591,37 @@ internal static class GateEndpoints
             .AnyAsync(x => x.BookingContainerId == made.BookingContainerId && x.EndReason == "COMPLETED", ct);
         return TypedResults.Created($"/api/tos/gate/transactions/{made.GateTransactionId}",
             await ProjectAsync(db, made.GateTransactionId, visitId, completed, ct));
+    }
+
+    /// <summary>
+    /// What would refuse this move, read before any money is taken (GATE_IN_COMPLETION_PLAN A1): the barrier's
+    /// BLOCK findings except "not paid yet" (NO_COUPON), and the trip's mandatory fields. A blind row has no
+    /// order yet, so NO_ASSIGNMENT is expected and its step is BLIND GATE IN's first.
+    /// </summary>
+    internal static async Task<List<GateFinding>> PrecheckAsync(GateTransactionRequest move, bool blind, BarrierReader barrier,
+        IMasterDataReferences master, TimeProvider time, CancellationToken ct)
+    {
+        var way = move.Direction.Clean()!;
+        var view = await barrier.ReadAsync(move.BranchId!.Value, move.ContainerNo, way, move.TransactionAt ?? time.GetUtcNow(), ct);
+        var blocks = view.Findings
+            .Where(f => f.Severity == GateSeverity.Block && f.Code != "NO_COUPON" && !(blind && f.Code == "NO_ASSIGNMENT"))
+            .ToList();
+        if (GateRules.TripTypeContradiction(move.TripType.Clean()!, way) is { } contradiction)
+            blocks.Add(new GateFinding("TRIP_TYPE", contradiction, GateSeverity.Block));
+
+        string? fullEmpty = view.StepRules?.FullEmpty;
+        var export = view.Booking?.DirectionCode.Contains("EXPORT", StringComparison.OrdinalIgnoreCase) ?? false;
+        if (fullEmpty is null && blind)
+            fullEmpty = (await master.OrderTypePlansAsync(["BLIND GATE IN"], ct)).GetValueOrDefault("BLIND GATE IN")?
+                .Steps.OrderBy(s => s.SequenceNo).FirstOrDefault()?.FullEmpty;
+        // Vector GateIn.cs:1191: a box with no paperwork comes in EMPTY; a laden one needs a real order.
+        if (blind && (fullEmpty == GateRules.Full || move.CargoWeightKg > 0))
+            blocks.Add(new GateFinding("BLIND_FULL", "A box on no order (BLIND GATE IN) can only come in EMPTY: a FULL box needs its booking.", GateSeverity.Block));
+        if (fullEmpty is not null)
+            foreach (var (field, messages) in GateRules.MissingForTrip(move.TripType.Clean()!, fullEmpty, export,
+                         move.TareWeightKg, move.MaxGrossWeightKg, move.CargoWeightKg, move.CustomsPermitNo, (move.Seals ?? []).Count))
+                blocks.Add(new GateFinding("MISSING_FIELD", $"{field}: {string.Join(" ", messages)}", GateSeverity.Block));
+        return blocks;
     }
 
     /// <summary>BOX_RESERVED when another draft holds the box the barrier is reading (GATE_IN_BIG_SAVE §1).</summary>
@@ -695,6 +778,19 @@ internal static class GateEndpoints
         if (branchId is not { } b || !scope.HasAt(TosPermissions.GateView, b)) return TypedResults.NotFound();
 
         var rendered = await eir.RenderAsync(id, ct);
+        return rendered is null
+            ? TypedResults.NotFound()
+            : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
+    }
+
+    private static async Task<Results<FileContentHttpResult, NotFound>> TruckInPdfAsync(
+        Guid id, TosDbContext db, TruckInDocument form, ICallerPermissions scope, CancellationToken ct)
+    {
+        var branchId = await db.TruckVisits.AsNoTracking()
+            .Where(v => v.TruckVisitId == id).Select(v => (Guid?)v.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is not { } b || !scope.HasAt(TosPermissions.GateView, b)) return TypedResults.NotFound();
+
+        var rendered = await form.RenderAsync(id, ct);
         return rendered is null
             ? TypedResults.NotFound()
             : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
@@ -1018,6 +1114,7 @@ internal static class GateEndpoints
             row.TruckCategoryCode, g.TripTypeCode, g.MaterialCode,
             g.MaxGrossWeightKg, g.CargoWeightKg, g.VentSetting, g.HumidityPct,
             g.GensetNo, g.ClipOnNo, g.CustomsPermitNo, g.PaperlessCode, g.NextLocationCode,
-            findings?.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList());
+            findings?.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList(),
+            g.HeightCode);
     }
 }

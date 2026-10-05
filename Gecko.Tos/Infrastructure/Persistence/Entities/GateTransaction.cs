@@ -147,6 +147,9 @@ public partial class GateTransaction
 
     public string? NextLocationCode { get; set; }
 
+    /// <summary>gecko_tos 26: STANDARD / HIGH_CUBE / HALF — the clerk's, else the equipment type's.</summary>
+    public string? HeightCode { get; set; }
+
     /// <summary>gecko_tos 24: the Idempotency-Key the recording request carried; unique per tenant.</summary>
     public string? IdempotencyKey { get; set; }
 

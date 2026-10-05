@@ -118,7 +118,8 @@ internal static class SurveyEndpoints
         return TypedResults.Ok(Project(survey, damages, await master.SurveyCodesAsync(ct), []));
     }
 
-    private static async Task<Results<Created<SurveyResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CreateAsync(
+    /// <summary>Also the big Save's damage step (GATE_IN_COMPLETION_PLAN A4): the GATE_IN survey right after the row's EIR.</summary>
+    internal static async Task<Results<Created<SurveyResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CreateAsync(
         SaveSurveyRequest request, TosDbContext db, IMasterDataReferences master,
         ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
     {

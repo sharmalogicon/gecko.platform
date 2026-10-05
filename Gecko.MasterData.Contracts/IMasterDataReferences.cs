@@ -208,8 +208,10 @@ public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool 
 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 
-/// <summary><see cref="SizeCode"/> is the length in feet as the tariffs write it: "20", "40", "45".</summary>
-public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, string SizeCode, bool IsReefer, bool IsOog, bool IsActive, decimal Teu);
+/// <summary><see cref="SizeCode"/> is the length in feet as the tariffs write it: "20", "40", "45".
+/// <see cref="HeightClass"/>: STANDARD, HIGH_CUBE or HALF — what the gate stores on the move unless the clerk keys another.</summary>
+public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, string SizeCode, bool IsReefer, bool IsOog, bool IsActive, decimal Teu,
+    string HeightClass = "STANDARD");
 
 public sealed record VesselRef(Guid VesselId, string VesselCode, string VesselName, string? ImoNumber, bool IsActive);
 

@@ -36,6 +36,8 @@ public partial class TosDbContext : DbContext
 
     public virtual DbSet<GateTransactionSeal> GateTransactionSeals { get; set; }
 
+    public virtual DbSet<GateTransactionCorrection> GateTransactionCorrections { get; set; }
+
     public virtual DbSet<Module> Modules { get; set; }
 
     public virtual DbSet<MovementPlan> MovementPlans { get; set; }
@@ -922,6 +924,10 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("clip_on_no");
+            entity.Property(e => e.HeightCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("height_code");
             entity.Property(e => e.ConditionCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
@@ -1978,6 +1984,42 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("vessel_code");
+        });
+
+        modelBuilder.Entity<GateTransactionCorrection>(entity =>
+        {
+            entity.HasKey(e => e.GateTransactionCorrectionId).HasName("pk_gate_transaction_correction");
+
+            entity.ToTable("gate_transaction_correction", "gate");
+
+            entity.HasIndex(e => new { e.TenantId, e.GateTransactionId, e.CorrectedAt }, "ix_gate_transaction_correction__transaction");
+
+            entity.Property(e => e.GateTransactionCorrectionId)
+                .HasDefaultValueSql("(newsequentialid())", "df_gate_transaction_correction__id")
+                .HasColumnName("gate_transaction_correction_id");
+            entity.Property(e => e.AfterJson).HasColumnName("after_json");
+            entity.Property(e => e.BeforeJson).HasColumnName("before_json");
+            entity.Property(e => e.CorrectedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_transaction_correction__corrected_at")
+                .HasColumnName("corrected_at");
+            entity.Property(e => e.CorrectedBy).HasColumnName("corrected_by");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_transaction_correction__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.GateTransactionId).HasColumnName("gate_transaction_id");
+            entity.Property(e => e.Reason)
+                .HasMaxLength(300)
+                .HasColumnName("reason");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_gate_transaction_correction__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
         });
 
         modelBuilder.Entity<TripSave>(entity =>

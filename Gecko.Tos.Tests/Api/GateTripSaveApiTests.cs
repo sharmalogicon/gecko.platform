@@ -71,12 +71,12 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             return response.StatusCode == HttpStatusCode.OK ? await response.Content.ReadFromJsonAsync<WindowBookingResponse>(ct) : null;
         }, q => q is not null && q.Boxes.Single().NextMovementCode == "FULL_OUT", $"{orderNo} quoted for FULL_OUT", ct)!;
 
-    private static object PickUp(Guid bookingContainerId, string box) => new
+    private static object PickUp(Guid bookingContainerId, string box, string? heightCode = null) => new
     {
         bookingContainerId,
         move = new
         {
-            containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT",
+            containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT", heightCode,
             seals = new object[] { new { sealNo = $"ZZT-{box[^4..]}", sealType = "LINE", isIntact = true } },
         },
     };
@@ -147,7 +147,7 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
                 truck = new { plate = "70-7777", driverName = "Somchai P." },
                 rows = new[]
                 {
-                    PickUp(a.Containers.Single().BookingContainerId, boxA),
+                    PickUp(a.Containers.Single().BookingContainerId, boxA, heightCode: "HIGH_CUBE"),
                     PickUp(b.Containers.Single().BookingContainerId, boxB),
                 },
                 payment = new { payments = new[] { new { channel = "CASH", amount = expected } }, expectedTotal = expected },
@@ -163,12 +163,29 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             var receipt = (await client.GetFromJsonAsync<ReceiptResponse>($"{Window}/receipts/{answer.Receipt.ReceiptId}", ct))!;
             Assert.Equal(new[] { boxA, boxB }.Order(), receipt.Lines.Select(l => l.ContainerNo).Distinct().Order());
             Assert.Equal(1, receipt.Lines.Count(l => l.BillingUnitCode == "PER_TRIP"));
+            // A7: no payer named, so the invoice is made out to the first box's customer (Vector GateIn.cs:2342).
+            Assert.NotEqual("Walk-in customer", receipt.PayerName);
 
             // An EIR per box, on one truck visit.
             Assert.All(answer.Rows, r => Assert.Equal("GATED", r.Status));
             Assert.Equal(2, answer.Rows.Select(r => r.EirNo).Distinct().Count());
             Assert.All(answer.Rows, r => Assert.NotNull(r.CouponRef));
             Assert.NotNull(answer.VisitNo);
+
+            // A10: the truck-in form and the coupon slips print.
+            foreach (var pdfUrl in new[] { answer.TruckInPdfUrl!, answer.Receipt.CouponPdfUrl! })
+            {
+                var pdf = await client.GetAsync(pdfUrl, ct);
+                Assert.True(pdf.StatusCode == HttpStatusCode.OK, $"{pdfUrl}: {(int)pdf.StatusCode} {await pdf.Content.ReadAsStringAsync(ct)}");
+                Assert.Equal("application/pdf", pdf.Content.Headers.ContentType?.MediaType);
+                Assert.StartsWith("%PDF", System.Text.Encoding.ASCII.GetString((await pdf.Content.ReadAsByteArrayAsync(ct))[..4]));
+            }
+
+            // A5: the clerk's height overrides the equipment type's.
+            var heights = new List<string?>();
+            foreach (var r in answer.Rows)
+                heights.Add((await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{r.GateTransactionId}", ct))!.HeightCode);
+            Assert.Equal(new[] { "HIGH_CUBE", "STANDARD" }, heights);
 
             // The answer was lost: the same Save again is the same receipt and the same EIRs, nothing new.
             var again = await SaveAsync(client, key, body, ct);
@@ -223,6 +240,10 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             Assert.True(row.Status == "GATED", $"{row.Status}: {row.Reason}");
             Assert.NotNull(row.EirNo);
             Assert.StartsWith("BK-", row.OrderNo);
+
+            // A5: no height keyed, so the EIR keeps the equipment type's (20GP = STANDARD).
+            var eir = (await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{row.GateTransactionId}", ct))!;
+            Assert.Equal("STANDARD", eir.HeightCode);
         }
         finally
         {
@@ -231,8 +252,9 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
         }
     }
 
+    /// <summary>A1: a box the barrier would refuse is found BEFORE the money: the whole Save is refused, nothing charged.</summary>
     [Fact]
-    public async Task A_box_the_barrier_refuses_after_payment_stays_paid_and_comes_back_not_gated()
+    public async Task A_box_the_barrier_would_refuse_stops_the_Save_before_any_money_is_taken()
     {
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
@@ -246,8 +268,6 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             await DropOffAsync(client, box, ct);
             shiftId = await OpenDrawerAsync(client, ct);
             var quote = await PickUpQuoteAsync(client, booking.Booking.OrderNo, ct);
-
-            // Customs puts a hold on the box after the clerk priced it.
             var hold = await client.PostAsJsonAsync("/api/tos/holds", new { containerNo = box, holdCode = "CUSTOMS", reason = "Red line" }, ct);
             Assert.Equal(HttpStatusCode.Created, hold.StatusCode);
 
@@ -258,20 +278,195 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
                 rows = new[] { PickUp(booking.Containers.Single().BookingContainerId, box) },
                 payment = new { payments = new[] { new { channel = "CASH", amount = quote.Total } }, expectedTotal = quote.Total },
             }, ct);
-            Assert.True(saved.StatusCode == HttpStatusCode.Created, $"save returned {(int)saved.StatusCode}: {await saved.Content.ReadAsStringAsync(ct)}");
-            var answer = (await saved.Content.ReadFromJsonAsync<TripSaveResponse>(ct))!;
-
-            Assert.NotNull(answer.Receipt);                        // the money was taken …
-            var row = Assert.Single(answer.Rows);
-            Assert.Equal("NOT_GATED", row.Status);                 // … the box did not move …
-            Assert.Null(row.EirNo);
-            Assert.Contains(row.Findings, f => f.Code == "HOLD");  // … and the clerk is told why.
-            Assert.NotNull(row.CouponRef);
-
-            // Its coupon is still good: once customs releases it, it goes out without paying again.
-            var after = await PreflightAsync(client, box, "OUT", ct);
-            Assert.DoesNotContain(after.Findings, f => f.Code == "NO_COUPON");
+            Assert.Equal(HttpStatusCode.Conflict, saved.StatusCode);
+            var body = await saved.Content.ReadAsStringAsync(ct);
+            Assert.Contains("HOLD", body);
+            Assert.Contains("\"charged\":false", body);
+            Assert.DoesNotContain(await TestDatabase.ChargesAsync(carrierRef), c => c.Status == "PAID");
         }
         finally { await CleanAsync(carrierRef, shiftId, box); }
+    }
+
+    /// <summary>A2: the money could not be taken (no drawer open), so the blind order the Save raised is cancelled: no orphan.</summary>
+    [Fact]
+    public async Task A_blind_order_is_undone_when_the_money_cannot_be_taken()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        await TestDatabase.GateChargeOnBlindGateInAsync(add: true);
+        try
+        {
+            var saved = await SaveAsync(client, Guid.NewGuid().ToString(), new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(),
+                truck = new { plate = "70-6666" },
+                rows = new[]
+                {
+                    new
+                    {
+                        blind = new { containerNo = box, lineCode = "MAEU", customerCode = "CUS-TAE", equipmentTypeCode = "20GP", carrierRef },
+                        move = new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m },
+                    },
+                },
+                payment = new { payments = new[] { new { channel = "CASH", amount = 107m } }, expectedTotal = 107m },
+            }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, saved.StatusCode);   // no drawer open (or the price differs): nothing taken
+            var preflight = await PreflightAsync(client, box, "IN", ct);
+            Assert.Contains(preflight.Findings, f => f.Code == "NO_ASSIGNMENT");   // the blind order did not stay behind
+        }
+        finally
+        {
+            await TestDatabase.GateChargeOnBlindGateInAsync(add: false);
+            await CleanAsync(carrierRef, null, box);
+        }
+    }
+
+    /// <summary>A4: the damage the clerk ticked is saved with the move: the GATE_IN survey and its damage hold come out of the one Save.</summary>
+    [Fact]
+    public async Task Damage_is_surveyed_with_the_move_in_the_same_Save()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        object Row(params object[] damages) => new
+        {
+            blind = new { containerNo = box, lineCode = "MAEU", customerCode = "CUS-TAE", equipmentTypeCode = "20GP", carrierRef },
+            move = new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m },
+            damages,
+        };
+        try
+        {
+            // An invented code is refused before anything is raised or charged.
+            var invented = await SaveAsync(client, Guid.NewGuid().ToString(), new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-2079" }, rows = new[] { Row(new { damageCode = "SMASHED" }) },
+            }, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, invented.StatusCode);
+            Assert.Contains("rows[0].damages[0].damageCode", await invented.Content.ReadAsStringAsync(ct));
+            Assert.Contains((await PreflightAsync(client, box, "IN", ct)).Findings, f => f.Code == "NO_ASSIGNMENT");
+
+            var saved = await SaveAsync(client, Guid.NewGuid().ToString(), new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-2079" },
+                rows = new[] { Row(new { damageCode = "HO", locationCode = "DRR" }, new { damageCode = "SC" }) },
+            }, ct);
+            Assert.True(saved.StatusCode == HttpStatusCode.Created, $"save returned {(int)saved.StatusCode}: {await saved.Content.ReadAsStringAsync(ct)}");
+            var row = Assert.Single((await saved.Content.ReadFromJsonAsync<TripSaveResponse>(ct))!.Rows);
+            Assert.True(row.Status == "GATED", $"{row.Status}: {row.Reason}");
+            Assert.NotNull(row.SurveyId);
+            Assert.Contains("DAMAGE", row.HoldsApplied!);
+
+            var survey = (await client.GetFromJsonAsync<SurveyResponse>($"{Gate}/surveys/{row.SurveyId}", ct))!;
+            Assert.Equal(("GATE_IN", row.GateTransactionId), (survey.SurveyType, survey.GateTransactionId));
+            Assert.Equal(new[] { "HO", "SC" }, survey.Damages.Select(d => d.DamageCode));
+            Assert.Equal("DRR", survey.Damages[0].LocationCode);
+            Assert.False(survey.IsServiceable);
+        }
+        finally { await CleanAsync(carrierRef, null, box); }
+    }
+
+    /// <summary>
+    /// A11 (owner D3, Vector GateIn.cs:1123): an IMPORT FULL box arrives as another type than booked. Without the
+    /// clerk's confirmation the Save is 409 TYPE_MISMATCH naming both; confirmed, the box moves to the booking's
+    /// line of that type (a new line here) and gates in.
+    /// </summary>
+    [Fact]
+    public async Task A_box_of_another_type_is_refused_until_the_clerk_confirms_then_the_booking_follows_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, box, ct);   // one 20GP place
+            await EventuallyAsync(() => PreflightAsync(client, box, "IN", ct), v => v.Decision == "ALLOWED", $"{box} allowed in", ct);
+            object Body(bool accept) => new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-1123" },
+                rows = new[]
+                {
+                    new
+                    {
+                        bookingContainerId = booking.Containers.Single().BookingContainerId,
+                        equipmentTypeCode = "40GP", acceptTypeChange = accept,
+                        move = new
+                        {
+                            containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT",
+                            grossWeightKg = 22000m, tareWeightKg = 3700m, maxGrossWeightKg = 30480m, cargoWeightKg = 18300m,
+                            seals = new object[] { new { sealNo = $"ZZT-{box[^4..]}", sealType = "LINE", isIntact = true } },
+                        },
+                    },
+                },
+            };
+
+            var asked = await SaveAsync(client, Guid.NewGuid().ToString(), Body(accept: false), ct);
+            Assert.Equal(HttpStatusCode.Conflict, asked.StatusCode);
+            var question = await asked.Content.ReadAsStringAsync(ct);
+            Assert.Contains("TYPE_MISMATCH", question);
+            Assert.Contains("20GP", question);
+            Assert.Contains("40GP", question);
+
+            var saved = await SaveAsync(client, Guid.NewGuid().ToString(), Body(accept: true), ct);
+            Assert.True(saved.StatusCode == HttpStatusCode.Created, $"save returned {(int)saved.StatusCode}: {await saved.Content.ReadAsStringAsync(ct)}");
+            var row = Assert.Single((await saved.Content.ReadFromJsonAsync<TripSaveResponse>(ct))!.Rows);
+            Assert.True(row.Status == "GATED", $"{row.Status}: {row.Reason}");
+
+            var after = (await client.GetFromJsonAsync<BookingDetailResponse>($"/api/tos/bookings/{booking.Booking.BookingId}", ct))!;
+            var line = Assert.Single(after.Requirements);                 // the 20GP place went with the box
+            Assert.Equal(("40GP", (short)1), (line.EquipmentTypeCode, line.Qty));
+            Assert.Equal(line.EquipmentRequirementId, after.Containers.Single().EquipmentRequirementId);
+            var eir = (await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{row.GateTransactionId}", ct))!;
+            Assert.Equal("40GP", eir.EquipmentTypeCode);
+        }
+        finally { await CleanAsync(carrierRef, null, box); }
+    }
+
+    /// <summary>A6: a box on no order comes in EMPTY; a laden one is refused before anything is raised (Vector GateIn.cs:1191).</summary>
+    [Fact]
+    public async Task A_blind_box_with_cargo_is_refused()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var box = NewBox();
+        var saved = await SaveAsync(client, Guid.NewGuid().ToString(), new
+        {
+            branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-1191" },
+            rows = new[]
+            {
+                new
+                {
+                    blind = new { containerNo = box, lineCode = "MAEU", customerCode = "CUS-TAE", equipmentTypeCode = "20GP" },
+                    move = new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m },
+                },
+            },
+        }, ct);
+        Assert.Equal(HttpStatusCode.Conflict, saved.StatusCode);
+        Assert.Contains("BLIND_FULL", await saved.Content.ReadAsStringAsync(ct));
+        var preflight = await PreflightAsync(client, box, "IN", ct);
+        Assert.Contains(preflight.Findings, f => f.Code == "NO_ASSIGNMENT");   // no order was raised
+    }
+
+    /// <summary>A6: 1×40' or 2×20' each way (Vector GateIn.cs:1366).</summary>
+    [Fact]
+    public async Task A_truck_carries_at_most_45_feet_each_way()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var (a, b) = (NewBox(), NewBox());
+        object Blind(string box) => new
+        {
+            blind = new { containerNo = box, lineCode = "MAEU", customerCode = "CUS-TAE", equipmentTypeCode = "40GP" },
+            move = new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 3700m, maxGrossWeightKg = 30480m },
+        };
+        var saved = await SaveAsync(client, Guid.NewGuid().ToString(), new
+        {
+            branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-4545" }, rows = new[] { Blind(a), Blind(b) },
+        }, ct);
+        Assert.Equal(HttpStatusCode.BadRequest, saved.StatusCode);
+        Assert.Contains("1×40' or 2×20'", await saved.Content.ReadAsStringAsync(ct));
     }
 }

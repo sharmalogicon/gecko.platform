@@ -65,6 +65,8 @@ internal static class WindowEndpoints
             .WithSummary("One receipt, as printed");
         window.MapGet("/receipts/{id:guid}/receipt.pdf", ReceiptPdfAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("The receipt as an A4 Thai full tax invoice (ใบเสร็จรับเงิน/ใบกำกับภาษี); a voided one prints with VOID");
+        window.MapGet("/receipts/{id:guid}/coupon.pdf", CouponPdfAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
+            .WithSummary("The receipt's gate coupons, one slip per box: coupon ref, container, movement, amount, valid until (Vector CouponInvoice)");
         window.MapPost("/receipts/{id:guid}/void", VoidReceiptAsync).RequireBranchPermission(RevenuePermissions.ReceiptVoid)
             .WithSummary("Void a wrong receipt before the box has moved: it keeps its number, its charges are cancelled, its coupons are withdrawn");
         window.MapPost("/waive", WaiveAsync).RequireBranchPermission(RevenuePermissions.ChargeWaive)
@@ -506,6 +508,19 @@ internal static class WindowEndpoints
 
     private static async Task<Results<FileContentHttpResult, NotFound<ProblemDetails>, ForbidHttpResult>> ReceiptPdfAsync(
         Guid id, RevenueDbContext db, ReceiptDocument document, ICallerPermissions permissions, CancellationToken ct)
+    {
+        var branchId = await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == id).Select(r => (Guid?)r.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });
+        if (!permissions.HasAt(RevenuePermissions.CashCollect, branchId.Value)) return TypedResults.Forbid();
+
+        var rendered = await document.RenderAsync(id, ct);
+        return rendered is null
+            ? TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." })
+            : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
+    }
+
+    private static async Task<Results<FileContentHttpResult, NotFound<ProblemDetails>, ForbidHttpResult>> CouponPdfAsync(
+        Guid id, RevenueDbContext db, CouponSlipDocument document, ICallerPermissions permissions, CancellationToken ct)
     {
         var branchId = await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == id).Select(r => (Guid?)r.BranchId).SingleOrDefaultAsync(ct);
         if (branchId is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });

@@ -749,6 +749,94 @@ internal static class BookingEndpoints
     private static Task LockAsync(TosDbContext db, Guid bookingId, CancellationToken ct) =>
         db.Database.ExecuteSqlInterpolatedAsync($"SELECT 1 FROM booking.booking WITH (UPDLOCK, HOLDLOCK) WHERE booking_id = {bookingId}", ct);
 
+    /// <summary>
+    /// The big Save raised this BLIND GATE IN order and then could not take the money (GATE_IN_COMPLETION_PLAN A2):
+    /// cancel it, so no order is left holding the box. Only an order nothing has moved on.
+    /// </summary>
+    internal static async Task UndoBlindOrderAsync(TosDbContext db, Guid bookingId, string reason, ITenantContext caller, TimeProvider time, CancellationToken ct)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, bookingId, ct);
+        var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == bookingId, ct);
+        if (booking is null || booking.Status != BookingRules.Open || booking.OrderTypeCode != BlindGateIn) return;
+        var boxes = await db.BookingContainers.Where(x => x.BookingId == bookingId).ToListAsync(ct);
+        var boxIds = boxes.Select(b => b.BookingContainerId).ToList();
+        var steps = await db.MovementPlans.Where(m => boxIds.Contains(m.BookingContainerId)).ToListAsync(ct);
+        if (steps.Any(s => s.Status == "DONE")) return;
+
+        var now = time.GetUtcNow();
+        booking.Status = BookingRules.Cancelled;
+        booking.CancelledAt = now;
+        booking.CancelledBy = caller.UserId();
+        booking.CancelReason = reason;
+        foreach (var box in boxes.Where(b => b.EndedAt is null))
+            End(box, "BOOKING_CANCELLED", steps.Where(s => s.BookingContainerId == box.BookingContainerId), caller, time);
+        await db.SaveChangesAsync(ct);
+        await BookingEvents.QueueChangedAsync(db, bookingId, "CANCELLED", now, ct);
+        await tx.CommitAsync(ct);
+    }
+
+    /// <summary>
+    /// GATE_IN_COMPLETION_PLAN A11 (owner D3): the box at the gate is another type than booked and the clerk
+    /// confirmed it. Under the booking lock it moves to the booking's line of that type — one more place there
+    /// (a new line when none exists, with the old line's cargo details), one less on its old line (gone at none).
+    /// Null = done; otherwise why not.
+    /// </summary>
+    internal static async Task<string?> ChangeBoxTypeAsync(TosDbContext db, IMasterDataReferences master, Guid bookingContainerId,
+        string typeCode, ITenantContext caller, TimeProvider time, CancellationToken ct)
+    {
+        var type = (await master.EquipmentTypesAsync([typeCode], ct)).GetValueOrDefault(typeCode);
+        if (type is not { IsActive: true }) return $"'{typeCode}' is not an active equipment type.";
+
+        var bookingId = await db.BookingContainers.Where(x => x.BookingContainerId == bookingContainerId).Select(x => x.BookingId).SingleAsync(ct);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAsync(db, bookingId, ct);
+        var booking = await db.Bookings.SingleAsync(b => b.BookingId == bookingId, ct);
+        if (booking.Status != BookingRules.Open) return $"{booking.OrderNo} is {booking.Status}.";
+        var box = await db.BookingContainers.SingleAsync(x => x.BookingContainerId == bookingContainerId, ct);
+        var lines = await db.EquipmentRequirements.Where(r => r.BookingId == bookingId).ToListAsync(ct);
+        var old = lines.Single(r => r.EquipmentRequirementId == box.EquipmentRequirementId);
+        if (string.Equals(old.EquipmentTypeCode, type.TypeCode, StringComparison.OrdinalIgnoreCase)) return null;
+
+        var now = time.GetUtcNow();
+        var target = lines.Where(r => string.Equals(r.EquipmentTypeCode, type.TypeCode, StringComparison.OrdinalIgnoreCase)).MinBy(r => r.LineNo);
+        if (target is null)
+        {
+            target = new EquipmentRequirement
+            {
+                TenantId = booking.TenantId, BookingId = bookingId, LineNo = (short)(lines.Max(r => r.LineNo) + 1),
+                EquipmentTypeId = type.EquipmentTypeId, EquipmentTypeCode = type.TypeCode, Qty = 1,
+                MinGradeCode = old.MinGradeCode, ImdgClass = old.ImdgClass, UnNumber = old.UnNumber,
+                DeclaredGrossWeightKg = old.DeclaredGrossWeightKg,
+                Remarks = $"Gate {now:yyyy-MM-dd}: {box.ContainerNo} arrived as {type.TypeCode}, booked as {old.EquipmentTypeCode}.",
+                CreatedBy = caller.UserId(), UpdatedBy = caller.UserId(),
+            };
+            db.EquipmentRequirements.Add(target);
+            await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
+        }
+        else
+        {
+            if (target.Qty >= 999) return $"Line {target.LineNo} ({target.EquipmentTypeCode}) is full.";
+            target.Qty++;
+            target.UpdatedAt = now;
+            target.UpdatedBy = caller.UserId();
+        }
+
+        box.EquipmentRequirementId = target.EquipmentRequirementId;
+        if (old.Qty <= 1) db.EquipmentRequirements.Remove(old);
+        else
+        {
+            old.Qty--;
+            old.UpdatedAt = now;
+            old.UpdatedBy = caller.UserId();
+        }
+        booking.UpdatedAt = now;   // bumps the booking's rowVersion: its lines are part of it
+        await db.SaveChangesAsync(ct);
+        await BookingEvents.QueueChangedAsync(db, bookingId, "REQUIREMENTS_CHANGED", now, ct);
+        await tx.CommitAsync(ct);
+        return null;
+    }
+
     private static void End(BookingContainer box, string reason, IEnumerable<MovementPlan> steps, ITenantContext caller, TimeProvider time)
     {
         box.EndedAt = time.GetUtcNow();

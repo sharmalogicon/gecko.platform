@@ -124,14 +124,14 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(typeCodes);
         var rows = await db.EquipmentTypes.AsNoTracking()
             .Where(e => codes.Contains(e.TypeCode))
-            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive, e.Teu })
+            .Select(e => new { e.EquipmentTypeId, e.TypeCode, e.LengthFt, e.IsReefer, e.IsOog, e.IsActive, e.Teu, e.HeightClass })
             .ToListAsync(ct);
 
         // Length is DECIMAL(4,1) — 20.0 — and tariffs speak of "20".
         return rows.ToDictionary(
             e => e.TypeCode,
             e => new EquipmentTypeRef(e.EquipmentTypeId, e.TypeCode,
-                decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive, e.Teu),
+                decimal.ToInt32(e.LengthFt).ToString(CultureInfo.InvariantCulture), e.IsReefer, e.IsOog, e.IsActive, e.Teu, e.HeightClass),
             StringComparer.OrdinalIgnoreCase);
     }
 

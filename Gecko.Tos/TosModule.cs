@@ -49,7 +49,9 @@ public static class TosModule
         services.AddScoped<BranchClock>();
         services.AddScoped<BarrierReader>();
         services.AddScoped<Gecko.Tos.Contracts.ITosBookingHeaders, TosBookingHeaders>();
+        services.AddScoped<Gecko.Tos.Contracts.ITosGateCoupons, TosGateCoupons>();
         services.AddScoped<EirDocument>();
+        services.AddScoped<TruckInDocument>();
         services.AddGeckoFileStore(configuration);
 
         // How Revenue's cash window reaches the barrier: GateCouponIssued, off
@@ -69,6 +71,7 @@ public static class TosModule
             .MapGateEndpoints()
             .MapReservationEndpoints()
             .MapTripEndpoints()
+            .MapCorrectionEndpoints()
             .MapContainerStoryEndpoints()
             .MapYardStockEndpoints()
             .MapReportEndpoints()

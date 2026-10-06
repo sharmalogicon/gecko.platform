@@ -38,11 +38,11 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
     }
 
     private static async Task<BookingDetailResponse> BookAsync(HttpClient client, string carrierRef, string[] boxes, CancellationToken ct,
-        string? haulierCode = null)
+        string? haulierCode = null, string orderTypeCode = OrderType)
     {
         var response = await client.PostAsJsonAsync("/api/tos/bookings", new
         {
-            branchId = SctLcb01, orderTypeCode = OrderType, lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef, haulierCode,
+            branchId = SctLcb01, orderTypeCode, lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef, haulierCode,
             validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
             requirements = new object[] { new { equipmentTypeCode = "20GP", qty = boxes.Length } },
             containers = boxes.Select(b => new { containerNo = b }).ToArray(),
@@ -248,14 +248,15 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
 
     // ── S3 = PLAN_BILLING 6.3: credit accrual from the gate event ────────────
 
-    private static async Task<GateTransactionResponse> PickUpAsync(HttpClient client, string box, CancellationToken ct, Guid? visitId = null)
+    private static async Task<GateTransactionResponse> PickUpAsync(HttpClient client, string box, CancellationToken ct, Guid? visitId = null,
+        string haulierCode = "HAU-SHT")
     {
         await EventuallyAsync(() => PreflightAsync(client, box, "OUT", ct), v => v.Decision == "ALLOWED", $"{box} allowed out", ct);
         var response = await client.PostAsJsonAsync($"{Gate}/transactions", new
         {
             branchId = SctLcb01, containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT",
             truckVisitId = visitId,
-            truck = visitId is null ? new { plate = "70-2222", haulierCode = "HAU-SHT", truckCategoryCode = "18_WHEEL" } : null,
+            truck = visitId is null ? new { plate = "70-2222", haulierCode, truckCategoryCode = "18_WHEEL" } : null,
             seals = new object[] { new { sealNo = $"ZZK-{box[^4..]}", sealType = "LINE", isIntact = true } },
         }, ct);
         Assert.True(response.StatusCode == HttpStatusCode.Created, $"gate-out returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
@@ -363,6 +364,65 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
         {
             await TestDatabase.RequireCouponAtAsync(SctLcb01, null);
             await CleanAsync(carrierRef, shiftId);
+        }
+    }
+
+    // ── GATE_OPEN_ITEMS #8: a haulier's credit term on a charge the tariff prices for cash only ──
+
+    /// <summary>
+    /// SCT's IMP CY/CY raises GATEFEE CUSTOMER CASH (฿150) at FULL_OUT; its CUSTOMER
+    /// CREDIT variant has a rate for GATE TEST only — none here, as KORAKIT's S-002 on
+    /// CUSOMER MTY. Vector (GateIn.cs:1577-1596) moves the CASH item to the haulier's
+    /// term at the CASH price: the line is billed later, not lost and not a hole that
+    /// blocks the window. HAU-LCH, not HAU-SHT: MasterData's term test owns HAU-SHT here.
+    /// </summary>
+    [Fact]
+    public async Task A_haulier_credit_term_with_no_credit_rate_bills_the_cash_price_on_credit_and_accrues_it_at_the_gate()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        JsonElement? term = null;
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct, orderTypeCode: "IMP CY/CY");
+            await DropOffAsync(client, box, ct);
+            var plain = await QuoteWhenAsync(client, booking.Booking.OrderNo, q => q.Boxes.Single().NextMovementCode == "FULL_OUT",
+                "Revenue to see the gate-in", ct, "&haulierCode=HAU-LCH");
+            Assert.Equal(160.50m, plain.Total);   // GATEFEE 150 cash, no term yet
+
+            var created = await client.PostAsJsonAsync(Terms, new
+            {
+                haulierCode = "HAU-LCH", orderTypeCode = "IMP CY/CY", movementCode = "FULL_OUT", chargeCode = "GATEFEE", paymentTermCode = "CREDIT",
+            }, ct);
+            Assert.True(created.StatusCode == HttpStatusCode.Created, await created.Content.ReadAsStringAsync(ct));
+            term = await created.Content.ReadFromJsonAsync<JsonElement>(ct);
+
+            // The window: nothing to pay, nothing unpriced, the cash price billed later on CREDIT.
+            var quote = await QuoteAsync(client, booking.Booking.OrderNo, ct, "&haulierCode=HAU-LCH");
+            var due = quote.Boxes.Single();
+            Assert.Empty(due.Due);
+            Assert.Empty(due.NoPrice ?? []);
+            Assert.Equal(0m, quote.Total);
+            var moved = Assert.Single(due.BilledLater!);
+            Assert.Equal(("GATEFEE", "CREDIT", "CUSTOMER", 150.00m, 10.50m, true),
+                (moved.ChargeCode, moved.PaymentTermCode, moved.BillTo, moved.Amount, moved.TaxAmount, moved.ByHaulierTerm));
+            Assert.Contains(due.Tried, t => t.ChargeCode == "GATEFEE" && t.Outcome == "HAULIER_CREDIT");
+
+            // The gate-out on that haulier's truck accrues it UNBILLED, at the cash price.
+            await PickUpAsync(client, box, ct, haulierCode: "HAU-LCH");
+            var charges = await ChargesWhenAsync(carrierRef, rows => rows.Any(c => c.Source == "GATE"), "the gate-out to accrue the credit", ct);
+            var credit = Assert.Single(charges, c => c.Source == "GATE");
+            Assert.Equal(("GATEFEE", "UNBILLED", "CREDIT", 150.00m, 10.50m), (credit.ChargeCode, credit.Status, credit.PaymentTermCode, credit.Amount, credit.TaxAmount));
+        }
+        finally
+        {
+            if (term is { } t)
+                await client.DeleteAsync($"{Terms}/{t.GetProperty("haulierChargeTermId").GetGuid()}?rowVersion={Uri.EscapeDataString(t.GetProperty("rowVersion").GetString()!)}", ct);
+            await TestDatabase.RemoveCashWindowAsync(carrierRef, null);
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
 

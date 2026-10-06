@@ -254,7 +254,10 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             {
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "HAULIER_CREDIT", null,
                     [$"{terms.HaulierCode} has a CREDIT term for {item.ChargeCode} at {step.MovementCode}: billed later, not paid here."]));
-                await PriceAsync(item, kind, Credit, byHaulier: true, later);
+                // No credit rate: Vector moves the CASH item to the haulier's term at the
+                // CASH price (GateIn.cs:1577-1596). Billed later either way, never a hole here.
+                if (!await PriceAsync(item, kind, Credit, byHaulier: true, later))
+                    await PriceAsync(item, kind, Cash, byHaulier: true, later, billAs: Credit);
                 continue;
             }
             await PriceAsync(item, kind, Cash, byHaulier: false, lines);
@@ -270,31 +273,39 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             await PriceAsync(item, kind, Credit, byHaulier: false, later);
         }
 
-        async Task PriceAsync(OrderTypeChargeRef item, string kind, string term, bool byHaulier, List<QuoteLine> into)
+        // Prices one variant; false when the tariff has no answer for it (no variant, no rate).
+        // billAs: the term the line is billed on, when priced at another term's rate.
+        async Task<bool> PriceAsync(OrderTypeChargeRef item, string kind, string term, bool byHaulier, List<QuoteLine> into, string? billAs = null)
         {
             if (!variants.TryGetValue((item.ChargeCode, item.BillTo, term), out var variant))
             {
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, term, "NO_VARIANT", null, [$"MDM has no {term} variant for this payer."]));
-                return;
+                return false;
             }
 
             var result = await pricing.PriceAsync(Request(plan, box, step, size, item.ChargeCode, item.BillTo, term, terms.TruckCategoryCode,
                 now, item.DefaultQty ?? 1, freeTimeKind: null, fullEmpty: step.FullEmpty), ct);
             var amount = result.Outcome == PriceOutcomes.Priced ? result.Amount ?? 0 : (decimal?)null;
+            var trail = billAs is null ? result.PrecedenceTrail
+                : [.. result.PrecedenceTrail, $"No {billAs} rate: the {term} price, billed on {billAs} (Vector GateIn.cs:1577-1596)."];
             if (amount is not > 0)
             {
                 // A rate of 0 is "free under this tariff" (owner 2026-10-03). No rate at all, on a
                 // cash line, is a hole in the tariff: kept as a NoPrice line so it cannot be skipped.
+                // A line billed later holds nothing at the window.
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, term,
-                    amount is null ? PriceOutcomes.Unpriced : "PRICED_ZERO", amount, result.PrecedenceTrail));
-                if (amount is null && term == Cash)
+                    amount is null ? PriceOutcomes.Unpriced : "PRICED_ZERO", amount, trail));
+                if (amount is null && term == Cash && billAs is null)
                     unpriced.Add(Line(kind, variant, PayerFor(plan, item.BillTo), result.Quantity, null, 0m, result, null, null));
-                return;
+                return amount is not null;
             }
 
-            tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, term, PriceOutcomes.Priced, amount, result.PrecedenceTrail));
-            into.Add(Line(kind, variant, PayerFor(plan, item.BillTo), result.Quantity, result.UnitRate,
-                amount.Value, result, null, null) with { ByHaulierTerm = byHaulier });
+            // Billed on another term: that term's variant (its tax, its ledger) when MDM has one.
+            var billed = billAs is not null && variants.TryGetValue((item.ChargeCode, item.BillTo, billAs), out var other) ? other : variant;
+            tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, term, PriceOutcomes.Priced, amount, trail));
+            into.Add(Line(kind, billed, PayerFor(plan, item.BillTo), result.Quantity, result.UnitRate,
+                amount.Value, result, null, null) with { ByHaulierTerm = byHaulier, PaymentTermCode = billAs ?? billed.PaymentTermCode });
+            return true;
         }
 
         // ── storage, on the way out (§4.4) ──────────────────────────────────

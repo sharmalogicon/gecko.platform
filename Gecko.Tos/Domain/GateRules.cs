@@ -136,6 +136,35 @@ public static class GateRules
         _ => null,
     };
 
+    /// <summary>
+    /// The four yard rules (owner 2026-10-06; Vector GateIn.cs:2998-3017): a drop-off is NOT in any yard (one in
+    /// another depot's yard is named, so it is gated out there first); a pick-up IS in this yard, and FULL or EMPTY
+    /// there as the step says.
+    /// </summary>
+    /// <param name="yardBranchCode">The depot whose yard holds the box, when it is in one.</param>
+    /// <param name="yardFullEmpty">What the open stay says the box is (FULL / EMPTY).</param>
+    public static IEnumerable<GateFinding> Yard(string containerNo, string direction, string? stepFullEmpty,
+        bool inYard, bool atThisDepot, string? yardBranchCode, string? yardFullEmpty)
+    {
+        if (direction == In && inYard)
+            yield return atThisDepot
+                ? YardState(containerNo, In, true)!
+                : new GateFinding("ALREADY_IN_YARD",
+                    $"{containerNo} is in the yard at {yardBranchCode ?? "another depot"}. Gate it out there before it comes in here.",
+                    GateSeverity.Block);
+        if (direction == Out && !(inYard && atThisDepot))
+            yield return inYard
+                ? new GateFinding("NOT_IN_YARD",
+                    $"{containerNo} is in the yard at {yardBranchCode ?? "another depot"}, not here. It can only leave from there.",
+                    GateSeverity.Block)
+                : YardState(containerNo, Out, false)!;
+        if (direction == Out && inYard && atThisDepot && stepFullEmpty is Full or Empty && yardFullEmpty is Full or Empty
+            && yardFullEmpty != stepFullEmpty)
+            yield return new GateFinding("LOAD_MISMATCH",
+                $"{containerNo} is {yardFullEmpty} in the yard; this is a {stepFullEmpty} pick-up.",
+                GateSeverity.Block);
+    }
+
     // ── gate-out release gates (gate-in-vector-parity Part B §B2) ───────────────
 
     /// <summary>

@@ -267,7 +267,7 @@ internal static class TestDatabase
             DELETE FROM gate.truck_visit       WHERE truck_visit_id IN (SELECT id FROM @v);
             """;
         command.Parameters.AddWithValue("@prefix", carrierRefPrefix);
-        await command.ExecuteNonQueryAsync();
+        await RetryOnDeadlockAsync(command);
     }
 
     /// <summary>
@@ -430,6 +430,19 @@ internal static class TestDatabase
     /// no application login can remove one — which is the point. Test-only, and only
     /// ever for fixture tenants.
     /// </summary>
+    /// <summary>
+    /// A clean-up batch can be the deadlock victim against the host's outbox dispatchers, which touch the same rows
+    /// while a test ends. Every statement in these batches is an idempotent DELETE, so the batch simply runs again.
+    /// </summary>
+    private static async Task RetryOnDeadlockAsync(SqlCommand command)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try { await command.ExecuteNonQueryAsync(); return; }
+            catch (SqlException e) when (e.Number == 1205 && attempt < 4) { await Task.Delay(200 * attempt); }
+        }
+    }
+
     public static async Task RemoveCashWindowAsync(string carrierRefPrefix, Guid? openShiftId)
     {
         await using var connection = new SqlConnection(AdminConnection);
@@ -461,7 +474,7 @@ internal static class TestDatabase
             """;
         command.Parameters.AddWithValue("@prefix", carrierRefPrefix);
         command.Parameters.AddWithValue("@shift", openShiftId is { } id ? id : DBNull.Value);
-        await command.ExecuteNonQueryAsync();
+        await RetryOnDeadlockAsync(command);
     }
 
     /// <summary>The gate transaction that closed the box's latest stay in Revenue's projection, if one did.</summary>

@@ -96,10 +96,17 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             .SingleOrDefaultAsync(v => v.ContainerNo == containerNo && v.GateOutTransactionId == null, ct);
 
         var registry = (await master.ContainersAsync([containerNo], ct)).GetValueOrDefault(containerNo);
+        var yardBranchCode = openVisit is null ? null
+            : (await clock.BranchesAsync([openVisit.BranchId], ct)).GetValueOrDefault(openVisit.BranchId)?.BranchCode;
+        IEnumerable<GateFinding> Yard(string? stepFullEmpty) => GateRules.Yard(containerNo, direction, stepFullEmpty,
+            openVisit is not null, openVisit?.BranchId == branchId, yardBranchCode, openVisit?.FullEmpty);
+
 
         if (assignment is null)
         {
             JudgeHolds(movementReleasesDamaged: false);
+            // A box on no order (a blind or ad-hoc gate-in) is still held to the yard rules.
+            findings.AddRange(Yard(null));
             // Q1: the ad-hoc gate is not a refusal — it is a WALK_IN booking the
             // clerk creates first. The barrier says so rather than just "no".
             findings.Add(new GateFinding("NO_ASSIGNMENT",
@@ -173,7 +180,7 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
 
         if (step is not null && stepRules is not null)
         {
-            if (GateRules.YardState(containerNo, direction, openVisit is not null) is { } yard) findings.Add(yard);
+            findings.AddRange(Yard(stepRules.FullEmpty));
 
             // ── 6. the cut-off (§5.2) ───────────────────────────────────────
             // EXPORT only. An import box gating in FULL is coming OFF a ship that

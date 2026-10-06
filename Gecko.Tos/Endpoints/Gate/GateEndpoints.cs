@@ -474,6 +474,12 @@ internal static class GateEndpoints
             return await ReplayAsync(db, key, hash!, ct)
                    ?? TosSupport.Conflict($"A request with {Idempotency.Header} {key} is still being processed.", "Repeat it in a moment.");
         }
+        catch (DbUpdateException e) when (LostRace(e))
+        {
+            await tx.RollbackAsync(ct);
+            db.ChangeTracker.Clear();
+            return Raced(view.ContainerNo);
+        }
 
         foreach (var seal in seals)
             db.GateTransactionSeals.Add(new GateTransactionSeal
@@ -526,7 +532,13 @@ internal static class GateEndpoints
                 LastEventAt = at,
             };
             db.ContainerVisits.Add(yardRow);
-            await db.SaveChangesAsync(ct);
+            try { await db.SaveChangesAsync(ct); }
+            catch (DbUpdateException e) when (LostRace(e))
+            {
+                await tx.RollbackAsync(ct);
+                db.ChangeTracker.Clear();
+                return Raced(view.ContainerNo);
+            }
             containerVisitId = yardRow.ContainerVisitId;
             AddEvent(db, yardRow, "GATE_IN", null, transaction.EirNo, at, caller.UserId(), transaction.GateTransactionId);
         }
@@ -570,7 +582,16 @@ internal static class GateEndpoints
         // ── the outbox: the LINE message leaves from here, not from the barrier ─
         await QueueAsync(db, transaction, view, visit, taken, completed, ct);
 
-        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        try
+        {
+            if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        }
+        catch (DbUpdateException e) when (LostRace(e))
+        {
+            await tx.RollbackAsync(ct);
+            db.ChangeTracker.Clear();
+            return Raced(view.ContainerNo);
+        }
         await tx.CommitAsync(ct);
 
         var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct, findings);
@@ -624,6 +645,19 @@ internal static class GateEndpoints
                 blocks.Add(new GateFinding("MISSING_FIELD", $"{field}: {string.Join(" ", messages)}", GateSeverity.Block));
         return blocks;
     }
+
+    /// <summary>
+    /// Two gates moved the same box in the same instant and the database let the other one win: one completed EIR
+    /// per step, one open stay per box, one step per move, two boxes each way per truck.
+    /// </summary>
+    private static bool LostRace(DbUpdateException e) =>
+        e.InnerException?.Message is { } m
+        && (m.Contains("uq_gate_transaction__plan") || m.Contains("uq_container_visit__open")
+            || m.Contains("uq_movement_plan__gate_transaction") || m.Contains("uq_gate_transaction__position"));
+
+    private static ProblemHttpResult Raced(string containerNo) =>
+        TypedResults.Problem(title: $"{containerNo} was just gated by another lane.", detail: "Nothing was recorded here. Read the box again (preflight).",
+            statusCode: StatusCodes.Status409Conflict, extensions: new Dictionary<string, object?> { ["code"] = "ALREADY_GATED" });
 
     /// <summary>BOX_RESERVED when another draft holds the box the barrier is reading (GATE_IN_BIG_SAVE §1).</summary>
     private static async Task<GateFinding?> HeldFindingAsync(TosDbContext db, IUserDirectory? users, BarrierView view, Guid? draftId,

@@ -16,6 +16,9 @@ public interface ITruckCashier
     /// <summary>Whether Revenue's copy of these boxes carries these equipment types yet (a type the gate just changed travels by the outbox).</summary>
     Task<bool> KnowsBoxTypesAsync(IReadOnlyDictionary<Guid, string> typeByBookingContainerId, CancellationToken ct);
 
+    /// <summary>Whether Revenue's copy of these booking places carries these container numbers yet (a box keyed at the gate travels by the outbox).</summary>
+    Task<bool> KnowsBoxNumbersAsync(IReadOnlyDictionary<Guid, string> containerNoByBookingContainerId, CancellationToken ct);
+
     /// <summary>
     /// Takes the truck's cash. Retry-safe: the same <see cref="TruckPaymentRequest.IdempotencyKey"/> answers with the receipt the
     /// first call issued. Nothing cash due is <see cref="TruckPaymentOutcome.NothingDue"/>, not an error.

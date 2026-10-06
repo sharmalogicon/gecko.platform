@@ -187,9 +187,14 @@ public sealed record ReserveBoxRequest(
     Guid? BookingContainerId = null,
     [property: MaxLength(11)] string? ContainerNo = null);
 
+/// <param name="BookingContainerId">The place held: use THIS one on Save (it may be another than asked for).</param>
+/// <param name="SwitchedFromBookingContainerId">The place asked for, when another truck had taken it and the box was moved to the
+/// next free place like it (owner 2026-10-06); <see cref="Message"/> says so for the clerk.</param>
+/// <param name="Findings">Warnings about the keyed box (e.g. TYPE_DIFFERS, CHECK_DIGIT); a refusal is a 409 instead.</param>
 public sealed record BoxReservationResponse(
     Guid BoxReservationId, Guid BranchId, Guid DraftId, Guid? BookingContainerId, string? ContainerNo,
-    Guid ReservedBy, string? ReservedByName, DateTimeOffset ReservedAt, DateTimeOffset ExpiresAt);
+    Guid ReservedBy, string? ReservedByName, DateTimeOffset ReservedAt, DateTimeOffset ExpiresAt,
+    Guid? SwitchedFromBookingContainerId = null, string? Message = null, IReadOnlyList<GateFindingResponse>? Findings = null);
 
 /// <summary>
 /// One box the gate clerk can pick (GATE_IN_VECTOR_PARITY_FOR_API §2): the booking it is on and the

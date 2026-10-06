@@ -125,15 +125,67 @@ internal static class TripEndpoints
             }
         }
 
-        // ── 1. no box another truck's clerk holds ───────────────────────────
+        // ── 0. what this call writes before the money is taken back if it stops (A2) ──
+        var raisedNow = new List<Guid>();                                        // blind orders raised by THIS call
+        var nominatedNow = new List<(Guid BookingContainerId, string ContainerNo)>();   // numbers it wrote onto empty places
+        async Task UndoAsync(string why)
+        {
+            db.ChangeTracker.Clear();
+            foreach (var (id, number) in nominatedNow) await GateNominations.UndoAsync(db, id, number, time, ct);
+            foreach (var id in raisedNow) await BookingEndpoints.UndoBlindOrderAsync(db, id, why, caller, time, ct);
+            db.ChangeTracker.Clear();
+        }
+        async Task<Results<Created<TripSaveResponse>, ValidationProblem, ProblemHttpResult>> StopAsync(
+            Results<Created<TripSaveResponse>, ValidationProblem, ProblemHttpResult> answer)
+        {
+            await UndoAsync("Gate Save stopped before payment.");
+            return answer;
+        }
+
+        // ── 1a. a box keyed on an EMPTY booking place: written onto it, or onto the next free place like it ──
+        // (owner 2026-10-06; Vector Operation.usp_BookingContainerMovement). Under the booking lock, so two Saves
+        // in the same instant never write one place twice; a place named by the booking is never overwritten.
         var now = time.GetUtcNow();
+        var lineIds = rows.Select(r => r.BookingContainerId).ToArray();
+        var switched = new Dictionary<int, GateFindingResponse>();
+        var placeRefusals = new List<object>();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (rows[i].BookingContainerId is not { } wanted) continue;
+            var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo);
+            var place = await GateNominations.PlaceAsync(db, wanted, ct);
+            if (place is null || place.BranchId != branchId)
+                return await StopAsync(TosSupport.Invalid($"rows[{i}].bookingContainerId", "Not a booked box at this depot."));
+            if (place.ContainerNo == number || (place.ContainerNo is not null && place.Source != GateNominations.Source)) continue;
+
+            var blocks = (await GateNominations.CheckAsync(db, master, clock, place, number, draftId, now, ct))
+                .Where(f => f.Severity == GateSeverity.Block).ToList();
+            var choice = blocks.Count > 0 ? null : await GateNominations.NominateAsync(db, master, wanted, number, draftId, caller, time, ct);
+            if (choice is { Place: { } chosen })
+            {
+                if (choice.Written) nominatedNow.Add((chosen.BookingContainerId, number));
+                lineIds[i] = chosen.BookingContainerId;
+                if (choice.Note is { } note) switched[i] = new GateFindingResponse("PLACE_SWITCHED", note, "INFO");
+                continue;
+            }
+            if (choice is not null) blocks.Add(new GateFinding(choice.Code!, choice.Problem!, GateSeverity.Block));
+            placeRefusals.Add(new { index = i, containerNo = number,
+                findings = blocks.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList() });
+        }
+        if (placeRefusals.Count > 0)
+            return await StopAsync(TypedResults.Problem(title: "Some boxes cannot go on their booking.",
+                detail: "Nothing was charged and nothing was recorded. Fix or remove these boxes, then Save again.",
+                statusCode: StatusCodes.Status409Conflict,
+                extensions: new Dictionary<string, object?> { ["rows"] = placeRefusals, ["charged"] = false }));
+
+        // ── 1. no box another truck's clerk holds ───────────────────────────
         for (var i = 0; i < rows.Count; i++)
         {
             var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo);
-            if (await BoxReservations.HeldByOtherAsync(db, rows[i].BookingContainerId, number, draftId, now, ct) is { } held)
+            if (await BoxReservations.HeldByOtherAsync(db, lineIds[i], number, draftId, now, ct) is { } held)
             {
                 var name = (await users.DisplayNamesAsync([held.ReservedBy], ct)).GetValueOrDefault(held.ReservedBy);
-                return TosSupport.Conflict(BoxReservations.Finding(held, name).Message, $"rows[{i}]: remove it from this truck, or ask that clerk to.");
+                return await StopAsync(TosSupport.Conflict(BoxReservations.Finding(held, name).Message, $"rows[{i}]: remove it from this truck, or ask that clerk to."));
             }
         }
 
@@ -147,13 +199,13 @@ internal static class TripEndpoints
                     findings = blocks.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList() });
         }
         if (refusals.Count > 0)
-            return TypedResults.Problem(title: "Some boxes cannot go through the gate.",
+            return await StopAsync(TypedResults.Problem(title: "Some boxes cannot go through the gate.",
                 detail: "Nothing was charged and nothing was recorded. Fix or remove these boxes, then Save again.",
                 statusCode: StatusCodes.Status409Conflict,
-                extensions: new Dictionary<string, object?> { ["rows"] = refusals, ["charged"] = false });
+                extensions: new Dictionary<string, object?> { ["rows"] = refusals, ["charged"] = false }));
 
         // ── 1c. one truck carries 1×40' or 2×20' each way (Vector GateIn.cs:1366) ──
-        if (await FeetAsync(db, master, rows, ct) is { } feet) return feet;
+        if (await FeetAsync(db, master, rows, ct) is { } feet) return await StopAsync(feet);
 
         // ── 1d. the booked boxes, before any blind order is raised ──────────
         var lines = new (Guid BookingContainerId, Guid BookingId, string OrderNo, string ContainerNo)[rows.Count];
@@ -161,7 +213,7 @@ internal static class TripEndpoints
         var typeChanges = new Dictionary<Guid, string>();
         for (var i = 0; i < rows.Count; i++)
         {
-            if (rows[i].BookingContainerId is not { } lineId) continue;
+            if (lineIds[i] is not { } lineId) continue;
             var line = await (
                 from x in db.BookingContainers.AsNoTracking()
                 join b in db.Bookings on x.BookingId equals b.BookingId
@@ -170,12 +222,11 @@ internal static class TripEndpoints
                 select new { x.BookingContainerId, x.BookingId, b.OrderNo, b.BranchId, x.ContainerNo, b.BookingTypeCode, b.OrderTypeCode, q.EquipmentTypeCode })
                 .SingleOrDefaultAsync(ct);
             if (line is null || line.BranchId != branchId)
-                return TosSupport.Invalid($"rows[{i}].bookingContainerId", "Not a booked box at this depot.");
+                return await StopAsync(TosSupport.Invalid($"rows[{i}].bookingContainerId", "Not a booked box at this depot."));
             var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo);
-            if (line.ContainerNo is null)
-                return TosSupport.Invalid($"rows[{i}].bookingContainerId", $"That place on {line.OrderNo} has no container number yet: nominate {number} on it first.");
             if (line.ContainerNo != number)
-                return TosSupport.Invalid($"rows[{i}].move.containerNo", $"{line.OrderNo}'s box is {line.ContainerNo}, not {number}.");
+                return await StopAsync(TosSupport.Invalid($"rows[{i}].move.containerNo",
+                    $"That place on {line.OrderNo} is for {line.ContainerNo}, not {number}. Pick an empty place, or check the number."));
             lines[i] = (line.BookingContainerId, line.BookingId, line.OrderNo, line.ContainerNo);
 
             // ── A11: the box is another type than booked (Vector GateIn.cs:1123) ──
@@ -198,22 +249,16 @@ internal static class TripEndpoints
                 });
         }
         if (mismatches.Count > 0)
-            return TypedResults.Problem(title: "A box is another type than booked.",
+            return await StopAsync(TypedResults.Problem(title: "A box is another type than booked.",
                 detail: "Nothing was charged and nothing was recorded. Confirm the change (acceptTypeChange) where it is allowed, then Save again.",
                 statusCode: StatusCodes.Status409Conflict,
-                extensions: new Dictionary<string, object?> { ["code"] = "TYPE_MISMATCH", ["rows"] = mismatches, ["charged"] = false });
+                extensions: new Dictionary<string, object?> { ["code"] = "TYPE_MISMATCH", ["rows"] = mismatches, ["charged"] = false }));
         foreach (var (lineId, type) in typeChanges)
             if (await BookingEndpoints.ChangeBoxTypeAsync(db, master, lineId, type, caller, time, ct) is { } refused)
-                return TosSupport.Conflict(refused, "Nothing was charged and nothing was recorded.");
+                return await StopAsync(TosSupport.Conflict(refused, "Nothing was charged and nothing was recorded."));
         db.ChangeTracker.Clear();
 
         // ── 2. blind orders (the same box answers with the same order) ──────
-        var raisedNow = new List<Guid>();   // raised by THIS call: undone if the money is not taken (A2)
-        async Task UndoAsync(string why)
-        {
-            foreach (var id in raisedNow) await BookingEndpoints.UndoBlindOrderAsync(db, id, why, caller, time, ct);
-            db.ChangeTracker.Clear();
-        }
         for (var i = 0; i < rows.Count; i++)
         {
             if (rows[i].Blind is not { } blind) continue;
@@ -251,6 +296,13 @@ internal static class TripEndpoints
             // A box whose type was just changed (A11, or by an interrupted try of this Save) is priced as that type.
             var keyedTypes = rows.Select((r, i) => (r, i)).Where(x => x.r.BookingContainerId is not null && x.r.EquipmentTypeCode.Clean() is not null)
                 .ToDictionary(x => lines[x.i].BookingContainerId, x => x.r.EquipmentTypeCode.Clean()!);
+            // A number written onto an empty place a moment ago travels to the window by the outbox: its coupon must name the box.
+            var numbers = nominatedNow.ToDictionary(n => n.BookingContainerId, n => n.ContainerNo);
+            if (numbers.Count > 0 && !await CatchUpAsync(wake, () => cashier.KnowsBoxNumbersAsync(numbers, ct), ct))
+            {
+                await UndoAsync("Gate Save: the cash window had not heard of the box keyed on the booking; nothing was charged.");
+                return TosSupport.Conflict("The cash window has not heard of the box keyed on the booking yet.", "Nothing was charged or gated. Save again in a moment.");
+            }
             if (keyedTypes.Count > 0 && !await CatchUpAsync(wake, () => cashier.KnowsBoxTypesAsync(keyedTypes, ct), ct))
             {
                 await UndoAsync("Gate Save: the cash window had not heard of the type change; nothing was charged.");
@@ -302,15 +354,16 @@ internal static class TripEndpoints
                 var (surveyId, holds, surveyProblem) = rows[i].Damages is { Count: > 0 } damages
                     ? await SurveyAsync(eir, move, damages, db, master, caller, scope, time, ct)
                     : (null, null, null);
+                IReadOnlyList<GateFindingResponse> said = [.. eir.Findings ?? [], .. new[] { surveyProblem, switched.GetValueOrDefault(i) }.OfType<GateFindingResponse>()];
                 results[i] = new TripRowResponse(i, eir.ContainerNo, lines[i].BookingContainerId, eir.OrderNo, "GATED",
                     eir.EirNo, eir.GateTransactionId, $"/api/tos/gate/transactions/{eir.GateTransactionId}/eir.pdf", coupon, null,
-                    surveyProblem is null ? eir.Findings ?? [] : [.. eir.Findings ?? [], surveyProblem], surveyId, holds);
+                    said, surveyId, holds);
             }
             else
             {
                 var (reason, findings) = Why(recorded.Result);
                 results[i] = new TripRowResponse(i, lines[i].ContainerNo, lines[i].BookingContainerId, lines[i].OrderNo, "NOT_GATED",
-                    null, null, null, coupon, reason, findings);
+                    null, null, null, coupon, reason, switched.GetValueOrDefault(i) is { } moved ? [.. findings, moved] : findings);
             }
         }
 

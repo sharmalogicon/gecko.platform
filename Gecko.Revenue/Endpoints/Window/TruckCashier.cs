@@ -33,6 +33,14 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
                && known.All(c => string.Equals(c.EquipmentTypeCode, typeByBookingContainerId[c.BookingContainerId], StringComparison.OrdinalIgnoreCase));
     }
 
+    public async Task<bool> KnowsBoxNumbersAsync(IReadOnlyDictionary<Guid, string> containerNoByBookingContainerId, CancellationToken ct)
+    {
+        var ids = containerNoByBookingContainerId.Keys.ToList();
+        var known = await db.BookingPlanContainers.AsNoTracking().Where(c => ids.Contains(c.BookingContainerId))
+            .Select(c => new { c.BookingContainerId, c.ContainerNo }).ToListAsync(ct);
+        return known.Count == ids.Count && known.All(c => c.ContainerNo == containerNoByBookingContainerId[c.BookingContainerId]);
+    }
+
     public async Task<TruckPaymentResult> PayAsync(TruckPaymentRequest request, CancellationToken ct)
     {
         var hash = Idempotency.HashOf(request with { CashierUserId = Guid.Empty });

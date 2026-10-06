@@ -68,12 +68,20 @@ internal static class WithholdingTax
 /// <summary>A variant the quote tried: priced or not, and why (the pricing record, PLAN_BILLING §4.1).</summary>
 internal sealed record TriedVariant(string ChargeCode, string BillTo, string PaymentTermCode, string Outcome, decimal? Amount, IReadOnlyList<string> Trail);
 
+/// <summary>
+/// One gate VAS this movement offers (Vector GateIn.cs:956 LoadGateInVASCharges), priced as it would be if ticked:
+/// <see cref="Line"/> null when no tariff prices it (<see cref="Outcome"/> UNPRICED / NO_VARIANT).
+/// </summary>
+internal sealed record VasOption(string ChargeCode, string ChargeName, string BillTo, string PaymentTermCode, bool Ticked,
+    string Outcome, QuoteLine? Line);
+
 internal sealed record MovementQuote(
     Guid BookingContainerId, string? ContainerNo, string MovementCode, string Direction,
     DateOnly? PaidUntil, ContainerStay? Stay, int? StayDays, bool StorageApplies,
     IReadOnlyList<QuoteLine> Lines, IReadOnlyList<TriedVariant> Tried,
     bool ReeferApplies = false, ReeferPowerQuote? Reefer = null,
-    IReadOnlyList<QuoteLine>? Later = null, GateTerms? Terms = null, IReadOnlyList<QuoteLine>? Unpriced = null)
+    IReadOnlyList<QuoteLine>? Later = null, GateTerms? Terms = null, IReadOnlyList<QuoteLine>? Unpriced = null,
+    IReadOnlyList<VasOption>? VasMenu = null)
 {
     /// <summary>
     /// Cash charges the order type raises on this movement that NO tariff prices (not a
@@ -183,8 +191,14 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         var ofStep = orderTypeCharges
             .Where(c => !c.IsValueAddedService && string.Equals(c.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase))
             .ToList();
-        var ticked = terms.Vas is { Count: > 0 } vas && OffersVas(step)
-            ? orderTypeCharges.Where(c => c.IsValueAddedService && c.RaiseAtGateIn && vas.Contains(c.ChargeCode, StringComparer.OrdinalIgnoreCase)).ToList()
+        // A VAS is the order type's, at gate, on this movement (or on any movement when the order type names none).
+        var offered = OffersVas(step)
+            ? orderTypeCharges.Where(c => c.IsValueAddedService && c.RaiseAtGateIn
+                                          && (c.MovementCode is null || string.Equals(c.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase)))
+                .ToList()
+            : [];
+        var ticked = terms.Vas is { Count: > 0 } vas
+            ? offered.Where(c => vas.Contains(c.ChargeCode, StringComparer.OrdinalIgnoreCase)).ToList()
             : [];
         var cashMenu = ofStep.Where(c => c.PaymentTermCode is null || c.PaymentTermCode == Cash)
             .Select(c => (Item: c, Kind: QuoteLine.Movement))
@@ -362,8 +376,32 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             }
         }
 
+        // ── the VAS menu: every VAS this movement offers, priced as if ticked, so the clerk sees the price on Record ──
+        var menu = new List<VasOption>();
+        if (offered.Count > 0)
+        {
+            var vasVariants = (await master.ChargeVariantsAsync(offered.Select(c => c.ChargeCode).Distinct(), ct))
+                .ToDictionary(v => (v.ChargeCode, v.BillTo, v.PaymentTermCode));
+            foreach (var item in offered.DistinctBy(c => (c.ChargeCode, c.BillTo, c.PaymentTermCode ?? Cash)).OrderBy(c => c.ChargeCode))
+            {
+                var term = item.PaymentTermCode ?? Cash;
+                var isTicked = ticked.Any(t => string.Equals(t.ChargeCode, item.ChargeCode, StringComparison.OrdinalIgnoreCase));
+                if (!vasVariants.TryGetValue((item.ChargeCode, item.BillTo, term), out var variant))
+                {
+                    menu.Add(new VasOption(item.ChargeCode, item.ChargeCode, item.BillTo, term, isTicked, "NO_VARIANT", null));
+                    continue;
+                }
+                var result = await pricing.PriceAsync(Request(plan, box, step, size, item.ChargeCode, item.BillTo, term, terms.TruckCategoryCode,
+                    now, item.DefaultQty ?? 1, freeTimeKind: null, fullEmpty: step.FullEmpty), ct);
+                menu.Add(result.Outcome == PriceOutcomes.Priced && result.Amount is { } amount
+                    ? new VasOption(item.ChargeCode, variant.DescriptionEn, item.BillTo, term, isTicked, amount > 0 ? PriceOutcomes.Priced : "PRICED_ZERO",
+                        Line(QuoteLine.Vas, variant, PayerFor(plan, item.BillTo), result.Quantity, result.UnitRate, amount, result, null, null))
+                    : new VasOption(item.ChargeCode, variant.DescriptionEn, item.BillTo, term, isTicked, PriceOutcomes.Unpriced, null));
+            }
+        }
+
         return new MovementQuote(box.BookingContainerId, box.ContainerNo, step.MovementCode, step.Direction,
-            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms, unpriced);
+            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms, unpriced, menu);
     }
 
     /// <summary>gate.gate_charge_only_order_types — a JSON array of order type codes; anything unreadable is "none".</summary>

@@ -149,6 +149,7 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             // FULL_IN is a full drop-off: no VAS offered, so ticking one is a 400 (§3 f).
             var arriving = await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_IN", "Revenue to see the booking", ct);
             Assert.False(arriving.Boxes.Single().VasOffered);
+            Assert.Empty(arriving.Boxes.Single().VasMenu ?? []);
             await ExpectFieldAsync(await client.GetAsync(QuoteUrl(orderNo, "&vas=VASWASH"), ct), "vas", ct);
             await ExpectFieldAsync(await client.GetAsync(QuoteUrl(orderNo, "&truckCategoryCode=3_WHEEL"), ct), "truckCategoryCode", ct);
             await ExpectFieldAsync(await client.GetAsync(QuoteUrl(orderNo, "&haulierCode=NOBODY"), ct), "haulierCode", ct);
@@ -159,6 +160,14 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             // ── no category, no default: the any-truck rate. Credit is shown, not charged.
             var due = plain.Boxes.Single();
             Assert.True(due.VasOffered);
+
+            // The VAS menu comes priced with the Record's quote, before anything is ticked (owner 2026-10-05).
+            var menu = due.VasMenu!;
+            var washOption = Assert.Single(menu, v => v.ChargeCode == "VASWASH");
+            Assert.Equal(("PRICED", false, 200.00m, 14.00m, 214.00m), (washOption.Outcome, washOption.Ticked, washOption.Amount, washOption.TaxAmount, washOption.Total));
+            var sealOption = Assert.Single(menu, v => v.ChargeCode == "VASSEAL");
+            Assert.Equal(("UNPRICED", (decimal?)null), (sealOption.Outcome, sealOption.Total));
+            Assert.DoesNotContain(due.Due, d => d.Kind == "VAS");   // listed is not charged
             Assert.Equal([("GATEFEE", 150.00m), ("GATETRIP", 100.00m)], due.Due.Select(d => (d.ChargeCode, d.Amount)).OrderBy(d => d.ChargeCode));
             Assert.Equal("PER_TRIP", due.Due.Single(d => d.ChargeCode == "GATETRIP").BillingUnitCode);
             Assert.Equal(267.50m, plain.Total);
@@ -182,6 +191,7 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             var vas = await QuoteAsync(client, orderNo, ct, "&vas=VASWASH&vas=VASSEAL");
             var wash = Assert.Single(vas.Boxes.Single().Due, d => d.ChargeCode == "VASWASH");
             Assert.Equal(("VAS", 200.00m), (wash.Kind, wash.Amount));
+            Assert.True(vas.Boxes.Single().VasMenu!.Single(v => v.ChargeCode == "VASWASH").Ticked);
             Assert.Contains(vas.Boxes.Single().Tried, t => t.ChargeCode == "VASSEAL" && t.Outcome == "UNPRICED");
             Assert.DoesNotContain(vas.Boxes.Single().Due, d => d.ChargeCode == "VASSEAL");
             await ExpectFieldAsync(await client.GetAsync(QuoteUrl(orderNo, "&vas=LIFTCR"), ct), "vas", ct);

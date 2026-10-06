@@ -41,7 +41,17 @@ public sealed record WindowBoxResponse(
     IReadOnlyList<QuoteLineResponse> Due, IReadOnlyList<SettledChargeResponse> Settled,
     IReadOnlyList<TriedVariantResponse> Tried, decimal Total, string? Note,
     IReadOnlyList<QuoteLineResponse>? BilledLater = null, bool VasOffered = false,
-    IReadOnlyList<QuoteLineResponse>? NoPrice = null);
+    IReadOnlyList<QuoteLineResponse>? NoPrice = null,
+    IReadOnlyList<VasOptionResponse>? VasMenu = null);
+
+/// <summary>
+/// One gate VAS the box's next movement offers, priced as if ticked (the clerk's VAS panel; Vector LoadGateInVASCharges).
+/// Tick it by sending its code in <c>&amp;vas=</c>; <see cref="Ticked"/> says it is in this quote's <c>due</c>.
+/// </summary>
+/// <param name="Outcome">PRICED, PRICED_ZERO (free under the tariff), UNPRICED (no tariff prices it: ticking it blocks the receipt) or NO_VARIANT.</param>
+public sealed record VasOptionResponse(
+    string ChargeCode, string ChargeName, string BillTo, string PaymentTermCode, bool Ticked, string Outcome,
+    decimal? UnitRate, decimal? Amount, decimal? TaxRate, decimal? TaxAmount, decimal? Total, string? CurrencyCode, string? ScheduleNo);
 
 /// <param name="Kind">MOVEMENT, VAS, STORAGE or REEFER.</param>
 /// <param name="BillingUnitCode">PER_TRIP = the once-per-truck gate charge.</param>

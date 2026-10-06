@@ -122,7 +122,8 @@ internal static class WindowEndpoints
             b.Quote?.Total ?? 0, b.Note,
             (b.Quote?.BilledLater ?? []).Select(ToResponse).ToList(),
             b.Rules is { } r && CashQuoter.OffersVas(r),
-            (b.Quote?.NoPrice ?? []).Select(ToResponse).ToList())).ToList();
+            (b.Quote?.NoPrice ?? []).Select(ToResponse).ToList(),
+            (b.Quote?.VasMenu ?? []).Select(ToResponse).ToList())).ToList();
 
         var lines = boxes.SelectMany(b => b.Quote?.Lines ?? []).ToList();
         var later = boxes.SelectMany(b => b.Quote?.BilledLater ?? []).ToList();
@@ -217,7 +218,8 @@ internal static class WindowEndpoints
             (quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
                 t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" ? t.Trail.FirstOrDefault() : null)).ToList(),
             quote?.Total ?? 0, note, later.Select(ToResponse).ToList(), CashQuoter.OffersVas(first),
-            (quote?.NoPrice ?? []).Select(ToResponse).ToList());
+            (quote?.NoPrice ?? []).Select(ToResponse).ToList(),
+            (quote?.VasMenu ?? []).Select(ToResponse).ToList());
 
         return TypedResults.Ok(new WindowBookingResponse(
             Guid.Empty, branch, "", "PREVIEW", code, plan.CustomerPartyCode, plan.AgentPartyCode, plan.LineCode,
@@ -634,6 +636,10 @@ internal static class WindowEndpoints
         new(l.Kind, l.ChargeCode, l.ChargeName, l.BillTo, l.PayerPartyCode, l.Quantity, l.UnitRate, l.Amount,
             l.TaxCode, l.TaxRate, l.TaxAmount, l.Total, l.ServiceFrom, l.ServiceTo, l.Price.ScheduleNo,
             l.PaymentTermCode, l.BillingUnitCode, l.ByHaulierTerm);
+
+    private static VasOptionResponse ToResponse(VasOption v) =>
+        new(v.ChargeCode, v.ChargeName, v.BillTo, v.PaymentTermCode, v.Ticked, v.Outcome,
+            v.Line?.UnitRate, v.Line?.Amount, v.Line?.TaxRate, v.Line?.TaxAmount, v.Line?.Total, v.Line?.CurrencyCode, v.Line?.Price.ScheduleNo);
 
     private static NotFound<ProblemDetails> NotKnown(string what) =>
         TypedResults.NotFound(new ProblemDetails

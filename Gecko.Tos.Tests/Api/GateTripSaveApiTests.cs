@@ -166,11 +166,26 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             // A7: no payer named, so the invoice is made out to the first box's customer (Vector GateIn.cs:2342).
             Assert.NotEqual("Walk-in customer", receipt.PayerName);
 
-            // An EIR per box, on one truck visit.
-            Assert.All(answer.Rows, r => Assert.Equal("GATED", r.Status));
-            Assert.Equal(2, answer.Rows.Select(r => r.EirNo).Distinct().Count());
+            // Gate in (owner 2026-10-06, Vector GateIn.cs:1455): the pick-ups are paid and PLANNED on the visit, no EIR yet.
+            Assert.All(answer.Rows, r => Assert.Equal(("PLANNED", (string?)null), (r.Status, r.EirNo)));
             Assert.All(answer.Rows, r => Assert.NotNull(r.CouponRef));
+            Assert.All(answer.Rows, r => Assert.NotNull(r.VisitPickupId));
             Assert.NotNull(answer.VisitNo);
+            var inYard = (await client.GetFromJsonAsync<TruckVisitResponse>($"{Gate}/visits/{answer.TruckVisitId}", ct))!;
+            Assert.Equal(2, inYard.Pickups!.Count(p => p.Status == "PLANNED"));
+
+            // Gate out: the clerk picks the truck in front of him and releases both boxes, on the same visit.
+            var outKey = Guid.NewGuid().ToString();
+            object outBody = new { branchId = SctLcb01, draftId = Guid.NewGuid(), truckVisitId = answer.TruckVisitId, rows = body.rows };
+            var released = await SaveAsync(client, outKey, outBody, ct);
+            Assert.True(released.StatusCode == HttpStatusCode.Created, $"gate out returned {(int)released.StatusCode}: {await released.Content.ReadAsStringAsync(ct)}");
+            var gone = (await released.Content.ReadFromJsonAsync<TripSaveResponse>(ct))!;
+            Assert.Equal(answer.TruckVisitId, gone.TruckVisitId);
+            Assert.All(gone.Rows, r => Assert.True(r.Status == "GATED", $"{r.ContainerNo} {r.Status}: {r.Reason}"));
+            Assert.Equal(2, gone.Rows.Select(r => r.EirNo).Distinct().Count());
+            Assert.NotNull(gone.TruckLeftAt);   // nothing left to collect: the truck has left
+            var outAgain = (await (await SaveAsync(client, outKey, outBody, ct)).Content.ReadFromJsonAsync<TripSaveResponse>(ct))!;
+            Assert.Equal(gone.Rows.Select(r => r.EirNo), outAgain.Rows.Select(r => r.EirNo));   // a retried gate out: the same EIRs
 
             // A10: the truck-in form and the coupon slips print.
             foreach (var pdfUrl in new[] { answer.TruckInPdfUrl!, answer.Receipt.CouponPdfUrl! })
@@ -183,7 +198,7 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
 
             // A5: the clerk's height overrides the equipment type's.
             var heights = new List<string?>();
-            foreach (var r in answer.Rows)
+            foreach (var r in gone.Rows)
                 heights.Add((await client.GetFromJsonAsync<GateTransactionResponse>($"{Gate}/transactions/{r.GateTransactionId}", ct))!.HeightCode);
             Assert.Equal(new[] { "HIGH_CUBE", "STANDARD" }, heights);
 
@@ -192,7 +207,7 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             Assert.Equal(HttpStatusCode.Created, again.StatusCode);
             var replay = (await again.Content.ReadFromJsonAsync<TripSaveResponse>(ct))!;
             Assert.Equal(answer.Receipt.ReceiptNo, replay.Receipt!.ReceiptNo);
-            Assert.Equal(answer.Rows.Select(r => r.EirNo), replay.Rows.Select(r => r.EirNo));
+            Assert.Equal(answer.Rows.Select(r => r.VisitPickupId), replay.Rows.Select(r => r.VisitPickupId));
 
             // The same key with another body is a client bug.
             Assert.Equal(HttpStatusCode.UnprocessableEntity, (await SaveAsync(client, key, body with { draftId = Guid.NewGuid() }, ct)).StatusCode);

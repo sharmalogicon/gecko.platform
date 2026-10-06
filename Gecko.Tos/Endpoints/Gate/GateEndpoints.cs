@@ -83,6 +83,9 @@ internal static class GateEndpoints
         gate.MapGet("/visits/{id:guid}", GetVisitAsync).RequireBranchPermission(TosPermissions.GateView).WithSummary("One truck visit and its boxes");
         gate.MapGet("/visits/{id:guid}/truck-in.pdf", TruckInPdfAsync).RequireBranchPermission(TosPermissions.GateView)
             .WithSummary("The truck-in form: the truck, driver, haulier and every box with movement, seals and weights (Vector TMS_TruckInForm)");
+        gate.MapPost("/visits/{id:guid}/pickups/{pickupId:guid}/cancel", CancelPickupAsync).RequireBranchPermission(TosPermissions.GateOverride)
+            .Validate<CancelPickupRequest>()
+            .WithSummary("Cancel a pick-up the truck leaves without (supervisor): the box is freed for other trucks");
         gate.MapPost("/visits/{id:guid}/depart", DepartAsync).RequireBranchPermission(TosPermissions.GateCreate)
             .WithSummary("The truck leaves — closes the visit and stops the dwell clock");
 
@@ -350,36 +353,9 @@ internal static class GateEndpoints
         {
             if (request.Truck is null)
                 return TosSupport.Invalid("truck", "Name the truck, or the open visit it is already on.");
-
-            var haulier = request.Truck.HaulierCode.Clean() is { } code
-                ? (await master.PartiesAsync([code], ct)).GetValueOrDefault(code)
-                : null;
-            if (request.Truck.HaulierCode.Clean() is not null && haulier is null)
-                return TosSupport.Invalid("truck.haulierCode", "Unknown haulier.");
-
-            // A tariff axis (§3.2): only a value of the tenant's TRUCK_CATEGORY code list prices.
-            var truckCategory = request.Truck.TruckCategoryCode.Clean();
-            if (truckCategory is not null
-                && !(await master.CodeListValuesAsync(TruckCategoryList, [truckCategory], ct)).Contains(truckCategory))
-                return TosSupport.Invalid("truck.truckCategoryCode", $"'{truckCategory}' is not a truck category of this tenant.");
-
-            visit = new TruckVisit
-            {
-                TenantId = caller.TenantId(),
-                BranchId = branchId,
-                VisitNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.TruckVisit, branchId, branch.BranchCode, clock.LocalNow(branch), ct),
-                TruckPlate = request.Truck.Plate.Trim(),
-                TrailerPlate = request.Truck.TrailerPlate?.Trim(),
-                HaulierPartyId = haulier?.PartyId,
-                HaulierPartyCode = haulier?.PartyCode,
-                DriverName = request.Truck.DriverName?.Trim(),
-                DriverLicenceHash = Hash(request.Truck.DriverLicence),
-                LaneCode = request.Truck.LaneCode.Clean(),
-                TruckCategoryCode = truckCategory,
-                ArrivedAt = request.Truck.ArrivedAt ?? at,
-                Source = "GATE",
-            };
-            db.TruckVisits.Add(visit);
+            var (opened, invalid) = await NewVisitAsync(request.Truck, branchId, branch, at, db, master, clock, caller, ct);
+            if (invalid is not null) return invalid;
+            visit = opened!;
         }
         visit.GateInAt ??= at;
         if (visit.ArrivedAt > at) visit.ArrivedAt = at;   // the CHECK: in never precedes arrival
@@ -659,6 +635,39 @@ internal static class GateEndpoints
         TypedResults.Problem(title: $"{containerNo} was just gated by another lane.", detail: "Nothing was recorded here. Read the box again (preflight).",
             statusCode: StatusCodes.Status409Conflict, extensions: new Dictionary<string, object?> { ["code"] = "ALREADY_GATED" });
 
+    /// <summary>A truck arriving: its visit, numbered, added to <paramref name="db"/> (not saved). Or why the truck block is wrong.</summary>
+    internal static async Task<(TruckVisit? Visit, ValidationProblem? Invalid)> NewVisitAsync(TruckRequest truck, Guid branchId, BranchClock.Branch branch,
+        DateTimeOffset at, TosDbContext db, IMasterDataReferences master, BranchClock clock, ITenantContext caller, CancellationToken ct)
+    {
+        var haulier = truck.HaulierCode.Clean() is { } code ? (await master.PartiesAsync([code], ct)).GetValueOrDefault(code) : null;
+        if (truck.HaulierCode.Clean() is not null && haulier is null)
+            return (null, TosSupport.Invalid("truck.haulierCode", "Unknown haulier."));
+
+        // A tariff axis (§3.2): only a value of the tenant's TRUCK_CATEGORY code list prices.
+        var truckCategory = truck.TruckCategoryCode.Clean();
+        if (truckCategory is not null && !(await master.CodeListValuesAsync(TruckCategoryList, [truckCategory], ct)).Contains(truckCategory))
+            return (null, TosSupport.Invalid("truck.truckCategoryCode", $"'{truckCategory}' is not a truck category of this tenant."));
+
+        var visit = new TruckVisit
+        {
+            TenantId = caller.TenantId(),
+            BranchId = branchId,
+            VisitNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.TruckVisit, branchId, branch.BranchCode, clock.LocalNow(branch), ct),
+            TruckPlate = truck.Plate.Trim(),
+            TrailerPlate = truck.TrailerPlate?.Trim(),
+            HaulierPartyId = haulier?.PartyId,
+            HaulierPartyCode = haulier?.PartyCode,
+            DriverName = truck.DriverName?.Trim(),
+            DriverLicenceHash = Hash(truck.DriverLicence),
+            LaneCode = truck.LaneCode.Clean(),
+            TruckCategoryCode = truckCategory,
+            ArrivedAt = truck.ArrivedAt ?? at,
+            Source = "GATE",
+        };
+        db.TruckVisits.Add(visit);
+        return (visit, null);
+    }
+
     /// <summary>BOX_RESERVED when another draft holds the box the barrier is reading (GATE_IN_BIG_SAVE §1).</summary>
     private static async Task<GateFinding?> HeldFindingAsync(TosDbContext db, IUserDirectory? users, BarrierView view, Guid? draftId,
         DateTimeOffset now, CancellationToken ct)
@@ -868,8 +877,10 @@ internal static class GateEndpoints
             .ToListAsync(ct);
         int Moves(Guid visitId, string way) => moves.Where(m => m.TruckVisitId == visitId && m.Direction == way).Sum(m => m.Count);
 
+        var pickups = await PickupsAsync(db, ids, ct);
         return TypedResults.Ok(new PagedResult<TruckVisitResponse>(
-            page.Items.Select(v => Project(v, [], GateRules.VisitMode(Moves(v.TruckVisitId, GateRules.In), Moves(v.TruckVisitId, GateRules.Out)))).ToList(),
+            page.Items.Select(v => Project(v, [], GateRules.VisitMode(Moves(v.TruckVisitId, GateRules.In), Moves(v.TruckVisitId, GateRules.Out)))
+                with { Pickups = pickups.Where(p => p.TruckVisitId == v.TruckVisitId).Select(p => p.Response).ToList() }).ToList(),
             page.Page, page.PageSize, page.TotalCount));
     }
 
@@ -888,7 +899,40 @@ internal static class GateEndpoints
                 t.ContainerNo, b.OrderNo, t.LinePartyCode, visit.TruckPlate,
                 t.TransactionAt, t.IsLate, t.Status)).ToListAsync(ct);
 
-        return TypedResults.Ok(Project(visit, boxes, ModeOf(boxes)));
+        return TypedResults.Ok(Project(visit, boxes, ModeOf(boxes)) with { Pickups = (await PickupsAsync(db, [visit.TruckVisitId], ct)).Select(p => p.Response).ToList() });
+    }
+
+    /// <summary>The boxes these trucks came to collect (owner 2026-10-06): the gate-out clerk's list for the truck in front of him.</summary>
+    private static async Task<List<(Guid TruckVisitId, VisitPickupResponse Response)>> PickupsAsync(TosDbContext db, IReadOnlyList<Guid> visitIds, CancellationToken ct) =>
+        (await (
+            from p in db.VisitPickups.AsNoTracking().Where(p => visitIds.Contains(p.TruckVisitId))
+            join x in db.BookingContainers on p.BookingContainerId equals x.BookingContainerId
+            join b in db.Bookings on x.BookingId equals b.BookingId
+            join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+            orderby p.PlannedAt
+            select new { p, b.OrderNo, r.EquipmentTypeCode }).ToListAsync(ct))
+        .Select(x => (x.p.TruckVisitId, new VisitPickupResponse(x.p.VisitPickupId, x.p.BookingContainerId, x.OrderNo, x.p.ContainerNo,
+            x.EquipmentTypeCode, x.p.Status, x.p.PlannedAt, x.p.GateTransactionId, x.p.CancelReason))).ToList();
+
+    /// <summary>The truck leaves without a box it came for (owner 2026-10-06): the pick-up is cancelled with a reason, its hold freed.</summary>
+    private static async Task<Results<Ok<VisitPickupResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CancelPickupAsync(
+        Guid id, Guid pickupId, CancelPickupRequest request, TosDbContext db, ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
+        var plan = await db.VisitPickups.SingleOrDefaultAsync(p => p.VisitPickupId == pickupId && p.TruckVisitId == id, ct);
+        if (plan is null || !scope.HasAt(TosPermissions.GateOverride, plan.BranchId)) return TypedResults.NotFound();
+        if (plan.Status != "PLANNED") return TosSupport.Conflict($"That pick-up is {plan.Status}.");
+        var now = time.GetUtcNow();
+        plan.Status = "CANCELLED";
+        plan.CancelledAt = now;
+        plan.CancelledBy = caller.UserId();
+        plan.CancelReason = request.Reason!.Trim();
+        plan.UpdatedAt = now;
+        plan.UpdatedBy = caller.UserId();
+        foreach (var hold in await BoxReservations.LiveAsync(db, plan.BookingContainerId, plan.ContainerNo, now, ct))
+            BoxReservations.Release(hold, BoxReservations.Removed, caller.UserId(), now);
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+        if (plan.ContainerNo is { } box) await GateNominations.UndoAsync(db, plan.BookingContainerId, box, time, ct);
+        return TypedResults.Ok((await PickupsAsync(db, [id], ct)).Single(p => p.Response.VisitPickupId == pickupId).Response);
     }
 
     private static string ModeOf(IReadOnlyList<GateTransactionSummaryResponse> boxes) => GateRules.VisitMode(
@@ -904,6 +948,9 @@ internal static class GateEndpoints
 
         var departedAt = request?.DepartedAt ?? time.GetUtcNow();
         if (visit.GateInAt is null) return TosSupport.Conflict($"Visit {visit.VisitNo} never came in.", "Record the gate-in first.");
+        if (await db.VisitPickups.CountAsync(p => p.TruckVisitId == id && p.Status == "PLANNED", ct) is > 0 and var waiting)
+            return TosSupport.Conflict($"{visit.TruckPlate} still has {waiting} pick-up(s) to collect.",
+                "Release them at gate out, or cancel them (POST /gate/visits/{id}/pickups/{pickupId}/cancel) if the truck leaves without them.");
         if (departedAt < visit.GateInAt) return TosSupport.Invalid("departedAt", "A truck cannot leave before it came in (V-13: Vector has 38,148 of these).");
 
         visit.GateOutAt = departedAt;

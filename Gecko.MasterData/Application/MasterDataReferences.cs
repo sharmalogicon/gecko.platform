@@ -221,11 +221,11 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             join t in db.EquipmentTypes on c.EquipmentTypeId equals t.EquipmentTypeId into types
             from t in types.DefaultIfEmpty()
             where numbers.Contains(c.ContainerNo)
-            select new { c.ContainerId, c.ContainerNo, TypeCode = t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid, c.FixedPortCodes })
+            select new { c.ContainerId, c.ContainerNo, TypeCode = t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid, c.FixedPortCodes, c.OwnerPartyId })
             .ToListAsync(ct);
         return rows.ToDictionary(c => c.ContainerNo,
             c => new ContainerRef(c.ContainerId, c.ContainerNo, c.TypeCode, c.Status, c.IsCheckDigitValid,
-                (c.FixedPortCodes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+                (c.FixedPortCodes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), c.OwnerPartyId),
             StringComparer.OrdinalIgnoreCase);
     }
 

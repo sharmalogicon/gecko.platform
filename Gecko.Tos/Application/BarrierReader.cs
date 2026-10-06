@@ -127,6 +127,10 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             findings.Add(new GateFinding("WRONG_BRANCH",
                 $"{containerNo} is booked at another depot on {booking.OrderNo}. It cannot be gated here.", GateSeverity.Block));
 
+        if (GateRules.OwnerMismatch(containerNo, registry?.OwnerPartyId, booking.LinePartyId, booking.LinePartyCode, booking.OrderNo,
+                await master.GetBoolSettingAsync(TosSettingKeys.RefuseOwnerMismatch, branchId, true, ct)) is { } owner)
+            findings.Add(owner);
+
         if (booking.Status != BookingRules.Open)
             findings.Add(new GateFinding("BOOKING_NOT_OPEN",
                 $"Booking {booking.OrderNo} is {booking.Status}.", GateSeverity.Block));

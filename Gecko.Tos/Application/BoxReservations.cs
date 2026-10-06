@@ -16,6 +16,9 @@ internal static class BoxReservations
     /// <summary>How long a hold lasts; each Record or price refresh extends it.</summary>
     public static readonly TimeSpan Hold = TimeSpan.FromMinutes(15);
 
+    /// <summary>A box a truck came to collect is held for it from gate in until it leaves with it (owner 2026-10-06).</summary>
+    public static readonly TimeSpan PickupHold = TimeSpan.FromHours(24);
+
     public const string Removed = "REMOVED";
     public const string Expired = "EXPIRED";
     public const string Gated = "GATED";

@@ -242,7 +242,7 @@ internal static class TestDatabase
             DECLARE @g TABLE (id UNIQUEIDENTIFIER);
             INSERT @g SELECT gate_transaction_id FROM gate.gate_transaction WHERE booking_id IN (SELECT id FROM @b);
             DECLARE @v TABLE (id UNIQUEIDENTIFIER);
-            INSERT @v SELECT DISTINCT truck_visit_id FROM gate.gate_transaction WHERE gate_transaction_id IN (SELECT id FROM @g);
+            INSERT @v SELECT DISTINCT truck_visit_id FROM gate.gate_transaction WHERE gate_transaction_id IN (SELECT id FROM @g); INSERT @v SELECT DISTINCT truck_visit_id FROM gate.visit_pickup WHERE booking_container_id IN (SELECT booking_container_id FROM booking.booking_container WHERE booking_id IN (SELECT id FROM @b)) AND truck_visit_id NOT IN (SELECT id FROM @v);
             DECLARE @cv TABLE (id UNIQUEIDENTIFIER);
             INSERT @cv SELECT container_visit_id FROM yard.container_visit
                 WHERE gate_in_transaction_id IN (SELECT id FROM @g) OR gate_out_transaction_id IN (SELECT id FROM @g);
@@ -261,6 +261,8 @@ internal static class TestDatabase
             DELETE FROM gate.gate_authorization WHERE booking_id IN (SELECT id FROM @b);
             DELETE FROM gate.attachment WHERE owner_id IN (SELECT id FROM @g) OR owner_id IN (SELECT id FROM @v);
             DELETE FROM gate.gate_transaction_correction WHERE gate_transaction_id IN (SELECT id FROM @g);
+            DELETE FROM gate.visit_pickup WHERE truck_visit_id IN (SELECT id FROM @v)
+                OR booking_container_id IN (SELECT booking_container_id FROM booking.booking_container WHERE booking_id IN (SELECT id FROM @b));
             DELETE FROM gate.gate_transaction_seal WHERE gate_transaction_id IN (SELECT id FROM @g);
             DELETE FROM outbox.message         WHERE aggregate_id IN (SELECT id FROM @g);
             DELETE FROM gate.gate_transaction  WHERE gate_transaction_id IN (SELECT id FROM @g);

@@ -242,8 +242,9 @@ public sealed record OrderTypeStepRef(
 
 /// <summary><see cref="EquipmentTypeCode"/> is null when the registry row was entered without a type.</summary>
 /// <param name="FixedPortCodes">The ports the box is designated to (gecko_master 25); empty = any port.</param>
+/// <param name="OwnerPartyId">The box's owner (MDM container.owner_party_id); null = not recorded.</param>
 public sealed record ContainerRef(Guid ContainerId, string ContainerNo, string? EquipmentTypeCode, string Status, bool IsCheckDigitValid,
-    IReadOnlyList<string>? FixedPortCodes = null);
+    IReadOnlyList<string>? FixedPortCodes = null, Guid? OwnerPartyId = null);
 
 /// <summary>
 /// <see cref="BlockingScope"/> is ALL / RELEASE / LOAD / GATE_IN / GATE_OUT and
@@ -286,6 +287,8 @@ public static class TosSettingKeys
 
     /// <summary>gecko_master 12_seed_config_definitions.sql — refuse a container number whose ISO 6346 check digit fails.</summary>
     public const string EnforceCheckDigit = "gate.enforce_check_digit";
+    /// <summary>gecko_master 30: true (default) = a box of another owner than the booking's line is refused; false = warned.</summary>
+    public const string RefuseOwnerMismatch = "gate.refuse_owner_mismatch";
 
     /// <summary>gecko_master 19_billing_settings.sql — a billable movement needs an unspent coupon (true = block, false = warn).</summary>
     public const string RequireCouponForCash = "gate.require_coupon_for_cash";

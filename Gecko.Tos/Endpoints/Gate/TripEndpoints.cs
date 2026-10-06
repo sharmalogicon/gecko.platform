@@ -81,13 +81,58 @@ internal static class TripEndpoints
             if (row.Move is null) { errors.Add($"rows[{i}].move", "The gate fields of this box."); continue; }
             var invalid = new List<ValidationResult>();
             var move = Move(row, request, null);
+            var emptyPickup = request.TruckVisitId is null && row.Move.Direction == GateRules.Out && row.BookingContainerId is not null
+                              && string.IsNullOrWhiteSpace(row.Move.ContainerNo);   // the yard chooses the box; it is keyed at gate out
             if (!Validator.TryValidateObject(move, new ValidationContext(move), invalid, validateAllProperties: true))
-                foreach (var v in invalid) errors.Add($"rows[{i}].move.{string.Join(",", v.MemberNames)}", v.ErrorMessage ?? "Invalid.");
+                foreach (var v in invalid.Where(v => !(emptyPickup && v.MemberNames.Contains(nameof(GateTransactionRequest.ContainerNo)))))
+                    errors.Add($"rows[{i}].move.{string.Join(",", v.MemberNames)}", v.ErrorMessage ?? "Invalid.");
             if (row.Blind is { } blind && !string.Equals(ContainerNumber.Normalise(blind.ContainerNo ?? ""), ContainerNumber.Normalise(row.Move.ContainerNo ?? ""), StringComparison.Ordinal))
                 errors.Add($"rows[{i}].blind.containerNo", "The blind order and the move must name the same box.");
         }
         if (rows.Count(r => r.Move?.Direction == GateRules.In) > 2 || rows.Count(r => r.Move?.Direction == GateRules.Out) > 2)
             errors.Add("rows", "A truck carries at most two boxes each way.");
+
+        // ── the truck: the open visit it is on (gate out), else the one this screen opened, else a new one ──
+        TruckVisit? joined = null;
+        if (request.TruckVisitId is { } named)
+        {
+            joined = await db.TruckVisits.AsNoTracking().SingleOrDefaultAsync(v => v.TruckVisitId == named, ct);
+            if (joined is null || joined.BranchId != branchId)
+                errors.Add("truckVisitId", "Not a truck visit at this depot.");
+            else if (joined.GateOutAt is not null)
+                errors.Add("truckVisitId", $"Visit {joined.VisitNo} ({joined.TruckPlate}) has already left the depot. A truck coming back is a new visit: send truck instead.");
+        }
+        else
+        {
+            var opened = await db.TripSaves.AsNoTracking()
+                .Where(t => t.BranchId == branchId && t.DraftId == draftId && t.TruckVisitId != null && t.Status == "DONE" && t.IdempotencyKey != key)
+                .OrderByDescending(t => t.UpdatedAt).Select(t => t.TruckVisitId).FirstOrDefaultAsync(ct);
+            if (opened is { } draftVisit)
+                joined = await db.TruckVisits.AsNoTracking()
+                    .SingleOrDefaultAsync(v => v.TruckVisitId == draftVisit && v.GateOutAt == null && v.BranchId == branchId, ct);
+        }
+        if (joined is null && request.Truck is null && !errors.ContainsKey("truckVisitId"))
+            errors.Add("truck", "Name the truck, or the open visit it is on (truckVisitId).");
+
+        // ── gate out (owner 2026-10-06; Vector GateOut.cs): the truck in front of the clerk releases what it came for ──
+        var gateOut = request.TruckVisitId is not null;
+        var releasedHere = await db.GateTransactions.AsNoTracking()   // a resumed gate-out: rows this key already released
+            .Where(g => g.IdempotencyKey != null && g.IdempotencyKey.StartsWith(key + "#")).Select(g => g.GateTransactionId).ToListAsync(ct);
+        var plans = joined is null ? [] : await db.VisitPickups
+            .Where(p => p.TruckVisitId == joined.TruckVisitId
+                        && (p.Status == "PLANNED" || (p.Status == "RELEASED" && p.GateTransactionId != null && releasedHere.Contains(p.GateTransactionId.Value))))
+            .ToListAsync(ct);
+        if (gateOut && joined is not null)
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (rows[i].Move?.Direction != GateRules.Out || rows[i].Blind is not null)
+                    errors.Add($"rows[{i}]", "At gate out a row releases a box this truck came to collect (planned at gate in). A drop-off is recorded at gate in.");
+                else if (!plans.Any(p => p.BookingContainerId == rows[i].BookingContainerId))
+                    errors.Add($"rows[{i}].bookingContainerId", $"Not a pick-up planned for {joined.TruckPlate} ({joined.VisitNo}) at gate in.");
+            }
+        // Whose holds these are: at gate out the truck's own (its pick-ups are held for its visit), else this screen's.
+        var holder = gateOut && joined is not null ? joined.TruckVisitId : draftId;
+        var asHeld = request with { DraftId = holder };
         if (rows.Any(r => r.Damages is { Count: > 0 }))
         {
             var codes = await master.SurveyCodesAsync(ct);
@@ -156,11 +201,20 @@ internal static class TripEndpoints
             var place = await GateNominations.PlaceAsync(db, wanted, ct);
             if (place is null || place.BranchId != branchId)
                 return await StopAsync(TosSupport.Invalid($"rows[{i}].bookingContainerId", "Not a booked box at this depot."));
+            if (number.Length == 0) continue;   // an empty pick-up planned without its box
+            if (gateOut && place.ContainerNo is { } planned && planned != number && place.Source == GateNominations.Source)
+            {
+                // The yard loaded another empty box than the one planned: the plan's box comes off, this one goes on.
+                foreach (var h in await BoxReservations.LiveAsync(db, null, planned, now, ct)) BoxReservations.Release(h, BoxReservations.Removed, caller.UserId(), now);
+                await db.SaveChangesAsync(ct);
+                await GateNominations.UndoAsync(db, place.BookingContainerId, planned, time, ct);
+                place = (await GateNominations.PlaceAsync(db, wanted, ct))!;
+            }
             if (place.ContainerNo == number || (place.ContainerNo is not null && place.Source != GateNominations.Source)) continue;
 
-            var blocks = (await GateNominations.CheckAsync(db, master, clock, place, number, draftId, now, ct))
+            var blocks = (await GateNominations.CheckAsync(db, master, clock, place, number, holder, now, ct))
                 .Where(f => f.Severity == GateSeverity.Block).ToList();
-            var choice = blocks.Count > 0 ? null : await GateNominations.NominateAsync(db, master, wanted, number, draftId, caller, time, ct);
+            var choice = blocks.Count > 0 ? null : await GateNominations.NominateAsync(db, master, wanted, number, holder, caller, time, ct);
             if (choice is { Place: { } chosen })
             {
                 if (choice.Written) nominatedNow.Add((chosen.BookingContainerId, number));
@@ -182,7 +236,7 @@ internal static class TripEndpoints
         for (var i = 0; i < rows.Count; i++)
         {
             var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo);
-            if (await BoxReservations.HeldByOtherAsync(db, lineIds[i], number, draftId, now, ct) is { } held)
+            if (await BoxReservations.HeldByOtherAsync(db, lineIds[i], number.Length == 0 ? null : number, holder, now, ct) is { } held)
             {
                 var name = (await users.DisplayNamesAsync([held.ReservedBy], ct)).GetValueOrDefault(held.ReservedBy);
                 return await StopAsync(TosSupport.Conflict(BoxReservations.Finding(held, name).Message, $"rows[{i}]: remove it from this truck, or ask that clerk to."));
@@ -191,9 +245,12 @@ internal static class TripEndpoints
 
         // ── 1b. every box past the barrier BEFORE any money is taken (A1) ──
         var refusals = new List<object>();
+        var doneBefore = await db.GateTransactions.AsNoTracking()   // an interrupted Save resumed: its moves are already made
+            .Where(g => g.IdempotencyKey != null && g.IdempotencyKey.StartsWith(key + "#")).Select(g => g.IdempotencyKey!).ToListAsync(ct);
         for (var i = 0; i < rows.Count; i++)
         {
-            var blocks = await GateEndpoints.PrecheckAsync(Move(rows[i], request, null), rows[i].Blind is not null, barrier, master, time, ct);
+            if (doneBefore.Contains($"{key}#{i}") || string.IsNullOrWhiteSpace(rows[i].Move!.ContainerNo)) continue;
+            var blocks = await GateEndpoints.PrecheckAsync(Move(rows[i], asHeld, null), rows[i].Blind is not null, barrier, master, time, ct);
             if (blocks.Count > 0)
                 refusals.Add(new { index = i, containerNo = ContainerNumber.Normalise(rows[i].Move!.ContainerNo),
                     findings = blocks.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList() });
@@ -205,7 +262,11 @@ internal static class TripEndpoints
                 extensions: new Dictionary<string, object?> { ["rows"] = refusals, ["charged"] = false }));
 
         // ── 1c. one truck carries 1×40' or 2×20' each way (Vector GateIn.cs:1366) ──
-        if (await FeetAsync(db, master, rows, ct) is { } feet) return await StopAsync(feet);
+        var aboard = joined is null ? [] : await db.GateTransactions.AsNoTracking()   // boxes the joined visit already moved
+            .Where(g => g.TruckVisitId == joined.TruckVisitId && g.Status == "COMPLETED"
+                        && !(g.IdempotencyKey != null && g.IdempotencyKey.StartsWith(key + "#")))
+            .Select(g => new Aboard(g.Direction, g.EquipmentTypeCode)).ToListAsync(ct);
+        if (await FeetAsync(db, master, rows, aboard, ct) is { } feet) return await StopAsync(feet);
 
         // ── 1d. the booked boxes, before any blind order is raised ──────────
         var lines = new (Guid BookingContainerId, Guid BookingId, string OrderNo, string ContainerNo)[rows.Count];
@@ -224,6 +285,11 @@ internal static class TripEndpoints
             if (line is null || line.BranchId != branchId)
                 return await StopAsync(TosSupport.Invalid($"rows[{i}].bookingContainerId", "Not a booked box at this depot."));
             var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo);
+            if (number.Length == 0)   // an empty pick-up planned without its box: the yard chooses it
+            {
+                lines[i] = (line.BookingContainerId, line.BookingId, line.OrderNo, line.ContainerNo ?? "");
+                continue;
+            }
             if (line.ContainerNo != number)
                 return await StopAsync(TosSupport.Invalid($"rows[{i}].move.containerNo",
                     $"That place on {line.OrderNo} is for {line.ContainerNo}, not {number}. Pick an empty place, or check the number."));
@@ -264,7 +330,7 @@ internal static class TripEndpoints
             if (rows[i].Blind is not { } blind) continue;
             var raised = await BookingEndpoints.RaiseBlindOrderAsync(
                 new BlindOrderRequest(branchId, blind.ContainerNo!, blind.LineCode!, blind.CustomerCode, blind.EquipmentTypeCode,
-                    blind.CarrierRef, blind.AgentCode, request.Truck!.HaulierCode, blind.Remarks, draftId),
+                    blind.CarrierRef, blind.AgentCode, request.Truck?.HaulierCode ?? joined?.HaulierPartyCode, blind.Remarks, draftId),
                 db, master, users, clock, caller, scope, ct);
             db.ChangeTracker.Clear();
             var order = raised.Result switch
@@ -312,7 +378,7 @@ internal static class TripEndpoints
             payment = await cashier.PayAsync(new TruckPaymentRequest(
                 branchId, caller.UserId(), key,
                 lines.GroupBy(l => l.BookingId).Select(g => new TruckBookingBoxes(g.Key, g.Select(l => l.BookingContainerId).ToList())).ToList(),
-                request.Truck!.TruckCategoryCode, request.Truck.HaulierCode, request.Vas,
+                request.Truck?.TruckCategoryCode ?? joined?.TruckCategoryCode, request.Truck?.HaulierCode ?? joined?.HaulierPartyCode, request.Vas,
                 pay.Payer, pay.Payments ?? [], pay.ExpectedTotal, pay.WithholdingTax), ct);
             if (payment.Outcome == TruckPaymentOutcome.Refused)
             {
@@ -339,11 +405,12 @@ internal static class TripEndpoints
 
         // ── 4. the moves: drop-offs before pick-ups, one EIR each ───────────
         var results = new TripRowResponse?[rows.Count];
-        Guid? visitId = null;
-        string? visitNo = null;
+        Guid? visitId = joined?.TruckVisitId;
+        string? visitNo = joined?.VisitNo;
         foreach (var i in Enumerable.Range(0, rows.Count).OrderBy(i => rows[i].Move!.Direction == GateRules.In ? 0 : 1).ThenBy(i => i))
         {
-            var move = Move(rows[i], request, visitId);
+            if (!gateOut && rows[i].Move!.Direction == GateRules.Out) continue;   // a pick-up: planned below, moved at gate out
+            var move = Move(rows[i], asHeld, visitId);
             var recorded = await GateEndpoints.RecordCoreAsync(move, $"{key}#{i}", db, barrier, master, clock, caller, scope, time, users, ct);
             db.ChangeTracker.Clear();
             var coupon = payment?.Coupons.FirstOrDefault(c => c.BookingContainerId == lines[i].BookingContainerId)?.CouponRef;
@@ -355,6 +422,18 @@ internal static class TripEndpoints
                     ? await SurveyAsync(eir, move, damages, db, master, caller, scope, time, ct)
                     : (null, null, null);
                 IReadOnlyList<GateFindingResponse> said = [.. eir.Findings ?? [], .. new[] { surveyProblem, switched.GetValueOrDefault(i) }.OfType<GateFindingResponse>()];
+                if (gateOut && plans.FirstOrDefault(p => p.BookingContainerId == rows[i].BookingContainerId && p.Status == "PLANNED") is { } plan)
+                {
+                    db.VisitPickups.Attach(plan);
+                    plan.Status = "RELEASED";
+                    plan.GateTransactionId = eir.GateTransactionId;
+                    plan.ReleasedAt = eir.TransactionAt;
+                    plan.ContainerNo = eir.ContainerNo;
+                    plan.UpdatedAt = time.GetUtcNow();
+                    plan.UpdatedBy = caller.UserId();
+                    await db.SaveChangesAsync(ct);
+                    db.ChangeTracker.Clear();
+                }
                 results[i] = new TripRowResponse(i, eir.ContainerNo, lines[i].BookingContainerId, eir.OrderNo, "GATED",
                     eir.EirNo, eir.GateTransactionId, $"/api/tos/gate/transactions/{eir.GateTransactionId}/eir.pdf", coupon, null,
                     said, surveyId, holds);
@@ -367,13 +446,84 @@ internal static class TripEndpoints
             }
         }
 
+        // ── 5. gate in: the pick-ups, planned on the truck's visit and held for it until it leaves ──
+        if (!gateOut)
+            foreach (var i in Enumerable.Range(0, rows.Count).Where(i => rows[i].Move!.Direction == GateRules.Out))
+            {
+                if (visitId is null)   // a truck that came only to collect
+                {
+                    var branch = (await clock.BranchesAsync([branchId], ct))[branchId];
+                    var (opened, invalid) = await GateEndpoints.NewVisitAsync(request.Truck!, branchId, branch, time.GetUtcNow(), db, master, clock, caller, ct);
+                    if (invalid is not null) return invalid;
+                    opened!.GateInAt = opened.ArrivedAt;
+                    await db.SaveChangesAsync(ct);
+                    (visitId, visitNo) = (opened.TruckVisitId, opened.VisitNo);
+                    db.ChangeTracker.Clear();
+                }
+                var number = ContainerNumber.Normalise(rows[i].Move!.ContainerNo ?? "") is { Length: > 0 } n ? n : null;
+                var at = time.GetUtcNow();
+                var plan = await db.VisitPickups.SingleOrDefaultAsync(p => p.BookingContainerId == lines[i].BookingContainerId && p.Status == "PLANNED", ct);
+                if (plan is null)
+                {
+                    plan = new VisitPickup
+                    {
+                        TenantId = caller.TenantId(), BranchId = branchId, TruckVisitId = visitId.Value, BookingContainerId = lines[i].BookingContainerId,
+                        ContainerNo = number, Status = "PLANNED", PlannedAt = at, PlannedBy = caller.UserId(), TripSaveId = save.TripSaveId,
+                        CreatedBy = caller.UserId(), UpdatedBy = caller.UserId(),
+                    };
+                    db.VisitPickups.Add(plan);
+                }
+                // The box (or the empty place) stays this truck's until it leaves with it.
+                var holds = await BoxReservations.LiveAsync(db, lines[i].BookingContainerId, number, at, ct);
+                var hold = holds.FirstOrDefault(h => h.DraftId == draftId || h.DraftId == visitId);
+                if (hold is null)
+                {
+                    hold = new BoxReservation
+                    {
+                        TenantId = caller.TenantId(), BranchId = branchId, BookingContainerId = lines[i].BookingContainerId, ContainerNo = number,
+                        ReservedBy = caller.UserId(), ReservedAt = at, CreatedBy = caller.UserId(),
+                    };
+                    db.BoxReservations.Add(hold);
+                }
+                hold.DraftId = visitId.Value;
+                hold.ExpiresAt = at + BoxReservations.PickupHold;
+                hold.UpdatedAt = at;
+                hold.UpdatedBy = caller.UserId();
+                string? reason = null;
+                try { await db.SaveChangesAsync(ct); }
+                catch (DbUpdateException e) when (e.InnerException?.Message is { } m && (m.Contains("uq_visit_pickup__planned") || m.Contains("uq_box_reservation__live")))
+                {
+                    reason = "Another truck was planned for this box a moment ago.";
+                }
+                db.ChangeTracker.Clear();
+                var coupon = payment?.Coupons.FirstOrDefault(c => c.BookingContainerId == lines[i].BookingContainerId)?.CouponRef;
+                results[i] = new TripRowResponse(i, number ?? "", lines[i].BookingContainerId, lines[i].OrderNo, reason is null ? "PLANNED" : "NOT_PLANNED",
+                    null, null, null, coupon, reason, switched.GetValueOrDefault(i) is { } moved ? [moved] : [], VisitPickupId: reason is null ? plan.VisitPickupId : null);
+            }
+
+        // ── 6. gate out: nothing left to collect, the truck has left ──
+        DateTimeOffset? truckLeftAt = null;
+        if (gateOut && visitId is { } leaving
+            && !await db.VisitPickups.AnyAsync(p => p.TruckVisitId == leaving && p.Status == "PLANNED", ct))
+        {
+            var visitRow = await db.TruckVisits.SingleAsync(v => v.TruckVisitId == leaving, ct);
+            if (visitRow.GateOutAt is null)
+            {
+                visitRow.GateOutAt = time.GetUtcNow();
+                await db.SaveChangesAsync(ct);
+            }
+            truckLeftAt = visitRow.GateOutAt;
+            db.ChangeTracker.Clear();
+        }
+
         var answer = new TripSaveResponse(save.TripSaveId, visitId, visitNo,
             payment?.Receipt is { } r
                 ? new TripReceiptResponse(r.ReceiptId, r.ReceiptNo, r.Subtotal, r.Tax, r.Total, r.WithholdingTax, r.Total - r.WithholdingTax,
                     r.CurrencyCode, $"/api/revenue/window/receipts/{r.ReceiptId}/receipt.pdf", $"/api/revenue/window/receipts/{r.ReceiptId}/coupon.pdf")
                 : null,
             results.Select(x => x!).ToList(),
-            visitId is { } truckVisit ? $"/api/tos/gate/visits/{truckVisit}/truck-in.pdf" : null);
+            visitId is { } truckVisit ? $"/api/tos/gate/visits/{truckVisit}/truck-in.pdf" : null,
+            truckLeftAt);
 
         save.Status = "DONE";
         save.TruckVisitId = visitId;
@@ -408,7 +558,10 @@ internal static class TripEndpoints
     }
 
     /// <summary>A truck carries 1×40' or 2×20' each way: the boxes' lengths in one direction add up to 45 ft at most.</summary>
-    private static async Task<ValidationProblem?> FeetAsync(TosDbContext db, IMasterDataReferences master, IReadOnlyList<TripRowRequest> rows, CancellationToken ct)
+    private sealed record Aboard(string Direction, string? EquipmentTypeCode);
+
+    private static async Task<ValidationProblem?> FeetAsync(TosDbContext db, IMasterDataReferences master, IReadOnlyList<TripRowRequest> rows,
+        IReadOnlyList<Aboard> aboard, CancellationToken ct)
     {
         var lineIds = rows.Select(r => r.BookingContainerId).OfType<Guid>().ToList();
         var booked = await (
@@ -421,14 +574,20 @@ internal static class TripEndpoints
         string? TypeOf(TripRowRequest r) => r.BookingContainerId is { } id ? r.EquipmentTypeCode.Clean() ?? booked.GetValueOrDefault(id)
             : r.Blind?.EquipmentTypeCode?.Trim().ToUpperInvariant() ?? registry.GetValueOrDefault(ContainerNumber.Normalise(r.Blind?.ContainerNo ?? ""))?.EquipmentTypeCode;
         var types = rows.Select(TypeOf).ToList();
-        var sizes = await master.EquipmentTypesAsync(types.OfType<string>().Distinct(), ct);
+        var sizes = await master.EquipmentTypesAsync(types.Concat(aboard.Select(a => a.EquipmentTypeCode)).OfType<string>().Distinct(), ct);
+        int Feet(string? type) => type is not null && sizes.GetValueOrDefault(type) is { } e && int.TryParse(e.SizeCode, out var ft) ? ft : 0;
         foreach (var way in new[] { GateRules.In, GateRules.Out })
         {
-            var feet = rows.Select((r, i) => (r, i)).Where(x => x.r.Move?.Direction == way)
-                .Sum(x => types[x.i] is { } t && sizes.GetValueOrDefault(t) is { } e && int.TryParse(e.SizeCode, out var ft) ? ft : 0);
-            if (feet > 45)
+            var already = aboard.Where(a => a.Direction == way).ToList();
+            var feet = rows.Select((r, i) => (r, i)).Where(x => x.r.Move?.Direction == way).Sum(x => Feet(types[x.i])) + already.Sum(a => Feet(a.EquipmentTypeCode));
+            var count = rows.Count(r => r.Move?.Direction == way) + already.Count;
+            if (feet > 45 || count > 2)
                 return TypedResults.ValidationProblem(new Dictionary<string, string[]>
-                    { ["rows"] = [$"A truck carries 1×40' or 2×20' each way; these boxes going {way} add up to {feet} ft."] });
+                {
+                    ["rows"] = [already.Count == 0
+                        ? $"A truck carries 1×40' or 2×20' each way; these boxes going {way} add up to {feet} ft."
+                        : $"A truck carries 1×40' or 2×20' each way; with the {already.Count} box(es) this truck already moved {way}, that is {count} box(es), {feet} ft."],
+                });
         }
         return null;
     }

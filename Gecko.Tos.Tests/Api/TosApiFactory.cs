@@ -56,6 +56,8 @@ public class TosApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
                 $"Another Gecko.Api (process {string.Join(", ", others)}) is draining the local outbox. Stop it before running these tests.");
 
         _liveApiRowsBefore = await LiveApiRowsAsync();
+        // SCT's fixture registry books boxes of other owners on MAEU orders: the owner rule warns there (gecko_master 30).
+        await TestDatabase.SetSctSettingAsync(Gecko.MasterData.Contracts.TosSettingKeys.RefuseOwnerMismatch, null, "false");
     }
 
     public override async ValueTask DisposeAsync()

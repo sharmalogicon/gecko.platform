@@ -146,6 +146,11 @@ internal static class GateNominations
 
         // The registry's type against the place (Vector GateIn.cs:3033-3063): an IMPORT box may differ (A11 changes the booking).
         var registry = (await master.ContainersAsync([containerNo], ct)).GetValueOrDefault(containerNo);
+        var line = await db.Bookings.AsNoTracking().Where(b => b.BookingId == place.BookingId)
+            .Select(b => new { b.LinePartyId, b.LinePartyCode }).SingleAsync(ct);
+        if (GateRules.OwnerMismatch(containerNo, registry?.OwnerPartyId, line.LinePartyId, line.LinePartyCode, place.OrderNo,
+                await master.GetBoolSettingAsync(TosSettingKeys.RefuseOwnerMismatch, place.BranchId, true, ct)) is { } owner)
+            findings.Add(owner);
         if (registry is null && !await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, place.BranchId, true, ct))
             findings.Add(new GateFinding("UNKNOWN_CONTAINER", $"{containerNo} is not in the container registry, and this depot does not accept unknown boxes.", GateSeverity.Block));
         if (registry?.EquipmentTypeCode is { } type && !string.Equals(type, place.EquipmentTypeCode, StringComparison.OrdinalIgnoreCase))

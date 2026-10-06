@@ -38,6 +38,8 @@ public partial class TosDbContext : DbContext
 
     public virtual DbSet<GateTransactionCorrection> GateTransactionCorrections { get; set; }
 
+    public virtual DbSet<VisitPickup> VisitPickups { get; set; }
+
     public virtual DbSet<Module> Modules { get; set; }
 
     public virtual DbSet<MovementPlan> MovementPlans { get; set; }
@@ -1984,6 +1986,32 @@ public partial class TosDbContext : DbContext
                 .HasMaxLength(20)
                 .IsUnicode(false)
                 .HasColumnName("vessel_code");
+        });
+
+        modelBuilder.Entity<VisitPickup>(entity =>
+        {
+            entity.HasKey(e => e.VisitPickupId).HasName("pk_visit_pickup");
+            entity.ToTable("visit_pickup", "gate");
+            entity.Property(e => e.VisitPickupId).HasDefaultValueSql("(newsequentialid())", "df_visit_pickup__id").HasColumnName("visit_pickup_id");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.TruckVisitId).HasColumnName("truck_visit_id");
+            entity.Property(e => e.BookingContainerId).HasColumnName("booking_container_id");
+            entity.Property(e => e.ContainerNo).HasMaxLength(11).IsUnicode(false).HasColumnName("container_no");
+            entity.Property(e => e.Status).HasMaxLength(10).IsUnicode(false).HasColumnName("status");
+            entity.Property(e => e.PlannedAt).HasColumnName("planned_at");
+            entity.Property(e => e.PlannedBy).HasColumnName("planned_by");
+            entity.Property(e => e.TripSaveId).HasColumnName("trip_save_id");
+            entity.Property(e => e.GateTransactionId).HasColumnName("gate_transaction_id");
+            entity.Property(e => e.ReleasedAt).HasColumnName("released_at");
+            entity.Property(e => e.CancelledAt).HasColumnName("cancelled_at");
+            entity.Property(e => e.CancelledBy).HasColumnName("cancelled_by");
+            entity.Property(e => e.CancelReason).HasMaxLength(300).HasColumnName("cancel_reason");
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_visit_pickup__created_at").HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_visit_pickup__updated_at").HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+            entity.Property(e => e.RowVersion).IsRowVersion().IsConcurrencyToken().HasColumnName("row_version");
         });
 
         modelBuilder.Entity<GateTransactionCorrection>(entity =>

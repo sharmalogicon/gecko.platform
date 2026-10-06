@@ -230,13 +230,18 @@ public sealed record GateDamageCodeResponse(string DamageCode, string Descriptio
 /// <see cref="Payment"/> null = take no money (a truck whose boxes owe no cash, or are on credit).
 /// <see cref="Vas"/>: the gate VAS the clerk ticked; each booking takes the codes its order type offers.
 /// </summary>
+/// <para><see cref="TruckVisitId"/> (GATE_OPEN_ITEMS #1; Vector GateOut.cs reuses the truck's TransactionNo): the rows join
+/// that open visit — a truck already in the yard taking a box out — and <see cref="Truck"/> may be left out. Without it, a
+/// second Save from the same screen (<see cref="DraftId"/>) joins the visit the first one opened; else a new visit for
+/// <see cref="Truck"/>.</para>
 public sealed record TripSaveRequest(
     [property: Required] Guid? BranchId,
     [property: Required] Guid? DraftId,
-    [property: Required] TruckRequest? Truck,
+    TruckRequest? Truck,
     [property: Required, MinLength(1), MaxLength(4)] IReadOnlyList<TripRowRequest>? Rows,
     IReadOnlyList<string>? Vas = null,
-    TripPaymentRequest? Payment = null);
+    TripPaymentRequest? Payment = null,
+    Guid? TruckVisitId = null);
 
 /// <summary>
 /// One box: a booked one (<see cref="BookingContainerId"/>) or one on no order (<see cref="Blind"/>, a BLIND GATE IN),
@@ -272,7 +277,9 @@ public sealed record TripPaymentRequest(
 /// <param name="TruckInPdfUrl">The truck-in form (A10), once a box went through.</param>
 public sealed record TripSaveResponse(
     Guid TripSaveId, Guid? TruckVisitId, string? VisitNo, TripReceiptResponse? Receipt, IReadOnlyList<TripRowResponse> Rows,
-    string? TruckInPdfUrl = null);
+    string? TruckInPdfUrl = null,
+    // Gate out: set when the truck has nothing left to collect and has left (its visit is closed).
+    DateTimeOffset? TruckLeftAt = null);
 
 /// <param name="Nett">What was paid: the total less withholding tax.</param>
 /// <param name="CouponPdfUrl">The coupon slips, one per box (A10).</param>
@@ -286,7 +293,9 @@ public sealed record TripRowResponse(
     int Index, string ContainerNo, Guid BookingContainerId, string OrderNo, string Status,
     string? EirNo, Guid? GateTransactionId, string? EirPdfUrl, string? CouponRef, string? Reason,
     IReadOnlyList<GateFindingResponse> Findings,
-    Guid? SurveyId = null, IReadOnlyList<string>? HoldsApplied = null);
+    Guid? SurveyId = null, IReadOnlyList<string>? HoldsApplied = null,
+    // owner 2026-10-06: a pick-up at gate in is PLANNED on the truck's visit (no EIR); gate out releases it.
+    Guid? VisitPickupId = null);
 
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,
@@ -302,6 +311,13 @@ public sealed record YardContainerResponse(
     string? PositionText, DateTimeOffset GateInAt, string GateInEirNo, string GateInMovementCode,
     int DaysInYard, bool IsHeld, Guid? CurrentBookingContainerId, DateTimeOffset LastEventAt);
 
+/// <summary>A box the truck came to collect: PLANNED at gate in, RELEASED by its EIR OUT at gate out, or CANCELLED.</summary>
+public sealed record VisitPickupResponse(
+    Guid VisitPickupId, Guid BookingContainerId, string OrderNo, string? ContainerNo, string? EquipmentTypeCode, string Status,
+    DateTimeOffset PlannedAt, Guid? GateTransactionId, string? CancelReason);
+
+public sealed record CancelPickupRequest([property: Required, MinLength(3), MaxLength(300)] string? Reason);
+
 public sealed record TruckVisitResponse(
     Guid TruckVisitId, string VisitNo, Guid BranchId, string TruckPlate, string? TrailerPlate,
     string? HaulierCode, string? DriverName, string? LaneCode,
@@ -310,4 +326,6 @@ public sealed record TruckVisitResponse(
     string? TruckCategoryCode = null,
     // What the truck did, DERIVED from its completed (not voided) moves — a PICKUP_DROPOFF_MODE code:
     // DROPOFF (in only), PICKUP (out only), PICKUP_DROPOFF (both), NONE (no move stands). Never an input.
-    string? PickupDropoffMode = null);
+    string? PickupDropoffMode = null,
+    // owner 2026-10-06: the boxes the truck came to collect (PLANNED ones are what gate out releases).
+    IReadOnlyList<VisitPickupResponse>? Pickups = null);

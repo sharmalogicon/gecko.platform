@@ -165,6 +165,19 @@ public static class GateRules
                 GateSeverity.Block);
     }
 
+    /// <summary>
+    /// Vector GateIn.cs:3025 / GateOut.cs:1030 (owner 2026-10-06: refuse): a box whose registry owner is known and is not
+    /// the booking's line (the box operator) does not move on that booking.
+    /// </summary>
+    public static GateFinding? OwnerMismatch(string containerNo, Guid? boxOwner, Guid bookingLine, string lineCode, string orderNo, bool refuse = true) =>
+        boxOwner is { } owner && owner != bookingLine
+            ? refuse
+                ? new GateFinding("OWNER_MISMATCH",
+                    $"{containerNo} belongs to another owner than {orderNo}'s line ({lineCode}). It cannot move on this booking.", GateSeverity.Block)
+                : new GateFinding("OWNER_MISMATCH",
+                    $"{containerNo} belongs to another owner than {orderNo}'s line ({lineCode}).", GateSeverity.Warn)
+            : null;
+
     // ── gate-out release gates (gate-in-vector-parity Part B §B2) ───────────────
 
     /// <summary>

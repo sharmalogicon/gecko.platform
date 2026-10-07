@@ -104,6 +104,28 @@ internal static class TestDatabase
     }
 
     /// <summary>
+    /// Sets (a value) or removes (null) one tenant-wide SCT setting in gecko_master.
+    /// Test-only, fixture tenant only — the sysadmin door, as settings are MDM's.
+    /// </summary>
+    public static async Task SetSctSettingAsync(string key, string? value)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gecko_master.config.tenant_setting WHERE tenant_id = @tenant AND setting_key = @key AND branch_id IS NULL;
+            IF @value IS NOT NULL
+                INSERT INTO gecko_master.config.tenant_setting (tenant_id, branch_id, setting_key, setting_value)
+                VALUES (@tenant, NULL, @key, @value);
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@key", key);
+        command.Parameters.AddWithValue("@value", value is null ? DBNull.Value : value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
     /// Soft-deletes a test tariff and everything under it, whatever its status.
     /// Test-only: production has no way to remove an approved price, by design.
     /// </summary>

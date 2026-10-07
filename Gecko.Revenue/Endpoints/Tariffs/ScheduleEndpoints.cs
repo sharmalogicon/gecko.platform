@@ -59,8 +59,8 @@ public sealed record DecisionRequest([property: Required] string RowVersion, [pr
 ///
 /// THE RULES THIS FILE ENFORCES, which the database cannot:
 ///   * Only a DRAFT can change. An approved price is changed by a new version.
-///   * The person who drafted or submitted a version cannot approve it, unless
-///     the tenant has switched revenue.tariff_self_approval_allowed on.
+///   * The person who drafted or submitted a version may approve it, unless
+///     the tenant has switched revenue.tariff_self_approval_allowed off (maker-checker).
 ///   * Two approved agreements with the same scope may not be in force on the
 ///     same day — the resolver would have no way to choose.
 ///   * Parties must exist in master data AND play the role they are named for:
@@ -210,7 +210,7 @@ internal static class ScheduleEndpoints
 
         var approver = caller.UserId();
         if (!ScheduleLifecycle.IsIndependentApprover(approver, schedule.CreatedBy, schedule.SubmittedBy)
-            && !await masterData.GetBoolSettingAsync(RevenueSettingKeys.TariffSelfApprovalAllowed, null, fallback: false, ct))
+            && !await masterData.GetBoolSettingAsync(RevenueSettingKeys.TariffSelfApprovalAllowed, null, fallback: true, ct))
             return TypedResults.Problem(
                 title: "You cannot approve a tariff you drafted or submitted.",
                 detail: "Ask another approver. A tenant administrator can allow self-approval with the setting "

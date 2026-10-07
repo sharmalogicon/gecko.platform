@@ -161,14 +161,41 @@ public sealed class TariffApiTests(RevenueApiFactory api)
         }
     }
 
+    private const string SelfApproval = "revenue.tariff_self_approval_allowed";
+
     [Fact]
-    public async Task The_person_who_submitted_cannot_approve()
+    public async Task By_default_the_person_who_submitted_may_approve()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var owner = await api.ClientForAsync(RevenueApiFactory.SctOwner);
+        var no = NewNo("SELFOK");
+        try
+        {
+            // No tenant row: the declared default (owner 2026-10-06: allowed) decides.
+            await TestDatabase.SetSctSettingAsync(SelfApproval, null);
+            var draft = await CreateAsync(owner, Spot(no, $"BKG-{no}"), ct);
+            await PutRatesAsync(owner, draft, GoodRates[..1], ct);
+            var submitted = await DecideAsync(owner, await ReloadAsync(owner, draft.ScheduleId, ct), "submit", ct);
+
+            var approved = await DecideAsync(owner, submitted, "approve", ct);
+
+            Assert.Equal("APPROVED", approved.Status);
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(no);
+        }
+    }
+
+    [Fact]
+    public async Task The_person_who_submitted_cannot_approve_when_the_tenant_turns_maker_checker_on()
     {
         var ct = TestContext.Current.CancellationToken;
         var owner = await api.ClientForAsync(RevenueApiFactory.SctOwner);
         var no = NewNo("SELF");
         try
         {
+            await TestDatabase.SetSctSettingAsync(SelfApproval, "false");
             var draft = await CreateAsync(owner, Spot(no, $"BKG-{no}"), ct);
             await PutRatesAsync(owner, draft, GoodRates[..1], ct);
             var submitted = await DecideAsync(owner, await ReloadAsync(owner, draft.ScheduleId, ct), "submit", ct);
@@ -181,6 +208,7 @@ public sealed class TariffApiTests(RevenueApiFactory api)
         }
         finally
         {
+            await TestDatabase.SetSctSettingAsync(SelfApproval, null);
             await TestDatabase.RemoveTariffAsync(no);
         }
     }

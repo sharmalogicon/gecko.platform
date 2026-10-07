@@ -19,11 +19,15 @@ internal sealed record PlanStep(short SequenceNo, string MovementCode, string St
 /// </summary>
 /// <param name="BillingUnitCode">The MDM charge code's unit: PER_TRIP is the once-per-truck gate charge.</param>
 /// <param name="ByHaulierTerm">A CASH line moved to credit by the haulier's charge term (gecko_master 22).</param>
+/// <param name="RateSource">TARIFF, or OVERRIDE: a supervisor's rate on the booking statement (gecko_revenue 25), kept against re-pricing.</param>
+/// <param name="UnitRateOriginal">With an override: the tariff's rate it replaced.</param>
 internal sealed record QuoteLine(
     string Kind, Guid ChargeCodeId, string ChargeCode, string ChargeName, string BillTo, string PaymentTermCode,
     string? PayerPartyCode, decimal Quantity, decimal? UnitRate, decimal Amount, string CurrencyCode,
     string? TaxCode, decimal TaxRate, decimal TaxAmount, DateOnly? ServiceFrom, DateOnly? ServiceTo, PriceResult Price,
-    string? BillingUnitCode = null, bool ByHaulierTerm = false)
+    string? BillingUnitCode = null, bool ByHaulierTerm = false,
+    string RateSource = RateSources.Tariff, decimal? UnitRateOriginal = null, string? OverrideReason = null,
+    Guid? OverriddenBy = null, DateTimeOffset? OverriddenAt = null, string? DiscountType = null, decimal? DiscountRate = null)
 {
     public const string Movement = "MOVEMENT";
     public const string Storage = "STORAGE";
@@ -75,14 +79,28 @@ internal sealed record TriedVariant(string ChargeCode, string BillTo, string Pay
 internal sealed record VasOption(string ChargeCode, string ChargeName, string BillTo, string PaymentTermCode, bool Ticked,
     string Outcome, QuoteLine? Line);
 
+/// <summary>Where a line's unit rate came from.</summary>
+internal static class RateSources
+{
+    public const string Tariff = "TARIFF";
+    /// <summary>A supervisor's rate on the booking statement (gecko_revenue 25).</summary>
+    public const string Override = "OVERRIDE";
+}
+
 internal sealed record MovementQuote(
     Guid BookingContainerId, string? ContainerNo, string MovementCode, string Direction,
     DateOnly? PaidUntil, ContainerStay? Stay, int? StayDays, bool StorageApplies,
     IReadOnlyList<QuoteLine> Lines, IReadOnlyList<TriedVariant> Tried,
     bool ReeferApplies = false, ReeferPowerQuote? Reefer = null,
     IReadOnlyList<QuoteLine>? Later = null, GateTerms? Terms = null, IReadOnlyList<QuoteLine>? Unpriced = null,
-    IReadOnlyList<VasOption>? VasMenu = null)
+    IReadOnlyList<VasOption>? VasMenu = null, IReadOnlyList<QuoteLine>? FreeByOverride = null)
 {
+    /// <summary>
+    /// Lines a supervisor repriced to 0 (gecko_revenue 25): they cost nothing, so nothing is paid or billed,
+    /// but they are kept, so the statement's quoted line keeps its override. Zero is not a waive.
+    /// </summary>
+    public IReadOnlyList<QuoteLine> ZeroRated => FreeByOverride ?? [];
+
     /// <summary>
     /// Cash charges the order type raises on this movement that NO tariff prices (not a
     /// contract, not the public / standard tariff), as lines at 0. While any is here the
@@ -172,8 +190,21 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         var lines = new List<QuoteLine>();
         var later = new List<QuoteLine>();
         var unpriced = new List<QuoteLine>();
+        var zeroRated = new List<QuoteLine>();
         var tried = new List<TriedVariant>();
         var terms = await ResolveAsync(gate, plan, ct);
+
+        // The booking statement's decisions on this box x movement (gecko_revenue 25): a QUOTED line a
+        // supervisor repriced keeps that rate, and one waived by id is settled, whoever prices it next.
+        var statement = await db.Charges.AsNoTracking()
+            .Where(c => c.BookingContainerId == box.BookingContainerId && c.MovementCode == step.MovementCode
+                        && c.Source == ChargeSource.Quote
+                        && ((c.Status == ChargeStatus.Quoted && (c.IsRateOverridden || (c.IsLocked && c.UnitRate != null && c.ScheduleId != null))) || c.Status == ChargeStatus.Waived || c.Status == ChargeStatus.Invoiced))
+            .Select(c => new { c.ChargeCode, c.BillTo, c.PaymentTermCode, c.Status, c.IsRateOverridden, c.UnitRate, c.UnitRateOriginal,
+                               c.OverrideReason, c.OverriddenBy, c.OverriddenAt, c.DiscountType, c.DiscountRate })
+            .ToListAsync(ct);
+        bool WaivedOnStatement(string code, string billTo, string term) => statement.Any(s =>
+            (s.Status == ChargeStatus.Waived || s.Status == ChargeStatus.Invoiced) && s.ChargeCode == code && s.BillTo == billTo && s.PaymentTermCode == term);
 
         var settled = await db.Charges.AsNoTracking()
             .Where(c => c.BookingContainerId == box.BookingContainerId && c.MovementCode == step.MovementCode
@@ -234,7 +265,8 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
         foreach (var (item, kind) in cashMenu)
         {
-            if (settled.Any(s => s.ChargeCode == item.ChargeCode && s.BillTo == item.BillTo && s.PaymentTermCode == Cash))
+            if (settled.Any(s => s.ChargeCode == item.ChargeCode && s.BillTo == item.BillTo && s.PaymentTermCode == Cash)
+                || WaivedOnStatement(item.ChargeCode, item.BillTo, Cash))
             {
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "SETTLED", null, []));
                 continue;
@@ -252,6 +284,11 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             }
             if (haulierTerms.TryGetValue(item.ChargeCode, out var haulierTerm) && haulierTerm == Credit)
             {
+                if (WaivedOnStatement(item.ChargeCode, item.BillTo, Credit))
+                {
+                    tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "SETTLED", null, ["Waived on the booking statement."]));
+                    continue;
+                }
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "HAULIER_CREDIT", null,
                     [$"{terms.HaulierCode} has a CREDIT term for {item.ChargeCode} at {step.MovementCode}: billed later, not paid here."]));
                 // No credit rate: Vector moves the CASH item to the haulier's term at the
@@ -265,6 +302,11 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
         foreach (var (item, kind) in creditMenu)
         {
+            if (WaivedOnStatement(item.ChargeCode, item.BillTo, Credit))
+            {
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "SETTLED", null, ["Waived on the booking statement."]));
+                continue;
+            }
             if (CarriedElsewhere(item.ChargeCode) is { } carried)
             {
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "PER_TRIP_ON_OTHER_BOX", null, [carried]));
@@ -285,6 +327,25 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
             var result = await pricing.PriceAsync(Request(plan, box, step, size, item.ChargeCode, item.BillTo, term, terms.TruckCategoryCode,
                 now, item.DefaultQty ?? 1, freeTimeKind: null, fullEmpty: step.FullEmpty), ct);
+
+            // A supervisor's rate on the statement wins over the tariff: quantity x that rate, VAT on top.
+            var billedTerm = billAs ?? term;
+            if (statement.FirstOrDefault(s => s.Status == ChargeStatus.Quoted && s.ChargeCode == item.ChargeCode
+                                              && s.BillTo == item.BillTo && s.PaymentTermCode == billedTerm) is { } ov)
+            {
+                var ovVariant = variants.TryGetValue((item.ChargeCode, item.BillTo, billedTerm), out var bv) ? bv : variant;
+                var ovRate = ov.UnitRate ?? 0;
+                // A LOCKED tariff line (gecko_revenue 26) keeps its rate too, but is not a correction: it stays TARIFF.
+                var ovLine = Overridden(kind, ovVariant, PayerFor(plan, item.BillTo), result.Quantity, ovRate, result,
+                    ov.UnitRateOriginal, ov.OverrideReason, ov.OverriddenBy, ov.OverriddenAt) with
+                    { ByHaulierTerm = byHaulier, PaymentTermCode = billedTerm, DiscountType = ov.DiscountType, DiscountRate = ov.DiscountRate,
+                      RateSource = ov.IsRateOverridden ? RateSources.Override : RateSources.Tariff };
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, billedTerm, RateSources.Override, ovLine.Amount,
+                    [.. result.PrecedenceTrail, $"Rate {ovRate:0.00} set on the booking statement: {ov.OverrideReason}"]));
+                (ovLine.Amount > 0 ? into : zeroRated).Add(ovLine);
+                return true;
+            }
+
             var amount = result.Outcome == PriceOutcomes.Priced ? result.Amount ?? 0 : (decimal?)null;
             var trail = billAs is null ? result.PrecedenceTrail
                 : [.. result.PrecedenceTrail, $"No {billAs} rate: the {term} price, billed on {billAs} (Vector GateIn.cs:1577-1596)."];
@@ -306,6 +367,29 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             into.Add(Line(kind, billed, PayerFor(plan, item.BillTo), result.Quantity, result.UnitRate,
                 amount.Value, result, null, null) with { ByHaulierTerm = byHaulier, PaymentTermCode = billAs ?? billed.PaymentTermCode });
             return true;
+        }
+
+        // ── lines added by hand on the booking statement for this move (source MANUAL, owner 2026-10-07):
+        //    collected like the rest of it — cash at the window, credit billed at the gate ──
+        var manual = await db.Charges.AsNoTracking()
+            .Where(c => c.BookingContainerId == box.BookingContainerId && c.MovementCode == step.MovementCode
+                        && c.Source == ChargeSource.Manual && c.Status == ChargeStatus.Quoted)
+            .ToListAsync(ct);
+        foreach (var m in manual)
+        {
+            if (m.PaymentTermCode == Cash && settled.Any(s => s.ChargeCode == m.ChargeCode && s.BillTo == m.BillTo && s.PaymentTermCode == Cash))
+                continue;
+            var price = new PriceResult(PriceOutcomes.Priced, m.ChargeCode, m.BillTo, m.PaymentTermCode, DateOnly.FromDateTime(now.UtcDateTime),
+                null, null, null, null, null, null, null, null, "MANUAL", m.BillingUnitCode, m.CurrencyCode, false, m.UnitRateOriginal, m.UnitRate,
+                m.Quantity, null, null, null, [], [], m.Amount, [], now);
+            var line = new QuoteLine(QuoteLine.Movement, m.ChargeCodeId ?? Guid.Empty, m.ChargeCode, m.ChargeName ?? m.ChargeCode, m.BillTo,
+                m.PaymentTermCode, m.PayerPartyCode, m.Quantity, m.UnitRate, m.Amount, m.CurrencyCode, m.TaxCode, m.TaxRate, m.TaxAmount,
+                null, null, price, m.BillingUnitCode, RateSource: RateSources.Override, UnitRateOriginal: m.UnitRateOriginal,
+                OverrideReason: m.OverrideReason, OverriddenBy: m.OverriddenBy, OverriddenAt: m.OverriddenAt,
+                DiscountType: m.DiscountType, DiscountRate: m.DiscountRate);
+            tried.Add(new TriedVariant(m.ChargeCode, m.BillTo, m.PaymentTermCode, ChargeSource.Manual, m.Amount,
+                [$"Added by hand on the booking statement: {m.OverrideReason}"]));
+            (m.Amount <= 0 ? zeroRated : m.PaymentTermCode == Cash ? lines : later).Add(line);
         }
 
         // ── storage, on the way out (§4.4) ──────────────────────────────────
@@ -412,7 +496,8 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         }
 
         return new MovementQuote(box.BookingContainerId, box.ContainerNo, step.MovementCode, step.Direction,
-            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms, unpriced, menu);
+            storageApplies ? until : null, stay, stayDays, storageApplies, lines, tried, reeferApplies, power, later, terms, unpriced, menu,
+            zeroRated);
     }
 
     /// <summary>gate.gate_charge_only_order_types — a JSON array of order type codes; anything unreadable is "none".</summary>
@@ -458,7 +543,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             tried.Add(new TriedVariant(v.Variant.ChargeCode, v.Variant.BillTo, Cash, v.Outcome, v.Amount, trail));
             if (v.Outcome != ReeferOutcomes.Priced) continue;
 
-            lines.Add(Line(QuoteLine.Reefer, v.Variant, PayerFor(plan, v.Variant.BillTo), power.BillableHours,
+            lines.Add(Line(QuoteLine.Reefer, v.Variant, PayerFor(plan, v.Variant.BillTo), v.Quantity,
                 v.Price!.UnitRate, v.Amount!.Value, v.Price, null, null));
         }
     }
@@ -502,6 +587,21 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     }
 
     /// <summary>
+    /// A line at a supervisor's rate (gecko_revenue 25): amount = quantity x rate, rounded to satang once;
+    /// the rate is net of VAT, which goes on top at the charge code's rate, whatever the tariff's convention.
+    /// </summary>
+    public static QuoteLine Overridden(string kind, ChargeVariantRef variant, string? payer, decimal quantity, decimal unitRate,
+        PriceResult price, decimal? original, string? reason, Guid? by, DateTimeOffset? at)
+    {
+        var net = Money(quantity * unitRate);
+        var tax = Money(net * variant.TaxRatePct / 100m);
+        return new QuoteLine(kind, variant.ChargeCodeId, variant.ChargeCode, variant.DescriptionEn, variant.BillTo, variant.PaymentTermCode, payer,
+            quantity, unitRate, net, price.CurrencyCode ?? "THB", variant.TaxCode, variant.TaxRatePct, tax, null, null, price,
+            variant.BillingUnitCode, RateSource: RateSources.Override, UnitRateOriginal: original, OverrideReason: reason,
+            OverriddenBy: by, OverriddenAt: at);
+    }
+
+    /// <summary>
     /// One priced line as a billing.charge with its price snapshot — the one way a
     /// charge is written, by the window (cash) and by the gate event (credit, 6.3).
     /// </summary>
@@ -526,6 +626,10 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             PricesIncludeTax = p.PricesIncludeTax, BaseRate = p.BaseRate, FreeUnits = p.FreeUnits,
             ChargeableQuantity = p.ChargeableQuantity, ResolvedAt = p.ResolvedAt, PriceSnapshotJson = JsonSerializer.Serialize(p),
             Status = status, CreatedAt = now, UpdatedAt = now,
+            // a supervisor's rate travels with the line onto what is paid or billed (gecko_revenue 25)
+            IsRateOverridden = line.RateSource == RateSources.Override, UnitRateOriginal = line.UnitRateOriginal,
+            OverrideReason = line.OverrideReason, OverriddenBy = line.OverriddenBy, OverriddenAt = line.OverriddenAt,
+            DiscountType = line.DiscountType, DiscountRate = line.DiscountRate,
         };
     }
 
@@ -560,4 +664,6 @@ internal static class ChargeSource
     public const string Gate = "GATE";
     /// <summary>gecko_revenue 23: the expected charge of a booked box, status QUOTED.</summary>
     public const string Quote = "QUOTE";
+    /// <summary>A line added by hand on the booking statement (no tariff behind it).</summary>
+    public const string Manual = "MANUAL";
 }

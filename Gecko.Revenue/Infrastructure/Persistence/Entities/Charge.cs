@@ -142,4 +142,22 @@ public partial class Charge
     public Guid? TruckVisitId { get; set; }
 
     public bool IsTripCharge { get; set; }
+
+    public decimal? UnitRateOriginal { get; set; }
+
+    public bool IsRateOverridden { get; set; }
+
+    public string? OverrideReason { get; set; }
+
+    public Guid? OverriddenBy { get; set; }
+
+    public DateTimeOffset? OverriddenAt { get; set; }
+
+    public string? DiscountType { get; set; }
+
+    public decimal? DiscountRate { get; set; }
+
+    public string? WaiveReasonCode { get; set; }
+
+    public bool IsLocked { get; set; }
 }

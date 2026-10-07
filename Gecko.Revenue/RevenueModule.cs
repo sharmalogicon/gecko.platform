@@ -79,6 +79,8 @@ public static class RevenueModule
             .MapWindowEndpoints()
             .MapReeferPowerEndpoints()
             .MapChargeEndpoints()
+            .MapInvoiceEndpoints()
+            .MapManualChargeEndpoints()
             .MapUnbilledOrderEndpoints()
             .MapReceiptReportEndpoints();
 

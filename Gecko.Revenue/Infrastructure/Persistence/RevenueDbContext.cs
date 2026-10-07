@@ -22,6 +22,10 @@ public partial class RevenueDbContext : DbContext
 
     public virtual DbSet<Charge> Charges { get; set; }
 
+    public virtual DbSet<Invoice> Invoices { get; set; }
+
+    public virtual DbSet<InvoiceLine> InvoiceLines { get; set; }
+
     public virtual DbSet<ContainerStay> ContainerStays { get; set; }
 
     public virtual DbSet<Currency> Currencies { get; set; }
@@ -297,6 +301,10 @@ public partial class RevenueDbContext : DbContext
                 .IsUnique()
                 .HasFilter("([source]='GATE' AND [is_trip_charge]=(1) AND [status]<>'CANCELLED')");
 
+            entity.HasIndex(e => new { e.TenantId, e.BookingContainerId, e.MovementCode, e.ChargeCode, e.BillTo, e.PaymentTermCode }, "uq_charge__quote")
+                .IsUnique()
+                .HasFilter("([source]='QUOTE' AND [status]<>'CANCELLED')");
+
             entity.HasIndex(e => new { e.TenantId, e.ContainerStayId, e.ChargeCode, e.BillingPeriod }, "uq_charge__storage")
                 .IsUnique()
                 .HasFilter("([source]='STORAGE' AND [status]<>'CANCELLED')");
@@ -365,6 +373,13 @@ public partial class RevenueDbContext : DbContext
                 .IsUnicode(false)
                 .IsFixedLength()
                 .HasColumnName("currency_code");
+            entity.Property(e => e.DiscountRate)
+                .HasColumnType("decimal(18, 4)")
+                .HasColumnName("discount_rate");
+            entity.Property(e => e.DiscountType)
+                .HasMaxLength(4)
+                .IsUnicode(false)
+                .HasColumnName("discount_type");
             entity.Property(e => e.EarnedAt).HasColumnName("earned_at");
             entity.Property(e => e.EarnedGateTransactionId).HasColumnName("earned_gate_transaction_id");
             entity.Property(e => e.EirNo)
@@ -377,6 +392,8 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.GateTransactionId).HasColumnName("gate_transaction_id");
             entity.Property(e => e.InvoiceId).HasColumnName("invoice_id");
             entity.Property(e => e.InvoiceLineId).HasColumnName("invoice_line_id");
+            entity.Property(e => e.IsLocked).HasColumnName("is_locked");
+            entity.Property(e => e.IsRateOverridden).HasColumnName("is_rate_overridden");
             entity.Property(e => e.IsTripCharge).HasColumnName("is_trip_charge");
             entity.Property(e => e.MovementCode)
                 .HasMaxLength(20)
@@ -386,6 +403,11 @@ public partial class RevenueDbContext : DbContext
                 .HasMaxLength(30)
                 .IsUnicode(false)
                 .HasColumnName("order_no");
+            entity.Property(e => e.OverriddenAt).HasColumnName("overridden_at");
+            entity.Property(e => e.OverriddenBy).HasColumnName("overridden_by");
+            entity.Property(e => e.OverrideReason)
+                .HasMaxLength(500)
+                .HasColumnName("override_reason");
             entity.Property(e => e.PayerPartyCode)
                 .HasMaxLength(30)
                 .IsUnicode(false)
@@ -458,6 +480,9 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.UnitRate)
                 .HasColumnType("decimal(18, 4)")
                 .HasColumnName("unit_rate");
+            entity.Property(e => e.UnitRateOriginal)
+                .HasColumnType("decimal(18, 4)")
+                .HasColumnName("unit_rate_original");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_charge__updated_at")
                 .HasColumnName("updated_at");
@@ -465,8 +490,153 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.WaiveReason)
                 .HasMaxLength(300)
                 .HasColumnName("waive_reason");
+            entity.Property(e => e.WaiveReasonCode)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("waive_reason_code");
             entity.Property(e => e.WaivedAt).HasColumnName("waived_at");
             entity.Property(e => e.WaivedBy).HasColumnName("waived_by");
+        });
+
+        modelBuilder.Entity<Invoice>(entity =>
+        {
+            entity.HasKey(e => e.InvoiceId).HasName("pk_invoice");
+
+            entity.ToTable("invoice", "billing");
+
+            entity.HasIndex(e => new { e.TenantId, e.BranchId, e.PayerPartyCode, e.IssuedAt }, "ix_invoice__payer");
+
+            entity.HasIndex(e => new { e.TenantId, e.InvoiceNo }, "uq_invoice__no").IsUnique();
+
+            entity.Property(e => e.InvoiceId)
+                .ValueGeneratedNever()
+                .HasColumnName("invoice_id");
+            entity.Property(e => e.BillTo)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("bill_to");
+            entity.Property(e => e.BranchId).HasColumnName("branch_id");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_invoice__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.CurrencyCode)
+                .HasMaxLength(3)
+                .IsUnicode(false)
+                .HasColumnName("currency_code");
+            entity.Property(e => e.InvoiceNo)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("invoice_no");
+            entity.Property(e => e.InvoiceType)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("invoice_type");
+            entity.Property(e => e.IssuedAt).HasColumnName("issued_at");
+            entity.Property(e => e.IssuedBy).HasColumnName("issued_by");
+            entity.Property(e => e.PayerName)
+                .HasMaxLength(300)
+                .HasColumnName("payer_name");
+            entity.Property(e => e.PayerPartyCode)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("payer_party_code");
+            entity.Property(e => e.PaymentTermCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("payment_term_code");
+            entity.Property(e => e.Remarks)
+                .HasMaxLength(500)
+                .HasColumnName("remarks");
+            entity.Property(e => e.RowVersion)
+                .IsRowVersion()
+                .IsConcurrencyToken()
+                .HasColumnName("row_version");
+            entity.Property(e => e.Status)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("status");
+            entity.Property(e => e.SubtotalAmount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("subtotal_amount");
+            entity.Property(e => e.TaxAmount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("tax_amount");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.TotalAmount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("total_amount");
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_invoice__updated_at")
+                .HasColumnName("updated_at");
+            entity.Property(e => e.UpdatedBy).HasColumnName("updated_by");
+        });
+
+        modelBuilder.Entity<InvoiceLine>(entity =>
+        {
+            entity.HasKey(e => e.InvoiceLineId).HasName("pk_invoice_line");
+
+            entity.ToTable("invoice_line", "billing");
+
+            entity.HasIndex(e => new { e.TenantId, e.ChargeId }, "uq_invoice_line__charge").IsUnique();
+
+            entity.HasIndex(e => new { e.InvoiceId, e.LineNo }, "uq_invoice_line__no").IsUnique();
+
+            entity.Property(e => e.InvoiceLineId)
+                .ValueGeneratedNever()
+                .HasColumnName("invoice_line_id");
+            entity.Property(e => e.Amount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("amount");
+            entity.Property(e => e.BookingId).HasColumnName("booking_id");
+            entity.Property(e => e.ChargeCode)
+                .HasMaxLength(15)
+                .IsUnicode(false)
+                .HasColumnName("charge_code");
+            entity.Property(e => e.ChargeId).HasColumnName("charge_id");
+            entity.Property(e => e.ChargeName)
+                .HasMaxLength(400)
+                .HasColumnName("charge_name");
+            entity.Property(e => e.ContainerNo)
+                .HasMaxLength(15)
+                .IsUnicode(false)
+                .HasColumnName("container_no");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_invoice_line__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.InvoiceId).HasColumnName("invoice_id");
+            entity.Property(e => e.LineNo).HasColumnName("line_no");
+            entity.Property(e => e.MovementCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("movement_code");
+            entity.Property(e => e.OrderNo)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("order_no");
+            entity.Property(e => e.Quantity)
+                .HasColumnType("decimal(18, 3)")
+                .HasColumnName("quantity");
+            entity.Property(e => e.TaxAmount)
+                .HasColumnType("decimal(18, 2)")
+                .HasColumnName("tax_amount");
+            entity.Property(e => e.TaxCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("tax_code");
+            entity.Property(e => e.TaxRate)
+                .HasColumnType("decimal(7, 4)")
+                .HasColumnName("tax_rate");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.UnitRate)
+                .HasColumnType("decimal(18, 4)")
+                .HasColumnName("unit_rate");
+
+            entity.HasOne(d => d.Invoice).WithMany(p => p.InvoiceLines)
+                .HasForeignKey(d => d.InvoiceId)
+                .OnDelete(DeleteBehavior.ClientSetNull)
+                .HasConstraintName("fk_invoice_line__invoice");
         });
 
         modelBuilder.Entity<ContainerStay>(entity =>

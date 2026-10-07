@@ -426,6 +426,299 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
         }
     }
 
+    // ── the booking statement: a supervisor reprices or waives ONE quoted line (gecko_revenue 25) ──
+
+    private static async Task<List<Gecko.Revenue.Endpoints.Charges.ChargeResponse>> StatementLinesAsync(HttpClient client, string orderNo, CancellationToken ct)
+    {
+        var statement = (await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Charges.BookingStatementResponse>(
+            $"/api/revenue/charges/statement?orderNo={Uri.EscapeDataString(orderNo)}", ct))!;
+        return statement.Boxes.SelectMany(b => b.Lines).Select(l => l.Charge).ToList();
+    }
+
+    private static async Task<Gecko.Revenue.Endpoints.Charges.ChargeResponse> ReadChargeAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        var body = await response.Content.ReadAsStringAsync(ct);
+        Assert.True(response.StatusCode == HttpStatusCode.OK, $"expected 200, got {(int)response.StatusCode}: {body}");
+        return JsonSerializer.Deserialize<Gecko.Revenue.Endpoints.Charges.ChargeResponse>(body, JsonSerializerOptions.Web)!;
+    }
+
+    [Fact]
+    public async Task A_quoted_line_repriced_or_waived_on_the_statement_sticks_at_the_window_and_can_be_undone()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        Guid? shiftId = null;
+        const string Charges = "/api/revenue/charges";
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct);
+            var orderNo = booking.Booking.OrderNo;
+            await DropOffAsync(client, box, ct);
+            await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_OUT", "Revenue to see the gate-in", ct);
+            var lines = await EventuallyAsync(() => StatementLinesAsync(client, orderNo, ct),
+                l => l.Any(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.ChargeCode == "GATEFEE"), "the quoted FULL_OUT lines", ct);
+            var fee = lines.Single(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.ChargeCode == "GATEFEE");
+            Assert.False(string.IsNullOrEmpty(fee.RowVersion));
+            Assert.Equal(("GATE", false), (fee.ChargeType, fee.IsRateOverridden));
+
+            // ── refused before anything changes: no reason, a negative rate, a clerk without the right
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price", new { rowVersion = fee.RowVersion, originalRate = 150m, discountType = "AMT", discountRate = 30m, reason = " " }, ct), "reason", ct);
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price", new { rowVersion = fee.RowVersion, originalRate = -1m, reason = "typo" }, ct), "originalRate", ct);
+            var clerk = await api.ClientForAsync(TosApiFactory.SctGateLcb);
+            Assert.Equal(HttpStatusCode.Forbidden, (await clerk.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price", new { rowVersion = fee.RowVersion, originalRate = 150m, discountType = "AMT", discountRate = 30m, reason = "x" }, ct)).StatusCode);
+            var sss = await api.ClientForAsync(TosApiFactory.SssOwner);
+            Assert.Equal(HttpStatusCode.NotFound, (await sss.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price", new { rowVersion = fee.RowVersion, originalRate = 150m, discountType = "AMT", discountRate = 30m, reason = "x" }, ct)).StatusCode);
+
+            // ── the rate is the supervisor's: quantity x rate, VAT from the line's tax code
+            var repriced = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price",
+                new { rowVersion = fee.RowVersion, originalRate = 150m, discountType = "PCT", discountRate = 20m, reason = "Agreed rate, confirmed by Khun A" }, ct), ct);
+            Assert.Equal(("QUOTED", (decimal?)120m, 120.00m, 8.40m, 128.40m, true, (decimal?)150m, "Agreed rate, confirmed by Khun A"),
+                (repriced.Status, repriced.UnitRate, repriced.Amount, repriced.TaxAmount, repriced.Total, repriced.IsRateOverridden,
+                 repriced.UnitRateOriginal, repriced.OverrideReason));
+            Assert.NotNull(repriced.OverriddenBy);
+            // A second writer holding the old rowVersion lost the race.
+            var stale = await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price", new { rowVersion = fee.RowVersion, originalRate = 99m, reason = "late" }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+            Assert.Contains("changed since you loaded", await stale.Content.ReadAsStringAsync(ct));
+
+            // ── it sticks: the window re-quotes from the tariff, but keeps the supervisor's rate and says so
+            var quote = await QuoteAsync(client, orderNo, ct);
+            var due = quote.Boxes.Single().Due;
+            Assert.Equal(("OVERRIDE", 120.00m, (decimal?)150m), (due.Single(d => d.ChargeCode == "GATEFEE").RateSource,
+                due.Single(d => d.ChargeCode == "GATEFEE").Amount, due.Single(d => d.ChargeCode == "GATEFEE").UnitRateOriginal));
+            Assert.Equal("TARIFF", due.Single(d => d.ChargeCode == "GATETRIP").RateSource);
+            Assert.Equal(235.40m, quote.Total);   // (100 + 120) x 1.07
+
+            // ── waive the gate charge BY ID: the window no longer asks for it; then put it back
+            var trip = (await StatementLinesAsync(client, orderNo, ct)).Single(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.ChargeCode == "GATETRIP");
+            var waived = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{trip.ChargeId}/waive",
+                new { rowVersion = trip.RowVersion, reasonCode = "GOODWILL", reason = "Goodwill, damaged on arrival" }, ct), ct);
+            Assert.Equal(("WAIVED", "Goodwill, damaged on arrival", (string?)null), (waived.Status, waived.WaiveReason, waived.CouponRef));   // GATEFEE still due: no release
+            Assert.Equal(128.40m, (await QuoteAsync(client, orderNo, ct)).Total);
+            var notQuoted = await client.PostAsJsonAsync($"{Charges}/{trip.ChargeId}/price", new { rowVersion = waived.RowVersion, originalRate = 1m, reason = "x" }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, notQuoted.StatusCode);
+            Assert.Contains("WAIVED charges cannot be repriced", await notQuoted.Content.ReadAsStringAsync(ct));
+            var unwaived = await ReadChargeAsync(await client.DeleteAsync($"{Charges}/{trip.ChargeId}/waive?rowVersion={Uri.EscapeDataString(waived.RowVersion!)}", ct), ct);
+            Assert.Equal(("QUOTED", (DateTimeOffset?)null), (unwaived.Status, unwaived.WaivedAt));
+            Assert.Equal(235.40m, (await QuoteAsync(client, orderNo, ct)).Total);
+
+            // ── waiving the last thing due releases the box (a waiver coupon); un-waiving takes it back
+            var fee2 = (await StatementLinesAsync(client, orderNo, ct)).Single(c => c.ChargeId == fee.ChargeId);
+            var trip2 = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{trip.ChargeId}/waive",
+                new { rowVersion = unwaived.RowVersion, reasonCode = "GOODWILL", reason = "Goodwill" }, ct), ct);
+            var feeWaived = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/waive",
+                new { rowVersion = fee2.RowVersion, reasonCode = "GOODWILL", reason = "Goodwill" }, ct), ct);
+            Assert.StartsWith("WAIVE-", feeWaived.CouponRef);
+            var feeBack = await ReadChargeAsync(await client.DeleteAsync($"{Charges}/{fee.ChargeId}/waive?rowVersion={Uri.EscapeDataString(feeWaived.RowVersion!)}", ct), ct);
+            Assert.Equal(("QUOTED", (string?)null, true), (feeBack.Status, feeBack.CouponRef, feeBack.IsRateOverridden));   // the override survived the waive
+            await ReadChargeAsync(await client.DeleteAsync($"{Charges}/{trip.ChargeId}/waive?rowVersion={Uri.EscapeDataString(trip2.RowVersion!)}", ct), ct);
+
+            // ── undo the override: back on the tariff's 150
+            var undone = await ReadChargeAsync(await client.DeleteAsync($"{Charges}/{fee.ChargeId}/price?rowVersion={Uri.EscapeDataString(feeBack.RowVersion!)}", ct), ct);
+            Assert.Equal(((decimal?)150m, 150.00m, false, (decimal?)null), (undone.UnitRate, undone.Amount, undone.IsRateOverridden, undone.UnitRateOriginal));
+            Assert.Equal(267.50m, (await QuoteAsync(client, orderNo, ct)).Total);
+
+            // ── reprice again and pay: the receipt takes the supervisor's rate, and a PAID line is never repriced
+            await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{fee.ChargeId}/price",
+                new { rowVersion = undone.RowVersion, originalRate = 150m, discountType = "AMT", discountRate = 30m, reason = "Agreed rate" }, ct), ct);
+            shiftId = await OpenDrawerAsync(client, ct);
+            var quoted = await QuoteAsync(client, orderNo, ct);
+            var paid = await client.PostAsJsonAsync($"{Window}/receipts", new
+            {
+                bookingId = booking.Booking.BookingId, bookingContainerIds = quoted.Boxes.Select(b => b.BookingContainerId).ToArray(),
+                payments = new object[] { new { channel = "CASH", amount = 235.40m } }, expectedTotal = 235.40m,
+            }, ct);
+            Assert.True(paid.StatusCode == HttpStatusCode.Created, await paid.Content.ReadAsStringAsync(ct));
+            var receipt = (await paid.Content.ReadFromJsonAsync<ReceiptResponse>(ct))!;
+            Assert.Equal(120.00m, receipt.Lines.Single(l => l.ChargeCode == "GATEFEE").Amount);
+            var paidFee = (await StatementLinesAsync(client, orderNo, ct)).Single(c => c.Status == "PAID" && c.ChargeCode == "GATEFEE");
+            Assert.Equal((true, (decimal?)150m), (paidFee.IsRateOverridden, paidFee.UnitRateOriginal));
+            var refused = await client.PostAsJsonAsync($"{Charges}/{paidFee.ChargeId}/price", new { rowVersion = paidFee.RowVersion, originalRate = 1m, reason = "x" }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+            Assert.Contains("PAID charges cannot be repriced. Void the receipt first.", await refused.Content.ReadAsStringAsync(ct));
+        }
+        finally { await CleanAsync(carrierRef, shiftId); }
+    }
+
+    [Fact]
+    public async Task Regenerate_reprices_from_the_tariff_but_keeps_locked_lines_and_a_bulk_waive_is_all_or_nothing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        const string Charges = "/api/revenue/charges";
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct);
+            var orderNo = booking.Booking.OrderNo;
+            await DropOffAsync(client, box, ct);
+            await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_OUT", "Revenue to see the gate-in", ct);
+            var lines = await EventuallyAsync(() => StatementLinesAsync(client, orderNo, ct),
+                l => l.Count(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.PaymentTermCode == "CASH") == 2, "the quoted FULL_OUT lines", ct);
+            Gecko.Revenue.Endpoints.Charges.ChargeResponse Charge(string code) => lines.Single(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.ChargeCode == code);
+
+            // GATEFEE corrected (unlocked); GATETRIP corrected AND locked.
+            var fee = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{Charge("GATEFEE").ChargeId}/price",
+                new { rowVersion = Charge("GATEFEE").RowVersion, originalRate = 150m, discountType = "AMT", discountRate = 30m, reason = "Agreed" }, ct), ct);
+            var trip = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{Charge("GATETRIP").ChargeId}/price",
+                new { rowVersion = Charge("GATETRIP").RowVersion, originalRate = 100m, discountType = "PCT", discountRate = 20m, reason = "Agreed" }, ct), ct);
+            Assert.Equal(((decimal?)120m, (decimal?)80m), (fee.UnitRate, trip.UnitRate));
+            trip = await ReadChargeAsync(await client.PostAsJsonAsync($"{Charges}/{trip.ChargeId}/lock", new { isLocked = true, rowVersion = trip.RowVersion }, ct), ct);
+            Assert.True(trip.IsLocked);
+
+            // Regenerate: the unlocked correction goes back to the tariff, the locked one stays.
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Charges}/regenerate", new { orderNo, reason = "" }, ct), "reason", ct);
+            var regen = await client.PostAsJsonAsync($"{Charges}/regenerate", new { orderNo, keepLocked = true, keepManual = true, reason = "New tariff" }, ct);
+            Assert.True(regen.StatusCode == HttpStatusCode.OK, await regen.Content.ReadAsStringAsync(ct));
+            var counts = (await regen.Content.ReadFromJsonAsync<Gecko.Revenue.Endpoints.Charges.RegenerateResponse>(ct))!;
+            Assert.Equal((1, 0), (counts.KeptLocked, counts.NoRate));
+            lines = await StatementLinesAsync(client, orderNo, ct);
+            Assert.Equal(((decimal?)150m, false), (Charge("GATEFEE").UnitRate, Charge("GATEFEE").IsRateOverridden));
+            Assert.Equal(((decimal?)80m, true, true), (Charge("GATETRIP").UnitRate, Charge("GATETRIP").IsRateOverridden, Charge("GATETRIP").IsLocked));
+            Assert.Equal(246.10m, (await QuoteAsync(client, orderNo, ct)).Total);   // (80 + 150) x 1.07
+
+            // Bulk waive: one id that is not a quoted line refuses the whole request; then both go.
+            var bad = await client.PostAsJsonAsync($"{Charges}/waive", new { chargeIds = new[] { Charge("GATEFEE").ChargeId, Guid.NewGuid() }, reasonCode = "GOODWILL" }, ct);
+            Assert.Equal(HttpStatusCode.NotFound, bad.StatusCode);
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Charges}/waive", new { chargeIds = new[] { Charge("GATEFEE").ChargeId }, reasonCode = "BECAUSE" }, ct), "reasonCode", ct);
+            Assert.Equal("QUOTED", (await StatementLinesAsync(client, orderNo, ct)).Single(c => c.ChargeId == Charge("GATEFEE").ChargeId).Status);
+            var both = await client.PostAsJsonAsync($"{Charges}/waive",
+                new { chargeIds = new[] { Charge("GATEFEE").ChargeId, Charge("GATETRIP").ChargeId }, reasonCode = "RATE_ERROR", reason = "Wrong rate loaded" }, ct);
+            Assert.True(both.StatusCode == HttpStatusCode.OK, await both.Content.ReadAsStringAsync(ct));
+            Assert.Equal(2, (await both.Content.ReadFromJsonAsync<Gecko.Revenue.Endpoints.Charges.BulkWaiveResponse>(ct))!.Waived);
+            var waived = (await StatementLinesAsync(client, orderNo, ct)).Where(c => c.MovementCode == "FULL_OUT" && c.PaymentTermCode == "CASH").ToList();
+            Assert.All(waived, c => Assert.Equal(("WAIVED", "RATE_ERROR"), (c.Status, c.WaiveReasonCode)));
+            Assert.Equal(0m, (await QuoteAsync(client, orderNo, ct)).Total);
+            var again = await client.PostAsJsonAsync($"{Charges}/waive", new { chargeIds = waived.Select(c => c.ChargeId).ToArray(), reasonCode = "GOODWILL" }, ct);
+            Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+        }
+        finally { await CleanAsync(carrierRef, null); }
+    }
+
+    [Fact]
+    public async Task A_credit_line_sent_to_an_invoice_in_advance_is_issued_at_once_and_never_billed_again_at_the_gate()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        Guid? invoiceId = null;
+        const string Invoices = "/api/revenue/invoices";
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct);
+            var orderNo = booking.Booking.OrderNo;
+            await DropOffAsync(client, box, ct);
+            await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_OUT", "Revenue to see the gate-in", ct);
+            var lines = await EventuallyAsync(() => StatementLinesAsync(client, orderNo, ct),
+                l => l.Any(c => c.Status == "QUOTED" && c.ChargeCode == "LIFTCR"), "the quoted credit line", ct);
+            var lift = lines.Single(c => c.Status == "QUOTED" && c.ChargeCode == "LIFTCR");
+            var fee = lines.Single(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT" && c.ChargeCode == "GATEFEE");
+
+            // Cash is never invoiced here; an issued invoice is final; only a clerk with the right may send.
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Invoices}/send", new { chargeIds = new[] { lift.ChargeId }, paymentTermCode = "CASH" }, ct), "paymentTermCode", ct);
+            Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync($"{Invoices}/send",
+                new { chargeIds = new[] { lift.ChargeId }, paymentTermCode = "CREDIT", invoiceNo = "INV-OLD" }, ct)).StatusCode);
+            var clerk = await api.ClientForAsync(TosApiFactory.SctGateLcb);
+            Assert.Equal(HttpStatusCode.Forbidden, (await clerk.PostAsJsonAsync($"{Invoices}/send", new { chargeIds = new[] { lift.ChargeId }, paymentTermCode = "CREDIT" }, ct)).StatusCode);
+
+            // The ticked cash line is ignored; the credit line goes on a new invoice, issued at once.
+            var sent = await client.PostAsJsonAsync($"{Invoices}/send",
+                new { chargeIds = new[] { lift.ChargeId, fee.ChargeId }, paymentTermCode = "CREDIT", remarks = "October lifts" }, ct);
+            Assert.True(sent.StatusCode == HttpStatusCode.OK, await sent.Content.ReadAsStringAsync(ct));
+            var invoice = (await sent.Content.ReadFromJsonAsync<Gecko.Revenue.Endpoints.Charges.SendInvoiceResponse>(ct))!;
+            invoiceId = invoice.InvoiceId;
+            Assert.StartsWith("INV-", invoice.InvoiceNo);
+            Assert.Equal((1, 300.00m, 21.00m, 321.00m), (invoice.Lines, invoice.Amount, invoice.Tax, invoice.Total));
+            var detail = (await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Charges.InvoiceDetailResponse>($"{Invoices}/{invoice.InvoiceId}", ct))!;
+            Assert.Equal(("ISSUED", "LIFTCR"), (detail.Invoice.Status, Assert.Single(detail.Lines).ChargeCode));
+            Assert.Contains((await client.GetFromJsonAsync<Gecko.Data.PagedResult<Gecko.Revenue.Endpoints.Charges.InvoiceSummaryResponse>>(
+                $"{Invoices}?orderNo={Uri.EscapeDataString(orderNo)}", ct))!.Items, i => i.InvoiceId == invoice.InvoiceId);
+            var after = await StatementLinesAsync(client, orderNo, ct);
+            Assert.Equal("INVOICED", after.Single(c => c.ChargeId == lift.ChargeId).Status);
+            Assert.Equal("QUOTED", after.Single(c => c.ChargeId == fee.ChargeId).Status);
+            Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync($"{Invoices}/send", new { chargeIds = new[] { lift.ChargeId }, paymentTermCode = "CREDIT" }, ct)).StatusCode);
+
+            // The box leaves: the gate does not bill the invoiced lift a second time.
+            await PickUpAsync(client, box, ct);
+            await EventuallyAsync(() => StatementLinesAsync(client, orderNo, ct),
+                l => !l.Any(c => c.Status == "QUOTED" && c.MovementCode == "FULL_OUT"), "the gate-out to settle FULL_OUT", ct);
+            Assert.DoesNotContain(await TestDatabase.ChargesAsync(carrierRef), c => c.Source == "GATE" && c.ChargeCode == "LIFTCR");
+
+            // §8: the line carries its box's size / type; the register lists a booking billed in full only on request.
+            Assert.Equal(("20GP", "20"), ((await StatementLinesAsync(client, orderNo, ct)).Single(c => c.ChargeId == lift.ChargeId) is var l ? (l.EquipmentTypeCode, l.EquipmentSize) : default));
+            var register = $"/api/revenue/charges/unbilled/orders?branchId={SctLcb01}&orderNo={Uri.EscapeDataString(orderNo)}";
+            Assert.Empty((await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Charges.UnbilledOrdersPage>(register, ct))!.Items);
+            var settled = Assert.Single((await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Charges.UnbilledOrdersPage>($"{register}&includeSettled=true", ct))!.Items);
+            Assert.Equal(((decimal?)321.00m, (decimal?)321.00m, (decimal?)0m), (settled.TotalBillable, settled.BilledAmount, settled.UnbilledAmount));
+        }
+        finally
+        {
+            if (invoiceId is { } id) await TestDatabase.RemoveInvoiceAsync(id);
+            await CleanAsync(carrierRef, null);
+        }
+    }
+
+    [Fact]
+    public async Task A_charge_added_by_hand_is_collected_with_the_boxs_move_and_bulk_add_or_update_never_doubles_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        Guid? shiftId = null;
+        const string Charges = "/api/revenue/charges";
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct);
+            var orderNo = booking.Booking.OrderNo;
+            await DropOffAsync(client, box, ct);
+            var plain = await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_OUT", "Revenue to see the gate-in", ct);
+            Assert.Equal(267.50m, plain.Total);
+            var boxId = plain.Boxes.Single().BookingContainerId;
+            object Body(decimal original, string type, decimal discount, string? mode = null, Guid[]? boxes = null) => new
+            {
+                orderNo, bookingContainerIds = boxes ?? new[] { boxId }, chargeCode = "VASWASH", movementCode = "FULL_OUT", billTo = "CUSTOMER",
+                paymentTermCode = "CASH", quantity = 1m, originalRate = original, discountType = type, discountRate = discount,
+                remarks = "Box washed on request", mode,
+            };
+
+            // A booking-level line is invoiced, so it cannot be cash.
+            await ExpectFieldAsync(await client.PostAsJsonAsync($"{Charges}/manual", Body(200m, "AMT", 50m, boxes: []), ct), "paymentTermCode", ct);
+            var added = await client.PostAsJsonAsync($"{Charges}/manual", Body(200m, "AMT", 50m), ct);
+            Assert.True(added.StatusCode == HttpStatusCode.OK, await added.Content.ReadAsStringAsync(ct));
+            var line = Assert.Single((await added.Content.ReadFromJsonAsync<List<Gecko.Revenue.Endpoints.Charges.ChargeResponse>>(ct))!);
+            Assert.Equal(("MANUAL", "QUOTED", (decimal?)150m, (decimal?)200m), (line.Source, line.Status, line.UnitRate, line.OriginalRate));
+            Assert.Equal(428.00m, (await QuoteAsync(client, orderNo, ct)).Total);   // (100 + 150 + 150) x 1.07
+
+            // Bulk ADD twice changes nothing; UPDATE reprices the line that is there.
+            async Task<Gecko.Revenue.Endpoints.Charges.BulkChargeResponse> BulkAsync(object body)
+            {
+                var r = await client.PostAsJsonAsync($"{Charges}/bulk", body, ct);
+                Assert.True(r.StatusCode == HttpStatusCode.OK, await r.Content.ReadAsStringAsync(ct));
+                return (await r.Content.ReadFromJsonAsync<Gecko.Revenue.Endpoints.Charges.BulkChargeResponse>(ct))!;
+            }
+            Assert.Equal(new(0, 0, 1), await BulkAsync(Body(200m, "AMT", 50m, "ADD", boxes: [])));
+            Assert.Equal(new(0, 1, 0), await BulkAsync(Body(200m, "PCT", 50m, "UPDATE", boxes: [])));
+            Assert.Equal(374.50m, (await QuoteAsync(client, orderNo, ct)).Total);   // (100 + 150 + 100) x 1.07
+
+            // Paid at the window with the box's move: the statement shows the paid line, not the hand-added one as well.
+            shiftId = await OpenDrawerAsync(client, ct);
+            var paid = await client.PostAsJsonAsync($"{Window}/receipts", new
+            {
+                bookingId = booking.Booking.BookingId, bookingContainerIds = new[] { boxId },
+                payments = new object[] { new { channel = "CASH", amount = 374.50m } }, expectedTotal = 374.50m,
+            }, ct);
+            Assert.True(paid.StatusCode == HttpStatusCode.Created, await paid.Content.ReadAsStringAsync(ct));
+            Assert.Equal(100.00m, (await paid.Content.ReadFromJsonAsync<ReceiptResponse>(ct))!.Lines.Single(l => l.ChargeCode == "VASWASH").Amount);
+            Assert.Equal("PAID", Assert.Single(await StatementLinesAsync(client, orderNo, ct), c => c.ChargeCode == "VASWASH").Status);
+        }
+        finally { await CleanAsync(carrierRef, shiftId); }
+    }
+
     // ── two bookings on one truck: the gate charge is collected once, at the window (owner 2026-10-01) ──
 
     [Fact]

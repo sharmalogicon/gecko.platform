@@ -56,11 +56,14 @@ public sealed record VasOptionResponse(
 /// <param name="Kind">MOVEMENT, VAS, STORAGE or REEFER.</param>
 /// <param name="BillingUnitCode">PER_TRIP = the once-per-truck gate charge.</param>
 /// <param name="ByHaulierTerm">A cash line the haulier's charge term moved to credit.</param>
+/// <param name="RateSource">TARIFF, or OVERRIDE: a supervisor's rate set on the booking statement, kept on every re-quote.</param>
+/// <param name="UnitRateOriginal">With OVERRIDE: the tariff's rate it replaced.</param>
 public sealed record QuoteLineResponse(
     string Kind, string ChargeCode, string ChargeName, string BillTo, string? PayerPartyCode,
     decimal Quantity, decimal? UnitRate, decimal Amount, string? TaxCode, decimal TaxRate, decimal TaxAmount, decimal Total,
     DateOnly? ServiceFrom, DateOnly? ServiceTo, string? ScheduleNo,
-    string PaymentTermCode = "CASH", string? BillingUnitCode = null, bool ByHaulierTerm = false);
+    string PaymentTermCode = "CASH", string? BillingUnitCode = null, bool ByHaulierTerm = false,
+    string RateSource = "TARIFF", decimal? UnitRateOriginal = null, string? OverrideReason = null);
 
 public sealed record SettledChargeResponse(
     Guid ChargeId, string ChargeCode, string Status, decimal Total, string? CouponRef, DateOnly? ServiceTo, string? WaiveReason);

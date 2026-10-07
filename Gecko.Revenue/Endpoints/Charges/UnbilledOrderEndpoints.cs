@@ -54,7 +54,8 @@ internal static class UnbilledOrderEndpoints
         var size = Math.Clamp(pageSize ?? 50, 1, 200);
         return TypedResults.Ok(new UnbilledOrdersPage(
             orders.Skip((p - 1) * size).Take(size).ToList(), p, size, orders.Count,
-            found!.Lines.Count, found.Lines.Sum(l => l.Amount), found.Lines.Sum(l => l.TaxAmount), found.Lines.Sum(l => l.Amount + l.TaxAmount)));
+            found!.Lines.Count(l => l.Status == ChargeStatus.Unbilled), Unbilled(found.Lines).Sum(l => l.Amount),
+            Unbilled(found.Lines).Sum(l => l.TaxAmount), Unbilled(found.Lines).Sum(l => l.Amount + l.TaxAmount)));
     }
 
     private static async Task<Results<Ok<IReadOnlyList<UnbilledLineResponse>>, ValidationProblem, ForbidHttpResult>> LinesAsync(
@@ -142,8 +143,13 @@ internal static class UnbilledOrderEndpoints
             _ => null,
         };
 
+        // includeSettled (owner 2026-10-07): a booking billed or paid in full has nothing UNBILLED and would
+        // never be listed; with the flag every billable line counts — unbilled, invoiced, paid, earned.
+        string[] statuses = f.IncludeSettled == true
+            ? [ChargeStatus.Unbilled, ChargeStatus.Invoiced, ChargeStatus.Paid, ChargeStatus.Earned]
+            : [ChargeStatus.Unbilled];
         var rows = db.Charges.AsNoTracking()
-            .Where(c => c.BranchId == branch && c.Status == ChargeStatus.Unbilled && c.BookingId != null);
+            .Where(c => c.BranchId == branch && statuses.Contains(c.Status) && c.BookingId != null);
         if (billTo is not null) rows = rows.Where(c => c.BillTo == billTo);
         if (Up(f.PaymentTermCode) is { } term) rows = rows.Where(c => c.PaymentTermCode == term);
         if (Up(f.ChargeCode) is { } charge) rows = rows.Where(c => c.ChargeCode == charge);
@@ -185,7 +191,11 @@ internal static class UnbilledOrderEndpoints
         return groups.Select(g =>
             {
                 var h = found.Headers[g.Key];
-                var list = g.ToList();
+                var all = g.ToList();
+                var list = Unbilled(all).ToList();
+                if (list.Count == 0) list = all;   // settled in full: the row still shows its lines and currency
+                var billed = all.Where(l => l.Status != ChargeStatus.Unbilled).Sum(l => l.Amount + l.TaxAmount);
+                var unbilled = Unbilled(all).Sum(l => l.Amount + l.TaxAmount);
                 return new UnbilledOrderResponse(
                     h.BookingId, h.OrderNo, h.CarrierRef, h.SubBlNo, h.BookedAt, h.BookingTypeCode, h.OrderTypeCode,
                     h.AgentCode, h.AgentCode is { } a ? parties.GetValueOrDefault(a)?.Name : null,
@@ -193,12 +203,15 @@ internal static class UnbilledOrderEndpoints
                     h.VesselCode, h.CallRef, h.Voyage, h.TerminalCode,
                     list.Select(l => l.PaymentTermCode).Distinct().Order().ToList(), list.Select(l => l.BillTo).Distinct().Order().ToList(),
                     list.Select(l => l.BookingContainerId).Distinct().Count(), list.Count,
-                    list.Sum(l => l.Amount), list.Sum(l => l.TaxAmount), list.Sum(l => l.Amount + l.TaxAmount),
+                    Unbilled(all).Sum(l => l.Amount), Unbilled(all).Sum(l => l.TaxAmount), unbilled,
                     list.Select(l => l.CurrencyCode).First(), h.StepsDone, h.StepsTotal,
-                    list.Min(l => l.PricedForDate), list.Max(l => l.PricedForDate));
+                    list.Min(l => l.PricedForDate), list.Max(l => l.PricedForDate),
+                    TotalBillable: billed + unbilled, BilledAmount: billed, UnbilledAmount: unbilled);
             })
             .OrderBy(o => o.OrderNo, StringComparer.Ordinal).ToList();
     }
+
+    private static IEnumerable<Charge> Unbilled(IEnumerable<Charge> lines) => lines.Where(l => l.Status == ChargeStatus.Unbilled);
 
     private static async Task<IReadOnlyList<UnbilledLineResponse>> LinesOfAsync(Found found, RevenueDbContext db, IMasterDataReferences master, CancellationToken ct)
     {
@@ -240,6 +253,8 @@ public sealed class UnbilledFilter
     public DateOnly? To { get; init; }
     public string? Progress { get; init; }
     public string[]? OrderNo { get; init; }
+    /// <summary>true: bookings billed or paid in full are listed too, with TotalBillable / BilledAmount / UnbilledAmount.</summary>
+    public bool? IncludeSettled { get; init; }
 }
 
 public sealed record UnbilledOrdersPage(
@@ -252,7 +267,8 @@ public sealed record UnbilledOrderResponse(
     string? ForwarderCode, string? VesselCode, string? CallRef, string? Voyage, string? TerminalCode,
     IReadOnlyList<string> PaymentTerms, IReadOnlyList<string> BillTo,
     int Boxes, int Lines, decimal Amount, decimal Tax, decimal Total, string CurrencyCode,
-    int StepsDone, int StepsTotal, DateOnly? FirstDate, DateOnly? LastDate);
+    int StepsDone, int StepsTotal, DateOnly? FirstDate, DateOnly? LastDate,
+    decimal? TotalBillable = null, decimal? BilledAmount = null, decimal? UnbilledAmount = null);
 
 public sealed record UnbilledLineResponse(
     Guid ChargeId, Guid BookingId, string OrderNo, Guid? BookingContainerId, string? ContainerNo, string? EquipmentTypeCode,

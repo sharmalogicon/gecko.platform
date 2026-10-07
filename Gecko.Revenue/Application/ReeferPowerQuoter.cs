@@ -28,8 +28,12 @@ internal sealed record ReeferPricingContext(
     BookingPlan? Plan = null, BookingPlanContainer? Box = null,
     string? MovementCode = null, string? Direction = null, string? FullEmpty = null);
 
-/// <summary>One CASH variant of an hourly REEFER charge code, priced (or not) for the visit's hours.</summary>
-internal sealed record ReeferVariantPrice(ChargeVariantRef Variant, string Outcome, PriceResult? Price, decimal? Amount, IReadOnlyList<string> Trail);
+/// <summary>
+/// One CASH variant of an hourly REEFER charge code, priced (or not) for the visit's time.
+/// <see cref="Quantity"/> is what the rate was applied to: started hours, or plug days for a rate tiered by DAY.
+/// </summary>
+internal sealed record ReeferVariantPrice(ChargeVariantRef Variant, string Outcome, PriceResult? Price, decimal? Amount, IReadOnlyList<string> Trail,
+    decimal Quantity = 0);
 
 internal sealed record ReeferPowerQuote(
     int BillableHours, int MinutesPlugged, int Sessions, string Outcome,
@@ -51,8 +55,10 @@ internal sealed record ReeferPowerQuote(
 ///      storage prices every STORAGE variant.
 ///   2. Tariff: an approved TOS schedule with a rate for that code × bill-to × CASH,
 ///      per hour — FLAT on an hourly billing unit (amount = hours × rate), or tiered
-///      with tier basis HOUR. A rate on any other unit is refused (RATE_NOT_SET),
-///      never multiplied by hours.
+///      with tier basis HOUR — or per DAY tiered by DAY, priced on the calendar days
+///      plugged in (KORAKIT's SE004 slabs: its old system counted electricity slab
+///      bands in days, owner 2026-10-06). A rate on any other unit is refused
+///      (RATE_NOT_SET), never multiplied by hours.
 /// No order-type linkage is needed: like storage, no movement raises it.
 ///
 /// Hours: <see cref="ReeferPower.Measure"/> — the visit's sessions summed (an open
@@ -60,17 +66,24 @@ internal sealed record ReeferPowerQuote(
 /// units only for a free-time kind (STORAGE / CHASSIS / TRUCK_WAITING), and reefer
 /// power has none, so every started hour is chargeable.
 /// </summary>
-internal sealed class ReeferPowerQuoter(RevenueDbContext db, IMasterDataReferences master, ITariffPricing pricing)
+internal sealed class ReeferPowerQuoter(RevenueDbContext db, IMasterDataReferences master, ITariffPricing pricing, BranchCalendar calendar)
 {
     private const string Cash = "CASH";
     private const string HourSource = "HOUR";
+    private const string DaySource = "DAY";
     public const string ChargeType = "REEFER";
 
     public async Task<ReeferPowerQuote> QuoteAsync(IReadOnlyCollection<ReeferSession> sessions, ReeferPricingContext context,
         DateTimeOffset asAt, CancellationToken ct)
     {
-        var time = ReeferPower.Measure(sessions.Select(s => new PlugSpan(s.PluggedInAt, s.PluggedOutAt, s.IsVoided)), asAt);
-        var hourly = await db.BillingUnits.AsNoTracking().Where(u => u.QuantitySource == HourSource).Select(u => u.Code).ToListAsync(ct);
+        var spans = sessions.Select(s => new PlugSpan(s.PluggedInAt, s.PluggedOutAt, s.IsVoided)).ToList();
+        var time = ReeferPower.Measure(spans, asAt);
+        var units = await db.BillingUnits.AsNoTracking().Where(u => u.QuantitySource == HourSource || u.QuantitySource == DaySource)
+            .Select(u => new { u.Code, u.QuantitySource }).ToListAsync(ct);
+        var hourly = units.Where(u => u.QuantitySource == HourSource).Select(u => u.Code).ToList();
+        var daily = units.Where(u => u.QuantitySource == DaySource).Select(u => u.Code).ToList();
+        var zone = await calendar.BranchAsync(context.BranchId, ct);
+        var days = ReeferPower.PluggedDays(spans, asAt, instant => zone?.LocalDate(instant) ?? DateOnly.FromDateTime(instant.UtcDateTime));
 
         var variants = (await master.ChargeVariantsOfTypeAsync(ChargeType, ct))
             .Where(v => v.PaymentTermCode == Cash && hourly.Contains(v.BillingUnitCode))
@@ -86,7 +99,7 @@ internal sealed class ReeferPowerQuoter(RevenueDbContext db, IMasterDataReferenc
 
         var priced = new List<ReeferVariantPrice>();
         foreach (var variant in variants)
-            priced.Add(await PriceAsync(variant, context, time.BillableHours, asAt, hourly, ct));
+            priced.Add(await PriceAsync(variant, context, time.BillableHours, days, asAt, hourly, daily, ct));
 
         var charged = priced.Where(p => p.Outcome == ReeferOutcomes.Priced).ToList();
         var currency = priced.Select(p => p.Price?.CurrencyCode).FirstOrDefault(c => c is not null);
@@ -114,8 +127,8 @@ internal sealed class ReeferPowerQuoter(RevenueDbContext db, IMasterDataReferenc
             priced);
     }
 
-    private async Task<ReeferVariantPrice> PriceAsync(ChargeVariantRef variant, ReeferPricingContext c, int hours, DateTimeOffset asAt,
-        List<string> hourly, CancellationToken ct)
+    private async Task<ReeferVariantPrice> PriceAsync(ChargeVariantRef variant, ReeferPricingContext c, int hours, int days, DateTimeOffset asAt,
+        List<string> hourly, List<string> daily, CancellationToken ct)
     {
         var plan = c.Plan;
         var request = new PriceRequest(
@@ -145,19 +158,29 @@ internal sealed class ReeferPowerQuoter(RevenueDbContext db, IMasterDataReferenc
         }
 
         // Only an hourly rate may be multiplied by hours: FLAT on an hourly unit, or tiers by HOUR.
+        // A per-day rate tiered by DAY is priced again on the days plugged in.
         var basis = result.TosRateId is { } rateId
             ? await db.TosRates.AsNoTracking().Where(r => r.TosRateId == rateId).Select(r => r.TierBasis).SingleOrDefaultAsync(ct)
             : null;
         var perHour = result.BillingUnitCode is { } unit && hourly.Contains(unit)
                       && (result.PricingMethod == PricingMethods.Flat || basis == TierBases.Hour);
-        if (!perHour)
+        var perDay = result.BillingUnitCode is { } dayUnit && daily.Contains(dayUnit) && basis == TierBases.Day;
+        if (!perHour && !perDay)
         {
             trail.Add($"The {variant.ChargeCode} rate on {result.ScheduleNo} is {result.BillingUnitCode}" +
-                      (basis is null ? "" : $" by {basis}") + ": reefer rate must be per hour.");
+                      (basis is null ? "" : $" by {basis}") + ": reefer rate must be per hour, or per day tiered by DAY.");
             return new ReeferVariantPrice(variant, ReeferOutcomes.RateNotSet, result, null, trail);
         }
 
+        decimal quantity = hours;
+        if (perDay)
+        {
+            result = await pricing.PriceAsync(request with { Quantity = days }, ct);
+            trail = [.. result.PrecedenceTrail, $"{days} calendar day(s) plugged in: {variant.ChargeCode} is tiered by DAY."];
+            quantity = days;
+        }
+
         var amount = CashQuoter.Money(result.Amount ?? 0);
-        return new ReeferVariantPrice(variant, amount > 0 ? ReeferOutcomes.Priced : ReeferOutcomes.PricedZero, result, amount, trail);
+        return new ReeferVariantPrice(variant, amount > 0 ? ReeferOutcomes.Priced : ReeferOutcomes.PricedZero, result, amount, trail, quantity);
     }
 }

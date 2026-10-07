@@ -318,6 +318,21 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>Removes a test invoice and its lines (an issued invoice is final, so this is the sysadmin door). Test-only.</summary>
+    public static async Task RemoveInvoiceAsync(Guid invoiceId)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gecko_revenue.billing.invoice_line WHERE invoice_id = @id;
+            DELETE FROM gecko_revenue.billing.invoice WHERE invoice_id = @id;
+            """;
+        command.Parameters.AddWithValue("@id", invoiceId);
+        await command.ExecuteNonQueryAsync();
+    }
+
     /// <summary>
     /// Sets (a value) or removes (null) one SCT tenant setting row in gecko_master —
     /// tenant-wide when <paramref name="branchId"/> is null. Test-only, fixture tenant only.

@@ -301,6 +301,76 @@ public sealed class ReeferPowerApiTests(RevenueApiFactory api)
         }
     }
 
+    // ── KORAKIT's SE004: a per-DAY rate tiered by DAY, priced on the calendar days plugged in ──
+
+    [Fact]
+    public async Task A_rate_tiered_by_day_prices_the_calendar_days_plugged_in_not_the_hours()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var owner = await api.ClientForAsync(RevenueApiFactory.SctOwner);
+        var maker = await api.ClientForAsync(RevenueApiFactory.SctAccounts);
+        var code = $"ZZRD{Guid.NewGuid():N}"[..10].ToUpperInvariant();
+        var spotNo = $"ZZ-RFY-{Guid.NewGuid():N}"[..20].ToUpperInvariant();
+        var booking = $"ZZ-RFZ-{Guid.NewGuid():N}"[..20].ToUpperInvariant();
+        try
+        {
+            var created = await owner.PostAsJsonAsync(Charges, new
+            {
+                chargeCode = code, descriptionEn = "Reefer power by day (test)", moduleCode = "TOS", chargeType = "REEFER",
+                chargeCategory = "REEFER", billingUnitCode = "PER_HOUR",
+            }, ct);
+            Assert.True(created.StatusCode == HttpStatusCode.Created, await created.Content.ReadAsStringAsync(ct));
+            var charge = (await created.Content.ReadFromJsonAsync<ChargeDetail>(ct))!.Charge;
+            var variants = await owner.PutAsJsonAsync($"{Charges}/{code}/variants", new
+            {
+                rowVersion = charge.RowVersion,
+                variants = new object[] { new { billTo = "CUSTOMER", paymentTermCode = "CASH", taxCode = "VAT7" } },
+            }, ct);
+            Assert.True(variants.StatusCode == HttpStatusCode.OK, await variants.Content.ReadAsStringAsync(ct));
+
+            // The slabs as KORAKIT wrote them: days 1-23 at 84.11, day 24 at 1,000, day 25 on at 50.
+            await ApprovedTariffAsync(maker, owner, Spot(spotNo, booking), new object[]
+            {
+                new
+                {
+                    chargeCode = code, billTo = "CUSTOMER", paymentTermCode = "CASH", billingUnitCode = "PER_DAY",
+                    pricingMethod = "TIERED_INCREMENTAL", tierBasis = "DAY",
+                    tiers = new object[] { new { fromQty = 1, toQty = 23, rate = 84.11m }, new { fromQty = 24, toQty = 24, rate = 1000m },
+                                           new { fromQty = 25, rate = 50m } },
+                },
+            }, ct);
+
+            // Plugged in 25 hours ago and still plugged: 26 started hours, but priced on the branch-local
+            // calendar days the plug spans (2, or 3 just after local midnight), as the old system counted.
+            var now = DateTimeOffset.UtcNow;
+            var s = new Session(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), NewBox(), SctLcb01, now.AddHours(-25));
+            await GateInAsync(s.GateIn!.Value, s.Box, now.AddHours(-26), ct);
+            await PlugAsync(TestDatabase.Sct, s, ReeferSessionHandler.Plugged, now.AddHours(-25), ct);
+            BranchClockInfo branch;
+            using (var scope = Scope(TestDatabase.Sct))
+                branch = (await scope.ServiceProvider.GetRequiredService<BranchCalendar>().BranchAsync(SctLcb01, ct))!;
+            var days = branch.LocalDate(now).DayNumber - branch.LocalDate(now.AddHours(-25)).DayNumber + 1;
+
+            var window = await WindowQuoteAsync(s.Box, booking, ct);
+            var line = Assert.Single(window.Lines, l => l.Kind == QuoteLine.Reefer);
+            Assert.Equal((code, (decimal)days, days * 84.11m), (line.ChargeCode, line.Quantity, line.Amount));
+            var tried = Assert.Single(window.Tried, t => t.ChargeCode == code);
+            Assert.Contains(tried.Trail, t => t.Contains($"{days} calendar day(s) plugged in"));
+            Assert.True(window.ReeferApplies);
+        }
+        finally
+        {
+            await TestDatabase.RemoveTariffAsync(spotNo);
+            await TestDatabase.RemoveReeferTestRowsAsync();
+            if (await owner.GetAsync($"{Charges}/{code}", ct) is { StatusCode: HttpStatusCode.OK } current)
+            {
+                var rowVersion = (await current.Content.ReadFromJsonAsync<ChargeDetail>(ct))!.Charge.RowVersion;
+                Assert.Equal(HttpStatusCode.NoContent,
+                    (await owner.DeleteAsync($"{Charges}/{code}?rowVersion={Uri.EscapeDataString(rowVersion)}", ct)).StatusCode);
+            }
+        }
+    }
+
     private static object Spot(string scheduleNo, string booking) => new
     {
         scheduleNo, name = "Reefer power test (spot)", moduleCode = "TOS", scheduleType = "SPOT",

@@ -635,7 +635,7 @@ internal static class WindowEndpoints
     private static QuoteLineResponse ToResponse(QuoteLine l) =>
         new(l.Kind, l.ChargeCode, l.ChargeName, l.BillTo, l.PayerPartyCode, l.Quantity, l.UnitRate, l.Amount,
             l.TaxCode, l.TaxRate, l.TaxAmount, l.Total, l.ServiceFrom, l.ServiceTo, l.Price.ScheduleNo,
-            l.PaymentTermCode, l.BillingUnitCode, l.ByHaulierTerm);
+            l.PaymentTermCode, l.BillingUnitCode, l.ByHaulierTerm, l.RateSource, l.UnitRateOriginal, l.OverrideReason);
 
     private static VasOptionResponse ToResponse(VasOption v) =>
         new(v.ChargeCode, v.ChargeName, v.BillTo, v.PaymentTermCode, v.Ticked, v.Outcome,
@@ -930,6 +930,33 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         }
         await transaction.CommitAsync(ct);
         return (charge, coupon);
+    }
+
+    /// <summary>
+    /// A quoted line waived by id on the booking statement (gecko_revenue 25): when it was the
+    /// last thing due on the box's NEXT move, the box goes on a waiver coupon, as the window's
+    /// own waive does. A line of a later move releases nothing yet. Runs in the caller's
+    /// transaction; the coupon's ref is kept on the charge so an un-waive can withdraw it.
+    /// </summary>
+    public async Task<CouponResponse?> ReleaseIfNothingDueAsync(WindowContext context, Charge waived, Guid by, CancellationToken ct)
+    {
+        if (waived.BookingContainerId is not { } boxId || waived.PaymentTermCode != "CASH") return null;
+        var box = (await QuoteBoxesAsync(context, new HashSet<Guid> { boxId }, null, ct)).SingleOrDefault();
+        if (box?.Quote is not { } quote || quote.MovementCode != waived.MovementCode
+            || quote.Lines.Count > 0 || quote.NoPrice.Count > 0 || string.IsNullOrEmpty(box.Box.ContainerNo))
+            return null;
+
+        var now = context.Now;
+        var payload = new CouponIssuedPayload(
+            CouponId: Guid.CreateVersion7(), BranchId: context.Plan.BranchId, BookingId: context.Plan.BookingId,
+            ContainerNo: box.Box.ContainerNo, MovementCode: quote.MovementCode,
+            CouponRef: $"WAIVE-{context.Plan.OrderNo}-{waived.ChargeId.ToString("N")[..6].ToUpperInvariant()}",
+            Channel: "WAIVED", Amount: null, CurrencyCode: null, ValidFrom: now, ValidUntil: ValidUntil(context, quote), IssuedBy: by,
+            TruckCategoryCode: quote.Terms?.TruckCategoryCode, HaulierCode: quote.Terms?.HaulierCode);
+        waived.CouponRef = payload.CouponRef;
+        await db.SaveChangesAsync(ct);
+        await RevenueOutbox.EnqueueAsync(db, context.Plan.TenantId, "CHARGE", waived.ChargeId, RevenueOutbox.CouponIssued, payload, ct);
+        return new CouponResponse(payload.CouponRef, payload.ContainerNo, payload.MovementCode, payload.ValidUntil);
     }
 
     /// <summary>

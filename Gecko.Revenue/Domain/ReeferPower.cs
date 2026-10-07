@@ -50,6 +50,23 @@ public static class ReeferPower
         return new PluggedTime(BillableHours(total), (int)Math.Floor(total.TotalMinutes), counted.Count, total);
     }
 
+    /// <summary>
+    /// Calendar days plugged in, for a rate tiered by DAY: the first plug-in's local
+    /// date to the last plug-out's (an open session: the as-at time), both counted —
+    /// as KORAKIT's old system counted its electricity slabs (stay days, end − start + 1).
+    /// 0 when nothing counts.
+    /// </summary>
+    public static int PluggedDays(IEnumerable<PlugSpan> sessions, DateTimeOffset asAt, Func<DateTimeOffset, DateOnly> localDate)
+    {
+        var spans = sessions.Where(s => !s.IsVoided)
+            .Select(s => (From: s.PluggedInAt, To: Min(s.PluggedOutAt ?? asAt, asAt)))
+            .Where(s => s.To > s.From)
+            .ToList();
+        return spans.Count == 0
+            ? 0
+            : localDate(spans.Max(s => s.To)).DayNumber - localDate(spans.Min(s => s.From)).DayNumber + 1;
+    }
+
     /// <summary>Per started hour, on exact ticks (no floating point): 60:00 = 1, 60:00.0000001 = 2, 0 = 0.</summary>
     public static int BillableHours(TimeSpan plugged) =>
         plugged <= TimeSpan.Zero ? 0 : (int)((plugged.Ticks + TimeSpan.TicksPerHour - 1) / TimeSpan.TicksPerHour);

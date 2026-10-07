@@ -479,6 +479,9 @@ internal sealed class GateEventHandler(
         Guid? BookingId, Guid? BookingContainerId, DateTimeOffset TransactionAt);
 }
 
+/// <summary>What a quote refresh changed on a booking's QUOTED lines; <c>NoRate</c> = lines no tariff prices.</summary>
+internal sealed record QuoteRefresh(int Repriced, int Added, int Removed, int NoRate);
+
 /// <summary>
 /// The automatic coupon (PLAN_BILLING §4.2 step 0): a billable movement that can
 /// owe NO cash — nothing in the order type prices in cash, and no storage on the
@@ -544,9 +547,10 @@ internal sealed class AutomaticCoupons(
     /// What is no longer expected — paid, billed at the gate, movement done, box gone — is CANCELLED
     /// with its reason (DELETE is denied). Runs with the caller's SaveChanges / transaction.
     /// </summary>
-    private async Task RefreshQuotesAsync(BookingPlan plan, BranchClockInfo branch, OrderTypePlanRef? orderType, DateTimeOffset now, CancellationToken ct)
+    public async Task<QuoteRefresh> RefreshQuotesAsync(BookingPlan plan, BranchClockInfo branch, OrderTypePlanRef? orderType, DateTimeOffset now, CancellationToken ct,
+        string? cancelReason = null)
     {
-        if (orderType is null) return;
+        if (orderType is null) return new QuoteRefresh(0, 0, 0, 0);
         var boxes = await db.BookingPlanContainers.Where(b => b.BookingId == plan.BookingId && b.IsCurrent && b.EndReason == null).ToListAsync(ct);
         var existing = await db.Charges.Where(c => c.BookingId == plan.BookingId && c.Source == ChargeSource.Quote && c.Status == ChargeStatus.Quoted).ToListAsync(ct);
 
@@ -558,7 +562,7 @@ internal sealed class AutomaticCoupons(
                 if (rules is not { IsBillable: true }) continue;
                 var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);
                 var lines = quote.Lines.Where(l => l.Kind is QuoteLine.Movement or QuoteLine.Vas)
-                    .Concat(quote.BilledLater).Concat(quote.NoPrice);
+                    .Concat(quote.BilledLater).Concat(quote.NoPrice).Concat(quote.ZeroRated);
                 foreach (var line in lines)
                 {
                     var key = (box.BookingContainerId, step.MovementCode, line.ChargeCode, line.BillTo, line.PaymentTermCode);
@@ -566,11 +570,13 @@ internal sealed class AutomaticCoupons(
                 }
             }
 
+        int repriced = 0, removed = 0;
         foreach (var row in existing)
         {
             var key = (row.BookingContainerId!.Value, row.MovementCode!, row.ChargeCode!, row.BillTo!, row.PaymentTermCode!);
             if (wanted.Remove(key, out var fresh))
             {
+                if (row.UnitRate != fresh.UnitRate || row.Amount != fresh.Amount || row.Quantity != fresh.Quantity) repriced++;
                 // Same line, new price: keep the row, take the new figures and snapshot.
                 row.Quantity = fresh.Quantity; row.UnitRate = fresh.UnitRate; row.Amount = fresh.Amount;
                 row.TaxCode = fresh.TaxCode; row.TaxRate = fresh.TaxRate; row.TaxAmount = fresh.TaxAmount;
@@ -581,17 +587,25 @@ internal sealed class AutomaticCoupons(
                 row.BaseRate = fresh.BaseRate; row.FreeUnits = fresh.FreeUnits; row.ChargeableQuantity = fresh.ChargeableQuantity;
                 row.ResolvedAt = fresh.ResolvedAt; row.PriceSnapshotJson = fresh.PriceSnapshotJson; row.PayerPartyCode = fresh.PayerPartyCode;
                 row.ContainerNo = fresh.ContainerNo; row.UpdatedAt = now;
+                // A supervisor's rate (gecko_revenue 25) came back through the quoter: the row keeps it.
+                row.IsRateOverridden = fresh.IsRateOverridden; row.UnitRateOriginal = fresh.UnitRateOriginal;
+                row.OverrideReason = fresh.OverrideReason; row.OverriddenBy = fresh.OverriddenBy; row.OverriddenAt = fresh.OverriddenAt;
+                row.DiscountType = fresh.DiscountType; row.DiscountRate = fresh.DiscountRate;
             }
             else
             {
                 row.Status = ChargeStatus.Cancelled;
                 row.CancelledAt = now;
-                row.CancelReason = "Quote no longer due: paid, billed at the gate, movement done or box removed.";
+                row.CancelReason = cancelReason ?? "Quote no longer due: paid, billed at the gate, movement done or box removed.";
                 row.UpdatedAt = now;
+                removed++;
             }
         }
         db.Charges.AddRange(wanted.Values);
         await db.SaveChangesAsync(ct);
+        // what the tariff still cannot price: those boxes are held at the gate
+        var noRate = existing.Concat(wanted.Values).Count(c => c.Status == ChargeStatus.Quoted && c.ScheduleId is null && !c.IsRateOverridden && !c.IsLocked);
+        return new QuoteRefresh(repriced, wanted.Count, removed, noRate);
     }
 
     /// <summary>The same box and movement always yield the same coupon id — TOS dedupes on it.</summary>

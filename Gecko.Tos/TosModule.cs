@@ -76,6 +76,7 @@ public static class TosModule
             .MapContainerInquiryEndpoints()
             .MapYardStockEndpoints()
             .MapReportEndpoints()
+            .MapListReportEndpoints()
             .MapSurveyEndpoints()
             .MapAttachmentEndpoints()
             .MapDashboardEndpoints();

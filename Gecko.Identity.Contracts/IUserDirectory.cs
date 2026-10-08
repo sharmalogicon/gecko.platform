@@ -9,4 +9,7 @@ namespace Gecko.Identity.Contracts;
 public interface IUserDirectory
 {
     Task<IReadOnlyDictionary<Guid, string>> DisplayNamesAsync(IEnumerable<Guid> userIds, CancellationToken ct);
+
+    /// <summary>The branches' display names (a report's heading), the caller's tenant only.</summary>
+    Task<IReadOnlyDictionary<Guid, string>> BranchNamesAsync(IEnumerable<Guid> branchIds, CancellationToken ct);
 }

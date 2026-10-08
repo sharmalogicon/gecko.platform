@@ -72,6 +72,9 @@ public interface IMasterDataReferences
     /// <summary>The container registry, by ISO 6346 number. A number not in the registry is simply absent.</summary>
     Task<IReadOnlyDictionary<string, ContainerRef>> ContainersAsync(IEnumerable<string> containerNos, CancellationToken ct);
 
+    /// <summary>Yards by id (a yard a box stands in). An id not found is simply absent.</summary>
+    Task<IReadOnlyDictionary<Guid, YardRef>> YardsAsync(IEnumerable<Guid> yardIds, CancellationToken ct);
+
     Task<IReadOnlyDictionary<string, CommodityRef>> CommoditiesAsync(IEnumerable<string> commodityCodes, CancellationToken ct);
 
     Task<IReadOnlyDictionary<string, CodeRef>> ContainerGradesAsync(IEnumerable<string> gradeCodes, CancellationToken ct);
@@ -244,7 +247,10 @@ public sealed record OrderTypeStepRef(
 /// <param name="FixedPortCodes">The ports the box is designated to (gecko_master 25); empty = any port.</param>
 /// <param name="OwnerPartyId">The box's owner (MDM container.owner_party_id); null = not recorded.</param>
 public sealed record ContainerRef(Guid ContainerId, string ContainerNo, string? EquipmentTypeCode, string Status, bool IsCheckDigitValid,
-    IReadOnlyList<string>? FixedPortCodes = null, Guid? OwnerPartyId = null);
+    IReadOnlyList<string>? FixedPortCodes = null, Guid? OwnerPartyId = null, string? OwnerPartyCode = null, decimal? MaxGrossKg = null);
+
+/// <summary>A yard of a branch (org.yard): what a report prints as its yard location.</summary>
+public sealed record YardRef(Guid YardId, Guid BranchId, string YardCode, string Name);
 
 /// <summary>
 /// <see cref="BlockingScope"/> is ALL / RELEASE / LOAD / GATE_IN / GATE_OUT and

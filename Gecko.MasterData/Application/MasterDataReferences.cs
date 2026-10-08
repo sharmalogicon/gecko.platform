@@ -220,13 +220,30 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             from c in db.Containers.AsNoTracking()
             join t in db.EquipmentTypes on c.EquipmentTypeId equals t.EquipmentTypeId into types
             from t in types.DefaultIfEmpty()
+            join o in db.Parties on c.OwnerPartyId equals o.PartyId into owners
+            from o in owners.DefaultIfEmpty()
             where numbers.Contains(c.ContainerNo)
-            select new { c.ContainerId, c.ContainerNo, TypeCode = t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid, c.FixedPortCodes, c.OwnerPartyId })
+            select new
+            {
+                c.ContainerId, c.ContainerNo, TypeCode = t == null ? null : t.TypeCode, c.Status, c.IsCheckDigitValid, c.FixedPortCodes, c.OwnerPartyId,
+                OwnerCode = o == null ? null : o.PartyCode, c.MaxGrossKg,
+            })
             .ToListAsync(ct);
         return rows.ToDictionary(c => c.ContainerNo,
             c => new ContainerRef(c.ContainerId, c.ContainerNo, c.TypeCode, c.Status, c.IsCheckDigitValid,
-                (c.FixedPortCodes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), c.OwnerPartyId),
+                (c.FixedPortCodes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), c.OwnerPartyId,
+                c.OwnerCode, c.MaxGrossKg),
             StringComparer.OrdinalIgnoreCase);
+    }
+
+    public async Task<IReadOnlyDictionary<Guid, YardRef>> YardsAsync(IEnumerable<Guid> yardIds, CancellationToken ct)
+    {
+        var ids = yardIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<Guid, YardRef>();
+        return await db.Yards.AsNoTracking()
+            .Where(y => ids.Contains(y.YardId))
+            .Select(y => new YardRef(y.YardId, y.BranchId, y.YardCode, y.NameEn))
+            .ToDictionaryAsync(y => y.YardId, ct);
     }
 
     public async Task<IReadOnlyDictionary<string, CommodityRef>> CommoditiesAsync(IEnumerable<string> commodityCodes, CancellationToken ct)

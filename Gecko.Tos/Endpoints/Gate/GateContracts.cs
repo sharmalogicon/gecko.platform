@@ -84,7 +84,9 @@ public sealed record GateSealResponse(string SealNo, string SealType, bool IsInt
 public sealed record GateTransactionSummaryResponse(
     Guid GateTransactionId, string EirNo, string Direction, string MovementCode, string FullEmpty,
     string ContainerNo, string OrderNo, string LineCode, string TruckPlate,
-    DateTimeOffset TransactionAt, bool IsLate, string Status);
+    DateTimeOffset TransactionAt, bool IsLate, string Status,
+    // The numbers the driver, agent and line quote for the booking (2026-10-08): the registers lead with them, not OrderNo.
+    string? CarrierRef = null, string? SubBlNo = null);
 
 // ── requests ────────────────────────────────────────────────────────────────
 

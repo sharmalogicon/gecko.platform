@@ -583,6 +583,8 @@ public sealed class GateApiTests(TosApiFactory api)
                 (await client.GetFromJsonAsync<PagedResult<GateTransactionSummaryResponse>>($"{Gate}/transactions?{query}", ct))!;
 
             Assert.Contains((await ListAsync($"containerNo={BoxA}")).Items, t => t.GateTransactionId == eir.GateTransactionId);
+            // The register carries the number people quote for the booking, beside Gecko's own order number.
+            Assert.Equal(carrierRef, (await ListAsync($"containerNo={BoxA}")).Items.Single(t => t.GateTransactionId == eir.GateTransactionId).CarrierRef);
             Assert.Contains((await ListAsync("truck=ZZ-778")).Items, t => t.GateTransactionId == eir.GateTransactionId);
             Assert.Single((await ListAsync($"bookingId={booking.Booking.BookingId}")).Items);
             Assert.DoesNotContain((await ListAsync($"containerNo={BoxA}&truck=NO-SUCH-PLATE")).Items, t => t.GateTransactionId == eir.GateTransactionId);

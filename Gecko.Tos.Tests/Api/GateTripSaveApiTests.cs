@@ -173,6 +173,12 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             Assert.NotNull(answer.VisitNo);
             var inYard = (await client.GetFromJsonAsync<TruckVisitResponse>($"{Gate}/visits/{answer.TruckVisitId}", ct))!;
             Assert.Equal(2, inYard.Pickups!.Count(p => p.Status == "PLANNED"));
+            // The Gate Out clerk finds the truck by the box it came for, or that box's order number.
+            async Task<bool> FoundByAsync(string search) =>
+                (await client.GetFromJsonAsync<PagedResult<TruckVisitResponse>>($"{Gate}/visits?branchId={SctLcb01}&search={Uri.EscapeDataString(search)}", ct))!
+                .Items.Any(v => v.TruckVisitId == answer.TruckVisitId);
+            Assert.True(await FoundByAsync(boxB));
+            Assert.True(await FoundByAsync(b.Booking.OrderNo));
 
             // Gate out: the clerk picks the truck in front of him and releases both boxes, on the same visit.
             var outKey = Guid.NewGuid().ToString();
@@ -184,6 +190,7 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
             Assert.All(gone.Rows, r => Assert.True(r.Status == "GATED", $"{r.ContainerNo} {r.Status}: {r.Reason}"));
             Assert.Equal(2, gone.Rows.Select(r => r.EirNo).Distinct().Count());
             Assert.NotNull(gone.TruckLeftAt);   // nothing left to collect: the truck has left
+            Assert.False(await FoundByAsync(boxA));   // released, not PLANNED: no longer a box this truck is here for
             var outAgain = (await (await SaveAsync(client, outKey, outBody, ct)).Content.ReadFromJsonAsync<TripSaveResponse>(ct))!;
             Assert.Equal(gone.Rows.Select(r => r.EirNo), outAgain.Rows.Select(r => r.EirNo));   // a retried gate out: the same EIRs
 

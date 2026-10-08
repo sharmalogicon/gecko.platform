@@ -777,7 +777,7 @@ internal static class GateEndpoints
             from t in db.GateTransactions.AsNoTracking()
             join b in db.Bookings on t.BookingId equals b.BookingId
             join v in db.TruckVisits on t.TruckVisitId equals v.TruckVisitId
-            select new { g = t, b.OrderNo, v.TruckPlate };
+            select new { g = t, b.OrderNo, b.CarrierRef, b.SubBlNo, v.TruckPlate };
 
         if (branchId is not null) rows = rows.Where(r => r.g.BranchId == branchId);
         if (direction.Clean() is { } way)
@@ -810,7 +810,7 @@ internal static class GateEndpoints
             page.Items.Select(r => new GateTransactionSummaryResponse(
                 r.g.GateTransactionId, r.g.EirNo, r.g.Direction, r.g.MovementCode, r.g.FullEmpty,
                 r.g.ContainerNo, r.OrderNo, r.g.LinePartyCode, r.TruckPlate,
-                r.g.TransactionAt, r.g.IsLate, r.g.Status)).ToList(),
+                r.g.TransactionAt, r.g.IsLate, r.g.Status, r.CarrierRef, r.SubBlNo)).ToList(),
             page.Page, page.PageSize, page.TotalCount));
     }
 
@@ -859,7 +859,18 @@ internal static class GateEndpoints
         if (openOnly == true) rows = rows.Where(v => v.GateOutAt == null);
         if (from is not null) rows = rows.Where(v => v.ArrivedAt >= from);
         if (to is not null) rows = rows.Where(v => v.ArrivedAt < to);
-        if (query.Search.Clean() is { } q) rows = rows.Where(v => v.VisitNo.Contains(q) || v.TruckPlate.Contains(q));
+        if (query.Search.Clean() is { } q)
+        {
+            // The driver at Gate Out names the box he came for, not his visit (2026-10-08): match the open pick-ups too.
+            var box = ContainerNumber.Normalise(q);
+            var collecting =
+                from p in db.VisitPickups.Where(p => p.Status == "PLANNED")
+                join x in db.BookingContainers on p.BookingContainerId equals x.BookingContainerId
+                join b in db.Bookings on x.BookingId equals b.BookingId
+                where p.ContainerNo!.Contains(box) || b.OrderNo.Contains(q)
+                select p.TruckVisitId;
+            rows = rows.Where(v => v.VisitNo.Contains(q) || v.TruckPlate.Contains(q) || collecting.Contains(v.TruckVisitId));
+        }
         if (scope.BranchFilter(TosPermissions.GateView) is { } mine)
         {
             var allowed = mine.ToList();
@@ -897,7 +908,7 @@ internal static class GateEndpoints
             select new GateTransactionSummaryResponse(
                 t.GateTransactionId, t.EirNo, t.Direction, t.MovementCode, t.FullEmpty,
                 t.ContainerNo, b.OrderNo, t.LinePartyCode, visit.TruckPlate,
-                t.TransactionAt, t.IsLate, t.Status)).ToListAsync(ct);
+                t.TransactionAt, t.IsLate, t.Status, b.CarrierRef, b.SubBlNo)).ToListAsync(ct);
 
         return TypedResults.Ok(Project(visit, boxes, ModeOf(boxes)) with { Pickups = (await PickupsAsync(db, [visit.TruckVisitId], ct)).Select(p => p.Response).ToList() });
     }

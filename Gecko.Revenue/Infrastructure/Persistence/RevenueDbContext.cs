@@ -1446,6 +1446,9 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.PayerAddress)
                 .HasMaxLength(500)
                 .HasColumnName("payer_address");
+            entity.Property(e => e.Remarks)
+                .HasMaxLength(500)
+                .HasColumnName("remarks");
             entity.Property(e => e.PayerBranchNo)
                 .HasMaxLength(10)
                 .IsUnicode(false)

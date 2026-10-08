@@ -33,6 +33,9 @@ public partial class Receipt
 
     public string? PayerAddress { get; set; }
 
+    /// <summary>gecko_revenue 28: the clerk's remarks (desktop InvoiceHeader.Remarks).</summary>
+    public string? Remarks { get; set; }
+
     public string CurrencyCode { get; set; } = null!;
 
     public decimal SubtotalAmount { get; set; }

@@ -68,61 +68,73 @@ internal static class BookingEndpoints
         var today = await clock.TodayForAsync(branchId is { } b ? [b] : [], ct);
         var filterDay = today(branchId ?? Guid.Empty);
 
-        var rows =
-            from p in db.VwBookingProgresses.AsNoTracking()
-            join bk in db.Bookings on p.BookingId equals bk.BookingId
-            join vc in db.VesselCalls on bk.VesselCallId equals vc.VesselCallId into calls
-            from vc in calls.DefaultIfEmpty()
-            join vl in db.VesselCallLines on bk.VesselCallLineId equals vl.VesselCallLineId into lines
-            from vl in lines.DefaultIfEmpty()
-            select new { p, bk, CallRef = vc == null ? null : vc.CallRef, Voyage = vl == null ? null : (vl.VoyageOut ?? vl.VoyageIn) };
+        // Paged over the booking table itself (owner 2026-10-08: the register was slow): the progress
+        // view adds up every booking's boxes and moves, so it is read for the page's rows only —
+        // unless the caller filters on progress, which only the view can answer.
+        var rows = db.Bookings.AsNoTracking();
 
-        if (branchId is not null) rows = rows.Where(r => r.bk.BranchId == branchId);
+        if (branchId is not null) rows = rows.Where(b => b.BranchId == branchId);
         // A branch-scoped clerk sees their depot's bookings and no others. Not a 403:
         // a list is a list, it just contains what the caller is allowed to see.
         if (scope.BranchFilter(TosPermissions.BookingView) is { } mine)
         {
             var allowed = mine.ToList();
-            rows = rows.Where(r => allowed.Contains(r.bk.BranchId));
+            rows = rows.Where(b => allowed.Contains(b.BranchId));
         }
         if (status.Clean() is { } s)
         {
             if (!BookingRules.Statuses.Contains(s)) return TosSupport.Invalid("status", $"Use one of: {string.Join(", ", BookingRules.Statuses)}.");
-            rows = rows.Where(r => r.bk.Status == s);
+            rows = rows.Where(b => b.Status == s);
         }
         if (progress.Clean() is { } pr)
         {
             if (!BookingRules.Progresses.Contains(pr)) return TosSupport.Invalid("progress", $"Use one of: {string.Join(", ", BookingRules.Progresses)}.");
-            rows = pr == BookingRules.Expired
-                ? rows.Where(r => (r.p.ProgressStatus == BookingRules.NotStarted || r.p.ProgressStatus == BookingRules.InProgress) && r.p.ValidTo < filterDay)
+            var matching = pr == BookingRules.Expired
+                ? db.VwBookingProgresses.Where(p => (p.ProgressStatus == BookingRules.NotStarted || p.ProgressStatus == BookingRules.InProgress) && p.ValidTo < filterDay)
                 : pr is BookingRules.NotStarted or BookingRules.InProgress
-                    ? rows.Where(r => r.p.ProgressStatus == pr && (r.p.ValidTo == null || r.p.ValidTo >= filterDay))
-                    : rows.Where(r => r.p.ProgressStatus == pr);
+                    ? db.VwBookingProgresses.Where(p => p.ProgressStatus == pr && (p.ValidTo == null || p.ValidTo >= filterDay))
+                    : db.VwBookingProgresses.Where(p => p.ProgressStatus == pr);
+            rows = rows.Where(b => matching.Any(p => p.BookingId == b.BookingId));
         }
-        if (orderTypeCode.Clean() is { } ot) rows = rows.Where(r => r.bk.OrderTypeCode == ot);
-        if (lineCode.Clean() is { } l) rows = rows.Where(r => r.bk.LinePartyCode == l);
-        if (customerCode.Clean() is { } c) rows = rows.Where(r => r.bk.CustomerPartyCode == c);
-        if (vesselCallId is not null) rows = rows.Where(r => r.bk.VesselCallId == vesselCallId);
+        if (orderTypeCode.Clean() is { } ot) rows = rows.Where(b => b.OrderTypeCode == ot);
+        if (lineCode.Clean() is { } l) rows = rows.Where(b => b.LinePartyCode == l);
+        if (customerCode.Clean() is { } c) rows = rows.Where(b => b.CustomerPartyCode == c);
+        if (vesselCallId is not null) rows = rows.Where(b => b.VesselCallId == vesselCallId);
         if (query.Search.Clean() is { } q)
         {
             var box = ContainerNumber.Normalise(q);
-            rows = rows.Where(r => r.bk.OrderNo.Contains(q) || r.bk.CarrierRef!.Contains(q) || r.bk.CustomerRef!.Contains(q)
-                || db.BookingContainers.Any(x => x.BookingId == r.bk.BookingId && x.ContainerNo == box));
+            rows = rows.Where(b => b.OrderNo.Contains(q) || b.CarrierRef!.Contains(q) || b.CustomerRef!.Contains(q)
+                || db.BookingContainers.Any(x => x.BookingId == b.BookingId && x.ContainerNo == box));
         }
 
-        var page = await rows.OrderByDescending(r => r.bk.CreatedAt).ThenByDescending(r => r.bk.OrderNo)
+        var page = await rows.OrderByDescending(b => b.CreatedAt).ThenByDescending(b => b.OrderNo)
             .ToPagedAsync(query.Page, query.PageSize, ct);
 
-        var branches = await clock.BranchesAsync(page.Items.Select(r => r.bk.BranchId), ct);
-        var todayOf = await clock.TodayForAsync(page.Items.Select(r => r.bk.BranchId), ct);
+        var ids = page.Items.Select(b => b.BookingId).ToList();
+        var progressOf = await db.VwBookingProgresses.AsNoTracking().Where(p => ids.Contains(p.BookingId)).ToDictionaryAsync(p => p.BookingId, ct);
+        var callIds = page.Items.Select(b => b.VesselCallId).OfType<Guid>().Distinct().ToList();
+        var callRefOf = callIds.Count == 0 ? []
+            : await db.VesselCalls.AsNoTracking().Where(v => callIds.Contains(v.VesselCallId)).ToDictionaryAsync(v => v.VesselCallId, v => v.CallRef, ct);
+        var lineIds = page.Items.Select(b => b.VesselCallLineId).OfType<Guid>().Distinct().ToList();
+        var voyageOf = lineIds.Count == 0 ? []
+            : await db.VesselCallLines.AsNoTracking().Where(v => lineIds.Contains(v.VesselCallLineId))
+                .ToDictionaryAsync(v => v.VesselCallLineId, v => v.VoyageOut ?? v.VoyageIn, ct);
+
+        var branches = await clock.BranchesAsync(page.Items.Select(b => b.BranchId), ct);
+        var todayOf = await clock.TodayForAsync(page.Items.Select(b => b.BranchId), ct);
 
         return TypedResults.Ok(new PagedResult<BookingSummaryResponse>(
-            page.Items.Select(r => new BookingSummaryResponse(
-                r.bk.BookingId, r.bk.OrderNo, r.bk.BranchId, branches.GetValueOrDefault(r.bk.BranchId)?.BranchCode, r.bk.CarrierRef,
-                r.bk.OrderTypeCode, r.bk.DirectionCode, r.bk.LinePartyCode, r.bk.CustomerPartyCode,
-                r.bk.VesselCallId, r.CallRef, r.Voyage,
-                r.bk.Status, BookingRules.EffectiveProgress(r.p.ProgressStatus, r.p.ValidTo, todayOf(r.bk.BranchId)),
-                r.p.QtyRequired, r.p.QtyAssigned, r.p.QtyCompleted, r.bk.ValidTo, r.bk.Source, r.bk.CreatedAt)).ToList(),
+            page.Items.Select(b =>
+            {
+                var p = progressOf.GetValueOrDefault(b.BookingId);
+                return new BookingSummaryResponse(
+                    b.BookingId, b.OrderNo, b.BranchId, branches.GetValueOrDefault(b.BranchId)?.BranchCode, b.CarrierRef,
+                    b.OrderTypeCode, b.DirectionCode, b.LinePartyCode, b.CustomerPartyCode,
+                    b.VesselCallId, b.VesselCallId is { } vc ? callRefOf.GetValueOrDefault(vc) : null,
+                    b.VesselCallLineId is { } vl ? voyageOf.GetValueOrDefault(vl) : null,
+                    b.Status, BookingRules.EffectiveProgress(p?.ProgressStatus ?? BookingRules.NotStarted, b.ValidTo, todayOf(b.BranchId)),
+                    p?.QtyRequired ?? 0, p?.QtyAssigned ?? 0, p?.QtyCompleted ?? 0, b.ValidTo, b.Source, b.CreatedAt);
+            }).ToList(),
             page.Page, page.PageSize, page.TotalCount));
     }
 
@@ -558,7 +570,7 @@ internal static class BookingEndpoints
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(db, id, ct);
-        var booking = await db.Bookings.AsNoTracking().SingleOrDefaultAsync(b => b.BookingId == id, ct);
+        var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         var box = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == bookingContainerId && x.BookingId == id, ct);
         if (booking is null || box is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
         if (booking.Status != BookingRules.Open) return NotOpen(booking);
@@ -566,11 +578,29 @@ internal static class BookingEndpoints
         if (!db.TrySetExpectedVersion(box, request.RowVersion))
             return TosSupport.Invalid("rowVersion", "Send the line's rowVersion you received when reading the booking.");
 
-        var line = await db.EquipmentRequirements.AsNoTracking().SingleAsync(r => r.EquipmentRequirementId == box.EquipmentRequirementId, ct);
+        var lines = await db.EquipmentRequirements.Where(r => r.BookingId == id).ToListAsync(ct);
+        var line = lines.Single(r => r.EquipmentRequirementId == box.EquipmentRequirementId);
         var steps = await db.MovementPlans.AsNoTracking().Where(m => m.BookingContainerId == bookingContainerId).OrderBy(m => m.SequenceNo).ToListAsync(ct);
         var started = steps.Any(s => s.Status == "DONE");
 
         var errors = new Dictionary<string, List<string>>();
+
+        // A new size/type (owner 2026-10-08): allowed until the box has moved at the gate or has money taken on it.
+        var wantedType = request.EquipmentTypeCode.Clean();
+        var retype = wantedType is not null && !string.Equals(wantedType, line.EquipmentTypeCode, StringComparison.OrdinalIgnoreCase);
+        EquipmentTypeRef? newType = null;
+        if (retype)
+        {
+            newType = (await master.EquipmentTypesAsync([wantedType!], ct)).GetValueOrDefault(wantedType!);
+            if (newType is not { IsActive: true })
+                errors.Add("equipmentTypeCode", $"'{wantedType}' is not an active equipment type.");
+            else if (started)
+                errors.Add("equipmentTypeCode", $"{box.ContainerNo} has already passed the gate on this booking; its size/type can no longer change.");
+            else if (box.ContainerNo is { } paidNo && await db.GateAuthorizations.AnyAsync(a => a.BookingId == id && a.ContainerNo == paidNo
+                         && a.PaymentChannel != "CREDIT" && a.PaymentChannel != "WAIVED" && a.Amount > 0 && a.ConsumedAt == null && a.RevokedAt == null, ct))
+                errors.Add("equipmentTypeCode", $"{paidNo} is already paid at the window for its next move; void the receipt before changing its size/type.");
+        }
+        var typeCode = retype && newType is not null ? newType.TypeCode : line.EquipmentTypeCode;
 
         // Nominating the box (owner 2026-10-04): the same checks as assigning one by number.
         var nominate = ContainerNumber.Normalise(request.ContainerNo ?? "") is { Length: > 0 } wanted && wanted != box.ContainerNo ? wanted : null;
@@ -590,7 +620,7 @@ internal static class BookingEndpoints
                 nominatedBox = (await master.ContainersAsync([nominate], ct)).GetValueOrDefault(nominate);
                 if (nominatedBox is null && !await master.GetBoolSettingAsync(TosSettingKeys.AllowUnknownContainer, booking.BranchId, true, ct))
                     errors.Add("containerNo", $"{nominate} is not in the container registry, and this depot does not accept unknown boxes.");
-                if (BookingRules.CannotAssign(line.Qty, 0, line.EquipmentTypeCode, nominatedBox?.EquipmentTypeCode) is { } wrongType)
+                if (BookingRules.CannotAssign(line.Qty, 0, typeCode, nominatedBox?.EquipmentTypeCode) is { } wrongType)
                     errors.Add("containerNo", $"{nominate}: {wrongType}");
                 var elsewhere = await (
                     from x in db.BookingContainers.AsNoTracking()
@@ -607,8 +637,10 @@ internal static class BookingEndpoints
         var cargoCode = request.CargoCategoryCode.Clean();
         if (cargoCode is not null && !(await master.CodeListValuesAsync("CARGO_CATEGORY", [cargoCode], ct)).Contains(cargoCode))
             errors.Add("cargoCategoryCode", $"'{cargoCode}' is not a CARGO_CATEGORY of this depot.");
-        if (request.ReeferSetTempC is not null && line.ReeferSetTempC is null)
-            errors.Add("reeferSetTempC", $"Line {line.LineNo} ({line.EquipmentTypeCode}) is not a reefer line; a set temperature makes no sense on it.");
+        // Reefer or not is the line's equipment type: a reefer line may have no set temperature yet.
+        if (request.ReeferSetTempC is not null
+            && (await master.EquipmentTypesAsync([typeCode], ct)).GetValueOrDefault(typeCode) is not { IsReefer: true })
+            errors.Add("reeferSetTempC", $"{typeCode} is not a reefer; a set temperature makes no sense on it.");
         if (request.ReeferSetTempC is < -70 or > 40) errors.Add("reeferSetTempC", "Between −70 °C and +40 °C.");
         if (request.ReeferVentPct is < 0 or > 100) errors.Add("reeferVentPct", "Between 0 and 100 %.");
         if (request.ReeferHumidityPct is < 0 or > 100) errors.Add("reeferHumidityPct", "Between 0 and 100 %.");
@@ -657,6 +689,49 @@ internal static class BookingEndpoints
         box.Remarks = string.IsNullOrWhiteSpace(request.Remarks) ? null : request.Remarks.Trim();
         box.HandoverModeCode = mode;
 
+        if (retype && newType is not null)
+        {
+            // To the booking's line of the new type: one more place when it is full, a new line when there is none
+            // (with the old line's cargo details). The old line gives the place back; at none it goes.
+            var now = DateTimeOffset.UtcNow;
+            var used = await UsedPerLineAsync(db, id, ct);
+            var target = lines.Where(r => string.Equals(r.EquipmentTypeCode, newType.TypeCode, StringComparison.OrdinalIgnoreCase)).MinBy(r => r.LineNo);
+            if (target is null)
+            {
+                target = new EquipmentRequirement
+                {
+                    TenantId = booking.TenantId, BookingId = id, LineNo = (short)(lines.Max(r => r.LineNo) + 1),
+                    EquipmentTypeId = newType.EquipmentTypeId, EquipmentTypeCode = newType.TypeCode, Qty = 1,
+                    MinGradeCode = line.MinGradeCode, ImdgClass = line.ImdgClass, UnNumber = line.UnNumber,
+                    DeclaredGrossWeightKg = line.DeclaredGrossWeightKg,
+                    ReeferSetTempC = newType.IsReefer ? line.ReeferSetTempC : null,
+                    ReeferVentPct = newType.IsReefer ? line.ReeferVentPct : null,
+                    ReeferHumidityPct = newType.IsReefer ? line.ReeferHumidityPct : null,
+                };
+                db.EquipmentRequirements.Add(target);
+                await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
+            }
+            else if (used.GetValueOrDefault(target.EquipmentRequirementId) >= target.Qty)
+            {
+                if (target.Qty >= 999) return TosSupport.Conflict($"Line {target.LineNo} ({target.EquipmentTypeCode}) is full.");
+                target.Qty++;
+                target.UpdatedAt = now;
+            }
+
+            var leftOnOld = used.GetValueOrDefault(line.EquipmentRequirementId) - 1;
+            if (line.Qty > Math.Max(1, leftOnOld))
+            {
+                line.Qty--;
+                line.UpdatedAt = now;
+            }
+            else if (leftOnOld <= 0) db.EquipmentRequirements.Remove(line);
+
+            box.EquipmentRequirementId = target.EquipmentRequirementId;
+            if (!newType.IsReefer) (box.ReeferSetTempC, box.ReeferVentPct, box.ReeferHumidityPct) = (null, null, null);
+            booking.UpdatedAt = now;   // the lines are part of the booking: its rowVersion moves
+            line = target;
+        }
+
         try
         {
             if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
@@ -665,7 +740,7 @@ internal static class BookingEndpoints
         {
             return TosSupport.Conflict($"{nominate} was put on another booking a moment ago.", "Reload the booking.");
         }
-        await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_CHANGED", DateTimeOffset.UtcNow, ct);
+        await BookingEvents.QueueChangedAsync(db, id, retype ? "REQUIREMENTS_CHANGED" : "CONTAINER_CHANGED", DateTimeOffset.UtcNow, ct);
         await tx.CommitAsync(ct);
         return TypedResults.Ok(ToResponse(box, line.LineNo, steps));
     }
@@ -676,7 +751,7 @@ internal static class BookingEndpoints
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(db, id, ct);
-        var booking = await db.Bookings.AsNoTracking().SingleOrDefaultAsync(b => b.BookingId == id, ct);
+        var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
         var box = await db.BookingContainers.SingleOrDefaultAsync(x => x.BookingContainerId == bookingContainerId && x.BookingId == id, ct);
         if (booking is null || box is null || !scope.HasAt(TosPermissions.BookingManage, booking.BranchId)) return TypedResults.NotFound();
         if (box.EndedAt is not null) return TosSupport.Conflict($"{box.ContainerNo} already left this booking ({box.EndReason}).");
@@ -687,6 +762,20 @@ internal static class BookingEndpoints
                 "A box with history stays on the booking; close the booking when the work is over.");
 
         End(box, "UNASSIGNED", steps, caller, time);
+
+        // Owner 2026-10-08: deleting a container books one fewer (Vector has no separate lines — a
+        // deleted row is one container less). The line drops a place; at none it goes (soft delete).
+        if (await db.EquipmentRequirements.SingleOrDefaultAsync(r => r.EquipmentRequirementId == box.EquipmentRequirementId, ct) is { } line)
+        {
+            if (line.Qty > 1)
+            {
+                line.Qty--;
+                line.UpdatedAt = time.GetUtcNow();
+                line.UpdatedBy = caller.UserId();
+            }
+            else db.EquipmentRequirements.Remove(line);
+        }
+        booking.UpdatedAt = time.GetUtcNow();   // the lines are part of the booking: its rowVersion moves
         // The gate may complete a step of this box at the same moment: the row versions decide, and the loser gets a 409.
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
         await BookingEvents.QueueChangedAsync(db, id, "CONTAINER_UNASSIGNED", time.GetUtcNow(), ct);
@@ -1052,6 +1141,10 @@ internal static class BookingEndpoints
             where x.ContainerNo != null && numbers.Contains(x.ContainerNo) && x.EndedAt == null
             select new { x.ContainerNo, b.OrderNo, x.BookingId, x.ClientLineId }).ToListAsync(ct);
 
+        // Reefer or not is the line's equipment type (a reefer line may have no set temperature yet).
+        var reeferTypes = (await master.EquipmentTypesAsync(requirements.Select(r => r.EquipmentTypeCode).Distinct(), ct))
+            .Values.Where(t => t.IsReefer).Select(t => t.TypeCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         // Where each box stands now, for the checks a handover mode switches on (Vector BookingEntry.cs:626-655).
         var inYard = items.Any(i => i.HandoverMode.Clean() is not null)
             ? await db.ContainerVisits.AsNoTracking()
@@ -1148,7 +1241,7 @@ internal static class BookingEndpoints
 
             // Reefer and DG details: the box's own, else the line's (owner Q2: the line holds the defaults).
             var setTemp = item.ReeferSetTempC ?? line.ReeferSetTempC;
-            if (item.ReeferSetTempC is not null && line.ReeferSetTempC is null)
+            if (item.ReeferSetTempC is not null && line.ReeferSetTempC is null && !reeferTypes.Contains(line.EquipmentTypeCode))
                 errors.Add($"{key}.reeferSetTempC", $"Line {line.LineNo} ({line.EquipmentTypeCode}) is not a reefer line; a set temperature makes no sense on it.");
             if (item.ReeferSetTempC is < -70 or > 40) errors.Add($"{key}.reeferSetTempC", "Between −70 °C and +40 °C.");
             if (item.ReeferVentPct is < 0 or > 100) errors.Add($"{key}.reeferVentPct", "Between 0 and 100 %.");
@@ -1437,9 +1530,8 @@ internal static class BookingEndpoints
             var grade = item.MinGradeCode.Clean();
             if (grade is not null && !grades.ContainsKey(grade)) errors.Add($"{key}.minGradeCode", $"Unknown container grade '{grade}'.");
 
-            // A reefer box without a set point is a box the gate cannot check (PLAN §4.2, C#).
-            if (type is { IsReefer: true } && item.ReeferSetTempC is null)
-                errors.Add($"{key}.reeferSetTempC", $"{type.TypeCode} is a reefer — give the set temperature.");
+            // Owner 2026-10-08: a reefer line may be saved without its set temperature — the
+            // instruction often comes later (COPARN, email) and is keyed then.
             if (type is { IsReefer: false } && item.ReeferSetTempC is not null)
                 errors.Add($"{key}.reeferSetTempC", $"{type.TypeCode} is not a reefer; a set temperature makes no sense on it.");
             if (item.ReeferSetTempC is < -70 or > 40) errors.Add($"{key}.reeferSetTempC", "Between −70 °C and +40 °C.");

@@ -545,7 +545,8 @@ internal static class WindowEndpoints
     /// </summary>
     private static async Task<Results<Ok<ReceiptResponse>, NotFound<ProblemDetails>, ForbidHttpResult, ValidationProblem, ProblemHttpResult>> VoidReceiptAsync(
         Guid id, VoidReceiptRequest request, RevenueDbContext db, ReceiptDocument document, ITenantContext caller,
-        ICallerPermissions permissions, TimeProvider clock, CancellationToken ct)
+        ICallerPermissions permissions, TimeProvider clock, AutomaticCoupons coupons, BranchCalendar calendar,
+        IMasterDataReferences master, CancellationToken ct)
     {
         var receipt = await db.Receipts.AsNoTracking().SingleOrDefaultAsync(r => r.ReceiptId == id, ct);
         if (receipt is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });
@@ -576,6 +577,15 @@ internal static class WindowEndpoints
 
         foreach (var charge in charges.Where(c => c.Status == ChargeStatus.Paid))
         {
+            if (charge.Source == ChargeSource.Manual)
+            {
+                // A hand-added line paid on a cash bill (owner 2026-10-08) goes back on the statement, still owed.
+                charge.Status = ChargeStatus.Quoted;
+                charge.ReceiptId = null;
+                charge.ReceiptLineId = null;
+                charge.UpdatedAt = now;
+                continue;
+            }
             charge.Status = ChargeStatus.Cancelled;
             charge.CancelledAt = now;
             charge.CancelledBy = by;
@@ -583,6 +593,13 @@ internal static class WindowEndpoints
             charge.UpdatedAt = now;
         }
         await db.SaveChangesAsync(ct);
+
+        // The statement expects again what the receipt had paid: its open bookings are quoted afresh.
+        foreach (var bookingId in charges.Select(c => c.BookingId).OfType<Guid>().Distinct())
+            if (await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.BookingId == bookingId && p.Status == "OPEN", ct) is { } plan
+                && await calendar.BranchAsync(plan.BranchId, ct) is { } branch)
+                await coupons.RefreshQuotesAsync(plan, branch,
+                    (await master.OrderTypePlansAsync([plan.OrderTypeCode], ct)).GetValueOrDefault(plan.OrderTypeCode), now, ct);
 
         foreach (var couponRef in charges.Select(c => c.CouponRef).OfType<string>().Distinct())
             await RevenueOutbox.EnqueueAsync(db, receipt.TenantId, "RECEIPT", receipt.ReceiptId, RevenueOutbox.CouponRevoked,

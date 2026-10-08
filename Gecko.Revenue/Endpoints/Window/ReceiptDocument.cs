@@ -72,7 +72,8 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
                 seller.TaxId, seller.TaxBranchNo, seller.IsHeadOffice, seller.Address, seller.Phone, seller.Email),
             receipt.VoidedAt is { } voided && branch is not null ? branch.Local(voided) : receipt.VoidedAt, receipt.VoidReason,
             replaces, replacedBy,
-            receipt.WithholdingTaxRate, receipt.WithholdingTaxAmount, receipt.TotalAmount - receipt.WithholdingTaxAmount);
+            receipt.WithholdingTaxRate, receipt.WithholdingTaxAmount, receipt.TotalAmount - receipt.WithholdingTaxAmount,
+            receipt.PayerPartyCode, receipt.Remarks);
     }
 
     public async Task<Rendered?> RenderAsync(Guid receiptId, CancellationToken ct)

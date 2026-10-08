@@ -83,6 +83,7 @@ public static class RevenueModule
             .MapChargeEndpoints()
             .MapInvoiceEndpoints()
             .MapManualChargeEndpoints()
+            .MapCashBillEndpoints()
             .MapUnbilledOrderEndpoints()
             .MapReceiptReportEndpoints();
 

@@ -220,7 +220,11 @@ public sealed record UpdateContainerLineRequest(
     [property: MaxLength(20)] string? StowageNo = null,
     bool? IsPreCool = null,
     [property: MaxLength(500)] string? Remarks = null,
-    [property: MaxLength(20)] string? HandoverMode = null);
+    [property: MaxLength(20)] string? HandoverMode = null,
+    // Owner 2026-10-08: change the box's size/type (e.g. 20GP → 20RF) until it has done a gate move or has
+    // something paid at the window. The box moves to the booking's line of that type (one more place there,
+    // or a new line); its old line gives the place back. Null = keep the type.
+    [property: MaxLength(10)] string? EquipmentTypeCode = null);
 
 /// <summary>
 /// Move boxes to another OPEN booking of the same branch and order type (Vector "Transfer

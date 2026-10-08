@@ -162,7 +162,8 @@ public sealed record ReceiptResponse(
     DateTimeOffset? VoidedAt, string? VoidReason,
     string? ReplacesReceiptNo = null, string? ReplacedByReceiptNo = null,
     // Withholding tax the payer kept back (0 = none). Total is the tax invoice's; NettAmount is what was paid.
-    decimal? WithholdingTaxRate = null, decimal WithholdingTaxAmount = 0, decimal NettAmount = 0);
+    decimal? WithholdingTaxRate = null, decimal WithholdingTaxAmount = 0, decimal NettAmount = 0,
+    string? PayerPartyCode = null, string? Remarks = null);
 
 /// <summary>
 /// The seller block of the tax invoice, exactly as MDM holds it. A null field is

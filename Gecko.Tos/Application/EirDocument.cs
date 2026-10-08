@@ -1,4 +1,6 @@
+using System.Globalization;
 using Gecko.Data.Documents;
+using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.Tos.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -9,20 +11,27 @@ using QuestPDF.Infrastructure;
 namespace Gecko.Tos.Application;
 
 /// <summary>
-/// The printed EIR (PLAN 5.6): the document the driver walks away with, and in
-/// Thailand a numbered document — so a VOIDED EIR still prints, with its number
-/// and a VOID mark, never as if it had not existed (Q4).
+/// The printed EIR, laid out as KORAKIT's Vector report TMS_EIRForm.rdl (owner 2026-10-08: exactly the RDL's).
+/// The RDL is an overlay for pre-printed EIR stationery: it prints no labels, lines or logo — only the move's
+/// values, each at its own position on a 102.3mm block, on a Letter page with 0.2in margins and an empty
+/// 0.52in header. Data is Report.usp_EIR's, read from Gecko's move (gecko_tos), its booking, truck visit,
+/// seals and survey; names are MDM's and Identity's at print time; times the branch's clock.
 ///
-/// Everything on it comes from gecko_tos rows written at the barrier, plus party
-/// NAMES from MDM (read at print time: a name is a label, not a fact of the move).
-/// Times are the BRANCH's clock — a 23:40 gate-in in Laem Chabang is the 23rd there.
-///
-/// PDPA: the driver's name and the truck plate are on it because they are on the
-/// paper EIR today; the licence number is not (only its hash is stored).
+/// Gecko addition the RDL has no rule against: a VOIDED EIR keeps its number and still prints, under the
+/// VOID watermark — in Thailand a numbered document never just disappears (Q4).
 /// </summary>
-internal sealed class EirDocument(TosDbContext db, IMasterDataReferences master, BranchClock clock)
+internal sealed class EirDocument(TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock)
 {
     public sealed record Rendered(string FileName, byte[] Pdf);
+
+    /// <summary>One EIR block, every value as Report.usp_EIR returns it and the RDL prints it.</summary>
+    internal sealed record Sheet(
+        string ContainerNo, string SizeType, string MovementCode,
+        string AgentName, string BookingBlNo, string ShipperName, string Wharf,
+        string VesselName, string VoyageNo, string TruckName, string TruckNo,
+        string SealNo1, string NextPrevLoc, string Temperature, string CustomPermitNo, string SetTemp,
+        string ContainerStatus, string Remarks, IReadOnlyList<string> Damages,
+        string CreatedOnDate, string CreatedOnTime, string CreatedBy, bool IsVoided);
 
     public async Task<Rendered?> RenderAsync(Guid gateTransactionId, CancellationToken ct)
     {
@@ -30,176 +39,163 @@ internal sealed class EirDocument(TosDbContext db, IMasterDataReferences master,
             from t in db.GateTransactions.AsNoTracking().Where(x => x.GateTransactionId == gateTransactionId)
             join b in db.Bookings on t.BookingId equals b.BookingId
             join v in db.TruckVisits on t.TruckVisitId equals v.TruckVisitId
-            select new { g = t, b.OrderNo, b.OrderTypeCode, b.CustomerPartyCode, b.HaulierPartyCode, b.CustomerRef, v.TruckPlate, v.TrailerPlate, v.DriverName, v.VisitNo })
+            join bc in db.BookingContainers on t.BookingContainerId equals bc.BookingContainerId
+            join r in db.EquipmentRequirements on bc.EquipmentRequirementId equals r.EquipmentRequirementId
+            join vc in db.VesselCalls on b.VesselCallId equals vc.VesselCallId into calls
+            from vc in calls.DefaultIfEmpty()
+            select new { g = t, b, v.TruckPlate, Haulier = v.HaulierPartyCode ?? b.HaulierPartyCode, SetTemp = bc.ReeferSetTempC ?? r.ReeferSetTempC, Call = vc })
             .SingleOrDefaultAsync(ct);
         if (row is null) return null;
         var g = row.g;
 
-        var seals = await db.GateTransactionSeals.AsNoTracking().Where(s => s.GateTransactionId == g.GateTransactionId)
-            .OrderBy(s => s.SealType).Select(s => new { s.SealType, s.SealNo, s.IsIntact }).ToListAsync(ct);
-        var survey = await db.Surveys.AsNoTracking().Where(s => s.GateTransactionId == g.GateTransactionId)
+        var seals = await db.GateTransactionSeals.AsNoTracking()
+            .Where(s => s.GateTransactionId == g.GateTransactionId && s.DeletedAt == null)
+            .OrderBy(s => s.CreatedAt).Select(s => new { s.SealType, s.SealNo }).ToListAsync(ct);
+        var survey = await db.Surveys.AsNoTracking().Where(s => s.GateTransactionId == g.GateTransactionId && s.DeletedAt == null)
             .OrderByDescending(s => s.SurveyedAt).FirstOrDefaultAsync(ct);
         var damages = survey is null ? [] : await db.SurveyDamages.AsNoTracking()
-            .Where(d => d.SurveyId == survey.SurveyId).OrderBy(d => d.LineNo).ToListAsync(ct);
-        var replaced = g.ReplacesGateTransactionId is { } r
-            ? await db.GateTransactions.AsNoTracking().Where(x => x.GateTransactionId == r).Select(x => x.EirNo).SingleOrDefaultAsync(ct)
-            : null;
+            .Where(d => d.SurveyId == survey.SurveyId && d.DeletedAt == null).OrderBy(d => d.LineNo).ToListAsync(ct);
+        var codes = damages.Count == 0 ? null : await master.SurveyCodesAsync(ct);
 
-        var parties = await master.PartiesAsync(new[] { g.LinePartyCode, row.CustomerPartyCode, row.HaulierPartyCode }.OfType<string>(), ct);
-        string Party(string? code) => code is null ? "—" : parties.TryGetValue(code, out var p) ? $"{p.Name} ({code})" : code;
-
+        var parties = await master.PartiesAsync(new[] { g.LinePartyCode, row.b.CustomerPartyCode, row.Haulier }.OfType<string>(), ct);
+        string Name(string? code) => code is not null && parties.TryGetValue(code, out var p) ? p.Name : code ?? "";
+        var vessel = row.Call?.VesselCode is { } vesselCode ? (await master.VesselsAsync([vesselCode], ct)).GetValueOrDefault(vesselCode) : null;
+        var createdBy = g.CreatedBy is { } by ? (await users.DisplayNamesAsync([by], ct)).GetValueOrDefault(by) : null;
         var branch = (await clock.BranchesAsync([g.BranchId], ct)).GetValueOrDefault(g.BranchId);
-        string Local(DateTimeOffset at) => (branch is null ? at : TimeZoneInfo.ConvertTime(at, branch.Zone)).ToString("dd MMM yyyy  HH:mm");
+        var at = branch is null ? g.TransactionAt : TimeZoneInfo.ConvertTime(g.TransactionAt, branch.Zone);
 
-        GeckoPdf.EnsureInitialised();
-        var isIn = g.Direction == "IN";
-        var voided = g.Status == "VOIDED";
+        var bookingType = row.b.BookingTypeCode;
+        var movement = Movement(g.MovementCode);
+        var sheet = new Sheet(
+            ContainerNo: g.ContainerNo,
+            SizeType: g.EquipmentTypeCode ?? "",
+            MovementCode: $"{bookingType} {movement}",
+            AgentName: Name(g.LinePartyCode),
+            BookingBlNo: row.b.CarrierRef ?? row.b.CustomerRef ?? "",
+            ShipperName: Name(row.b.CustomerPartyCode),
+            Wharf: Wharf(bookingType, movement, row.Call?.TerminalCode),
+            VesselName: vessel?.VesselName ?? "",
+            VoyageNo: (row.b.DirectionCode == "EXPORT" ? row.Call?.OperatorVoyageOut ?? row.Call?.OperatorVoyageIn : row.Call?.OperatorVoyageIn ?? row.Call?.OperatorVoyageOut) ?? "",
+            TruckName: Name(row.Haulier),
+            TruckNo: row.TruckPlate,
+            SealNo1: seals.FirstOrDefault(s => s.SealType is "LINE" or "AGENT")?.SealNo ?? "",
+            NextPrevLoc: g.NextLocationCode ?? row.b.NextPrevLocation ?? "",
+            Temperature: Number(g.TempObservedC),
+            CustomPermitNo: bookingType == "IMPORT" ? g.CustomsPermitNo ?? "" : "",
+            SetTemp: Number(row.SetTemp),
+            ContainerStatus: g.ConditionCode ?? "",
+            Remarks: g.Remarks ?? "",
+            Damages: damages.Select(d => Damage(d.ComponentCode, d.DamageLocationCode, d.DamageCode,
+                codes?.DamageCodes.GetValueOrDefault(d.DamageCode)?.DescriptionEn)).ToList(),
+            CreatedOnDate: at.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture),
+            CreatedOnTime: at.ToString("H:mm", CultureInfo.InvariantCulture),
+            CreatedBy: createdBy ?? "",
+            IsVoided: g.Status == "VOIDED");
 
-        var pdf = Document.Create(document => document.Page(page =>
-        {
-            GeckoPdf.Page(page);
-
-            page.Header().Row(header =>
-            {
-                header.RelativeItem().Column(c =>
-                {
-                    c.Item().Text("EQUIPMENT INTERCHANGE RECEIPT").FontSize(15).Bold();
-                    c.Item().Text("ใบรับ-ส่งตู้คอนเทนเนอร์ (EIR)").FontSize(10);
-                    c.Item().Text($"Depot {branch?.BranchCode ?? g.BranchId.ToString()}").FontColor(Colors.Grey.Darken2);
-                });
-                header.ConstantItem(200).AlignRight().Column(c =>
-                {
-                    c.Item().AlignRight().Text(g.EirNo).FontSize(14).Bold();
-                    c.Item().AlignRight().Text($"{(isIn ? "GATE IN" : "GATE OUT")} · {g.MovementCode}").FontSize(11).SemiBold()
-                        .FontColor(isIn ? Colors.Green.Darken2 : Colors.Blue.Darken2);
-                    c.Item().AlignRight().Text(Local(g.TransactionAt));
-                    if (voided) c.Item().AlignRight().Text("VOIDED").Bold().FontColor(Colors.Red.Darken2);
-                });
-            });
-
-            page.Content().PaddingTop(12).Column(body =>
-            {
-                body.Spacing(10);
-
-                body.Item().Border(1).BorderColor(Colors.Grey.Lighten1).Padding(8).Row(box =>
-                {
-                    box.RelativeItem(2).Column(c =>
-                    {
-                        c.Item().Text(Pretty(g.ContainerNo)).FontSize(20).Bold();
-                        c.Item().Text(g.IsCheckDigitValid ? "Check digit OK" : $"CHECK DIGIT FAILED — {g.CheckDigitOverrideReason}")
-                            .FontSize(7).FontColor(g.IsCheckDigitValid ? Colors.Grey.Darken1 : Colors.Red.Darken2);
-                    });
-                    box.RelativeItem().Column(c => { c.Field("Type", g.EquipmentTypeCode); c.Field("ISO", g.IsoCode); });
-                    box.RelativeItem().Column(c => { c.Field("Full / empty", g.FullEmpty); c.Field("Line", g.LinePartyCode); });
-                });
-
-                body.Item().Row(parts =>
-                {
-                    parts.RelativeItem().Column(c =>
-                    {
-                        c.Spacing(3);
-                        c.Item().Text("BOOKING").FontSize(8).Bold().FontColor(Colors.Grey.Darken2);
-                        c.Field("Order", $"{row.OrderNo}  ({row.OrderTypeCode})");
-                        c.Field("Customer ref", row.CustomerRef);
-                        c.Field("Customer", Party(row.CustomerPartyCode));
-                        c.Field("Line", Party(g.LinePartyCode));
-                    });
-                    parts.ConstantItem(16);
-                    parts.RelativeItem().Column(c =>
-                    {
-                        c.Spacing(3);
-                        c.Item().Text("TRUCK").FontSize(8).Bold().FontColor(Colors.Grey.Darken2);
-                        c.Field("Plate", row.TrailerPlate is null ? row.TruckPlate : $"{row.TruckPlate} / {row.TrailerPlate}");
-                        c.Field("Driver", row.DriverName);
-                        c.Field("Haulier", Party(row.HaulierPartyCode));
-                        c.Field("Visit", row.VisitNo);
-                    });
-                });
-
-                body.Item().Row(facts =>
-                {
-                    facts.RelativeItem().Column(c =>
-                    {
-                        c.Spacing(3);
-                        c.Item().Text("CONDITION").FontSize(8).Bold().FontColor(Colors.Grey.Darken2);
-                        c.Field("Condition / grade", $"{g.ConditionCode ?? "—"} / {g.GradeCode ?? "—"}");
-                        c.Field("Gross weight", g.GrossWeightKg is { } kg ? $"{kg:N0} kg ({g.WeightSource ?? "declared"})" : null);
-                        c.Field("VGM", g.VgmKg is { } vgm ? $"{vgm:N0} kg {g.VgmMethod}" : null);
-                        c.Field("Reefer temp", g.TempObservedC is { } t ? $"{t:0.0} °C" : null);
-                        c.Field("Yard position", g.PositionText);
-                    });
-                    facts.ConstantItem(16);
-                    facts.RelativeItem().Column(c =>
-                    {
-                        c.Spacing(3);
-                        c.Item().Text("SEALS").FontSize(8).Bold().FontColor(Colors.Grey.Darken2);
-                        if (seals.Count == 0) c.Item().Text("No seal recorded");
-                        foreach (var s in seals)
-                            c.Field(s.SealType, s.IsIntact ? s.SealNo : $"{s.SealNo}  — NOT INTACT");
-                        if (g.SealMismatch) c.Item().Text("Seal differs from the one declared on the booking.").FontColor(Colors.Red.Darken2);
-                    });
-                });
-
-                if (survey is not null)
-                    body.Item().Column(c =>
-                    {
-                        c.Item().Text($"SURVEY · {(survey.IsServiceable ? "serviceable" : "NOT SERVICEABLE")} · {survey.SurveyorName}")
-                            .FontSize(8).Bold().FontColor(survey.IsServiceable ? Colors.Grey.Darken2 : Colors.Red.Darken2);
-                        if (damages.Count == 0) c.Item().Text("No damage found.");
-                        else c.Item().Table(table =>
-                        {
-                            table.ColumnsDefinition(cols => { cols.ConstantColumn(24); cols.RelativeColumn(); cols.RelativeColumn(); cols.RelativeColumn(); cols.RelativeColumn(); cols.RelativeColumn(2); });
-                            table.Header(h =>
-                            {
-                                foreach (var title in new[] { "#", "Location", "Component", "Damage", "Size (cm)", "Remarks" })
-                                    h.Cell().BorderBottom(1).PaddingBottom(2).Text(title).FontSize(7).Bold();
-                            });
-                            foreach (var d in damages)
-                            {
-                                table.Cell().Text(d.LineNo.ToString());
-                                table.Cell().Text(d.DamageLocationCode ?? "—");
-                                table.Cell().Text(d.ComponentCode ?? "—");
-                                table.Cell().Text(d.DamageCode + (d.IsPreExisting ? " (existing)" : ""));
-                                table.Cell().Text(d.LengthCm is null ? "—" : $"{d.LengthCm:0} × {d.WidthCm:0}");
-                                table.Cell().Text(d.Remarks ?? "");
-                            }
-                        });
-                    });
-
-                var notes = new List<string>();
-                if (g.IsLate) notes.Add($"Accepted after the {g.CutoffKindApplied} cut-off ({(g.CutoffAtApplied is { } at ? Local(at) : "?")})" +
-                                        (g.LateOverrideReason is { } why ? $" — override: {why}" : " — by exception"));
-                if (replaced is not null) notes.Add($"Replaces EIR {replaced}.");
-                if (voided) notes.Add($"VOIDED {(g.VoidedAt is { } va ? Local(va) : "")} — {g.VoidReason}");
-                if (!string.IsNullOrWhiteSpace(g.Remarks)) notes.Add(g.Remarks);
-                if (notes.Count > 0)
-                    body.Item().Column(c => { foreach (var n in notes) c.Item().Text(n).Italic(); });
-
-                body.Item().PaddingTop(28).Row(sign =>
-                {
-                    foreach (var who in new[] { "Driver / ผู้ขับรถ", "Gate clerk / เจ้าหน้าที่" })
-                    {
-                        sign.RelativeItem().Column(c =>
-                        {
-                            c.Item().PaddingTop(24).BorderTop(1).BorderColor(Colors.Grey.Darken1);
-                            c.Item().AlignCenter().Text(who).FontSize(8);
-                        });
-                        sign.ConstantItem(40);
-                    }
-                });
-            });
-
-            if (voided) page.Foreground().VoidWatermark();
-
-            page.Footer().Row(f =>
-            {
-                f.RelativeItem().Text($"Recorded {Local(g.RecordedAt)} · GECKO").FontSize(7).FontColor(Colors.Grey.Darken1);
-                f.RelativeItem().AlignRight().Text(t => { t.Span("Page ").FontSize(7); t.CurrentPageNumber().FontSize(7); });
-            });
-        })).GeneratePdf();
-
-        return new Rendered($"{g.EirNo}.pdf", pdf);
+        return new Rendered($"{g.EirNo}.pdf", Render([sheet]));
     }
 
-    private static string Pretty(string box) => box.Length == 11 ? $"{box[..4]} {box[4..10]} {box[10..]}" : box;
+    // ── the RDL's expressions ───────────────────────────────────────────────
+
+    /// <summary>Vector's movement codes read "FULL OUT"; Gecko's are the same words joined ("FULL_OUT").</summary>
+    internal static string Movement(string code) => code.Replace('_', ' ');
+
+    /// <summary><c>=IIF(LookupCode="EXPORT" And MovementCode="FULL OUT", "WHARF : " + Terminal, "")</c>.</summary>
+    internal static string Wharf(string bookingType, string movement, string? terminal) =>
+        bookingType == "EXPORT" && movement == "FULL OUT" ? "WHARF : " + (terminal ?? "") : "";
+
+    /// <summary>Vector's numeric(5,2) as SSRS prints it unformatted: two decimals. Nothing recorded prints nothing.</summary>
+    internal static string Number(decimal? value) => value?.ToString("0.00", CultureInfo.InvariantCulture) ?? "";
+
+    /// <summary>
+    /// One line of the RDL's damage list (Tablix1, =Fields!LookupDescription.Value, a row per damage of the move):
+    /// Vector named the damaged part; Gecko records part, location and damage — printed in that order, the damage
+    /// by its MDM description.
+    /// </summary>
+    internal static string Damage(string? component, string? location, string damageCode, string? description) =>
+        string.Join(" ", new[] { component, location, description ?? damageCode }.Where(s => !string.IsNullOrWhiteSpace(s)));
+
+    // ── the layout, in the RDL's own coordinates ────────────────────────────
+
+    private const string Black = "#000000";
+    private const float Mm = 72f / 25.4f;
+    private const float Inch = 72f;
+
+    /// <summary>Letter portrait, 0.2in margins, an empty 0.52083in page header; Tablix3 a 102.3181mm block per move.</summary>
+    internal static byte[] Render(IReadOnlyList<Sheet> sheets)
+    {
+        GeckoPdf.EnsureInitialised();
+        return Document.Create(document => document.Page(page =>
+        {
+            page.Size(PageSizes.Letter);
+            page.Margin(0.2f, Unit.Inch);
+            page.DefaultTextStyle(t => t.FontSize(8).FontFamily(GeckoPdf.LatinFont, GeckoPdf.ThaiFont).FontColor(Black));
+            page.Header().Height(0.52083f, Unit.Inch);
+            page.Content().Column(column =>
+            {
+                foreach (var sheet in sheets)
+                    column.Item().Width(192.15668f * Mm).Height(102.3181f * Mm).Layers(layers =>
+                    {
+                        layers.PrimaryLayer();
+                        if (sheet.IsVoided) layers.Layer().VoidWatermark();
+                        Block(layers, sheet);
+                    });
+            });
+        })).GeneratePdf();
+    }
+
+    /// <summary>Rectangle1 (top 0.21448mm, left 2.60485mm) and Rectangle2 inside it (top 6.89958mm): every Textbox at its RDL place.</summary>
+    private static void Block(LayersDescriptor layers, Sheet s)
+    {
+        const float r1Top = 0.21448f, r1Left = 2.60485f;
+        void InR1(float top, float left, float width, string text, float size = 8, bool bold = false, bool center = false) =>
+            Box(layers, (r1Top + top) * Mm, (r1Left + left) * Mm, width * Mm, text, size, bold, center);
+        const float r2Top = r1Top + 6.89958f, r2Left = r1Left;
+        void InR2(float top, float left, float width, string text, bool center = false) =>
+            Box(layers, (r2Top + top) * Mm, (r2Left + left) * Mm, width * Mm, text, 8, false, center);
+
+        // The top line: container, size/type, booking type + movement.
+        InR1(0.3175f, 43.60903f, 30.02708f, s.ContainerNo, size: 9, bold: true);
+        InR1(0.3175f, 103.75764f, 14.94583f, s.SizeType);
+        InR1(0.3175f, 149.61249f, 37.2935f, s.MovementCode);
+
+        // Rectangle2: the parties, the ship, the truck, the seal and the reefer.
+        InR2(0.79375f, 30.34458f, 111.57735f, s.AgentName);
+        InR2(6.79375f, 48.28333f, 37.71547f, s.BookingBlNo);
+        InR2(13.09639f, 143.52707f, 43.37892f, s.Wharf, center: true);
+        InR2(13.46403f, 47.93056f, 73.68333f, s.ShipperName);
+        InR2(20.73403f, 28.57854f, 71.82771f, s.VesselName);
+        InR2(20.73403f, 115.21096f, 18.45575f, s.VoyageNo);
+        InR2(27.05153f, 28.57854f, 74.47354f, s.TruckName);
+        InR2(27.40431f, 127.47568f, 22.09584f, s.TruckNo);
+        InR2(34.445f, 28.57854f, 25.56445f, s.SealNo1);
+        InR2(34.445f, 149.61249f, 22.08958f, s.NextPrevLoc);
+        Box(layers, (r2Top + 0) * Mm + 1.3561f * Inch, r2Left * Mm + 2.85545f * Inch, 1.46883f * Inch, s.CustomPermitNo, 8, false, false);
+        InR2(41.59153f, 36.72986f, 15.73958f, s.Temperature);
+        Box(layers, r2Top * Mm + 1.6458f * Inch, r2Left * Mm + 3.28856f * Inch, 0.53107f * Inch, s.SetTemp, 8, false, false);
+
+        // Condition, remarks, the damage list, then when and by whom.
+        InR1(59.26944f, 48.63611f, 37.96242f, s.ContainerStatus);
+        InR1(69.62069f, 39.11111f, 116.14582f, s.Remarks);
+        layers.Layer().PaddingTop(r1Top * Mm + 2.98406f * Inch).PaddingLeft(r1Left * Mm + 1.54203f * Inch).AlignTop().AlignLeft()
+            .Width(4.575f * Inch).Column(c =>
+            {
+                foreach (var damage in s.Damages) c.Item().MinHeight(0.1875f * Inch).PaddingLeft(2).PaddingTop(2).Text(damage).FontSize(8);
+            });
+        InR1(90.73584f, 35.10708f, 36.7418f, s.CreatedOnDate);
+        InR1(96.73862f, 35.10708f, 36.7418f, s.CreatedOnTime);
+        InR1(96.73584f, 156.7625f, 25f, s.CreatedBy);
+    }
+
+    /// <summary>An RDL Textbox: no border, 2pt left and top padding, CanGrow (wraps downward inside its width).</summary>
+    private static void Box(LayersDescriptor layers, float top, float left, float width, string text, float size, bool bold, bool center)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        var cell = layers.Layer().PaddingTop(top).PaddingLeft(left).AlignTop().AlignLeft().Width(width).PaddingLeft(2).PaddingTop(2);
+        (center ? cell.AlignCenter() : cell.AlignLeft()).Text(t =>
+        {
+            var span = t.Span(text).FontSize(size);
+            if (bold) span.Bold();
+        });
+    }
 }

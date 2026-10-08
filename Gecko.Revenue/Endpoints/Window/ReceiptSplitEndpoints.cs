@@ -18,7 +18,7 @@ namespace Gecko.Revenue.Endpoints.Window;
 /// to several payers — some charges to another customer, the rest to the haulier. The money taken
 /// does not change; the tax invoices do.
 ///   * gate receipts only (issued_from GATE), ISSUED, and only on the day they were issued;
-///   * every line goes to exactly one part, two parts at least; each part is a NEW receipt
+///   * every line goes to exactly one part; ONE part is a re-issue to another payer; each part is a NEW receipt
 ///     (CA + branch + YYMM + 5) naming the original (split_from_receipt_id);
 ///   * the original is cancelled "Split into …" — its coupons are NOT withdrawn and the charges
 ///     keep their status (the boxes have moved): they are re-pointed to the parts, with the part's payer;
@@ -61,7 +61,7 @@ internal static class ReceiptSplitEndpoints
         var errors = new Dictionary<string, List<string>>();
         void Add(string key, string message) { if (!errors.TryGetValue(key, out var list)) errors[key] = list = []; list.Add(message); }
         var parts = request.Parts ?? [];
-        if (parts.Count < 2) Add("parts", "Split into two parts at least.");
+        if (parts.Count < 1) Add("parts", "A split needs a part at least.");   // one part = re-issue to another payer
         var taken = parts.SelectMany(p => p.LineNos ?? []).ToList();
         if (taken.Count != taken.Distinct().Count()) Add("parts", "A line is in two parts.");
         var known = lines.Select(l => l.LineNo).ToHashSet();
@@ -181,7 +181,7 @@ internal static class ReceiptSplitEndpoints
 
         // The original is cancelled, naming its parts (only the void columns may change on a receipt).
         var into = string.Join(", ", issued.Select(i => i.Receipt.ReceiptNo));
-        var reason = $"Split into {into}" + (string.IsNullOrWhiteSpace(request.Remarks) ? "" : $": {request.Remarks.Trim()}");
+        var reason = (issued.Count == 1 ? $"Re-issued as {into}" : $"Split into {into}") + (string.IsNullOrWhiteSpace(request.Remarks) ? "" : $": {request.Remarks.Trim()}");
         if (reason.Length > 300) reason = reason[..300];
         var cancelled = await db.Receipts.Where(r => r.ReceiptId == id && r.Status == "ISSUED")
             .ExecuteUpdateAsync(s => s

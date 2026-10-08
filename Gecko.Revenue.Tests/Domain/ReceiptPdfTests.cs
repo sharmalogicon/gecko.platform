@@ -64,6 +64,21 @@ public sealed class ReceiptPdfTests
         Assert.Equal("%PDF"u8.ToArray(), pdf[..4]);
     }
 
+    /// <summary>Owner 2026-10-09: the bill prints the withholding tax kept back and the net paid, and the truck's haulier.</summary>
+    [Fact]
+    public void A_bill_with_withholding_tax_and_a_haulier_renders()
+    {
+        var facts = new ReceiptPrintFacts("+66 0 0000 0000", "บริษัท ขนส่ง จำกัด", new Dictionary<string, string>());
+        var receipt = Receipt("ISSUED", FullSeller);
+        var withheld = receipt with
+        {
+            WithholdingTaxRate = 3m, WithholdingTaxAmount = Math.Round(receipt.Subtotal * 0.03m, 2),
+            NettAmount = receipt.Total - Math.Round(receipt.Subtotal * 0.03m, 2),
+        };
+
+        Assert.Equal("%PDF"u8.ToArray(), ReceiptDocument.Render(withheld, facts)[..4]);
+    }
+
     [Theory]
     [InlineData("ISSUED")]
     [InlineData("VOIDED")]

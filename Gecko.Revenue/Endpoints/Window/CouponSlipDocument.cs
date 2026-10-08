@@ -17,7 +17,7 @@ namespace Gecko.Revenue.Endpoints.Window;
 /// Two deliberate differences: the bill's total is the receipt's total (the RDL summed the header total over every line,
 /// so a two-line bill printed it twice); and a VOIDED receipt carries the VOID mark.
 /// </summary>
-internal sealed class CouponSlipDocument(ReceiptDocument receipts, IMasterDataReferences master)
+internal sealed class CouponSlipDocument(ReceiptDocument receipts)
 {
     public sealed record Rendered(string FileName, byte[] Pdf);
 
@@ -28,7 +28,7 @@ internal sealed class CouponSlipDocument(ReceiptDocument receipts, IMasterDataRe
     {
         var r = await receipts.ReadAsync(receiptId, ct);
         if (r is null) return null;
-        var facts = await ReceiptDocument.PrintFactsAsync(r, master, ct);
+        var facts = await receipts.PrintFactsAsync(r, ct);
         return new Rendered($"{r.ReceiptNo.Replace('/', '-')}-coupons.pdf", Render(r, facts));
     }
 

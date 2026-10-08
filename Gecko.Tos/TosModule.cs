@@ -50,6 +50,7 @@ public static class TosModule
         services.AddScoped<BarrierReader>();
         services.AddScoped<Gecko.Tos.Contracts.ITosBookingHeaders, TosBookingHeaders>();
         services.AddScoped<Gecko.Tos.Contracts.ITosGateCoupons, TosGateCoupons>();
+        services.AddScoped<Gecko.Tos.Contracts.ITosTruckVisits, TosTruckVisits>();
         services.AddScoped<EirDocument>();
         services.AddScoped<TruckInDocument>();
         services.AddGeckoFileStore(configuration);

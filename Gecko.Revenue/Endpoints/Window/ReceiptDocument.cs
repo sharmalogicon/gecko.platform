@@ -3,6 +3,7 @@ using Gecko.Data.Documents;
 using Gecko.MasterData.Contracts;
 using Gecko.Revenue.Application;
 using Gecko.Revenue.Infrastructure.Persistence;
+using Gecko.Tos.Contracts;
 using Microsoft.EntityFrameworkCore;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
@@ -22,7 +23,7 @@ namespace Gecko.Revenue.Endpoints.Window;
 /// A VOIDED receipt still prints, with its number and the VOID mark: in Thailand a
 /// tax-invoice number that vanishes is a gap the Revenue Department asks about.
 /// </summary>
-internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences master, BranchCalendar calendar)
+internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences master, BranchCalendar calendar, ITosTruckVisits trucks)
 {
     public sealed record Rendered(string FileName, byte[] Pdf);
 
@@ -85,19 +86,28 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
     public async Task<Rendered?> RenderAsync(Guid receiptId, CancellationToken ct)
     {
         var r = await ReadAsync(receiptId, ct);
-        return r is null ? null : new Rendered($"{r.ReceiptNo.Replace('/', '-')}.pdf", Render(r, await PrintFactsAsync(r, master, ct)));
+        return r is null ? null : new Rendered($"{r.ReceiptNo.Replace('/', '-')}.pdf", Render(r, await PrintFactsAsync(r, ct)));
     }
 
-    /// <summary>What the printed bill shows beyond the receipt itself, read from MDM at print time: the payer's phone and the
-    /// charge names Vector printed (its Master.ChargeCode description — MDM's local description, else the English one).</summary>
-    internal static async Task<ReceiptPrintFacts> PrintFactsAsync(ReceiptResponse r, IMasterDataReferences master, CancellationToken ct)
+    /// <summary>What the printed bill shows beyond the receipt itself, read at print time: the payer's phone and the
+    /// charge names Vector printed (its Master.ChargeCode description — MDM's local description, else the English one),
+    /// and the haulier of the truck(s) the receipt's charges were raised for (TOS, owner 2026-10-09).</summary>
+    internal async Task<ReceiptPrintFacts> PrintFactsAsync(ReceiptResponse r, CancellationToken ct)
     {
-        var phone = r.PayerPartyCode is { } payer ? (await master.PartiesAsync([payer], ct)).GetValueOrDefault(payer)?.Phone : null;
+        var visitIds = await db.Charges.AsNoTracking()
+            .Where(c => c.ReceiptId == r.ReceiptId && c.TruckVisitId != null)
+            .Select(c => c.TruckVisitId!.Value).Distinct().ToListAsync(ct);
+        var hauliers = (await trucks.VisitsAsync(visitIds, ct)).Values.Select(v => v.HaulierCode).OfType<string>().Distinct().ToList();
+        var partyCodes = hauliers.Concat(r.PayerPartyCode is { } p ? [p] : Array.Empty<string>()).Distinct().ToList();
+        var parties = partyCodes.Count == 0 ? new Dictionary<string, PartyRef>() : await master.PartiesAsync(partyCodes, ct);
+        var phone = r.PayerPartyCode is { } payer ? parties.GetValueOrDefault(payer)?.Phone : null;
+        var haulierName = hauliers.Count == 0 ? null
+            : string.Join(", ", hauliers.Select(h => parties.GetValueOrDefault(h)?.Name ?? h).Distinct());
         var codes = r.Lines.Select(l => l.ChargeCode).Distinct().ToList();
         IReadOnlyDictionary<string, string> names = codes.Count == 0 ? new Dictionary<string, string>() : (await master.ChargeVariantsAsync(codes, ct))
             .GroupBy(v => v.ChargeCode, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First().DescriptionLocal ?? g.First().DescriptionEn, StringComparer.OrdinalIgnoreCase);
-        return new ReceiptPrintFacts(phone, null, names);
+        return new ReceiptPrintFacts(phone, haulierName, names);
     }
 
     // ── the KPS full tax invoice (TMS.Operation.Gate.FullTaxInvoice(KPS).rdl, Report.usp_Operation_FullTaxInvoiceReceiptKPS) ──
@@ -227,10 +237,21 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
                     Total("จำนวนเงินหลังหักมัดจำ", "");
                     Total($"จำนวนภาษีมูลค่าเพิ่ม {vatRate.ToString("0.00", CultureInfo.InvariantCulture)}%", Plain(r.Tax));
 
-                    table.Cell().ColumnSpan(2).Box(left: true, bottom: true, minHeight: foot)
+                    // Withholding tax the payer kept back (owner 2026-10-09): two rows under the grand total, the block closing
+                    // on the net paid. A receipt without it prints exactly the RDL's block.
+                    var withheld = r.WithholdingTaxAmount != 0;
+                    table.Cell().ColumnSpan(2).Box(left: true, bottom: !withheld, minHeight: foot)
                         .Text(" " + VectorAmountInWords.ExpandPrice(r.Total).ToUpperInvariant());
-                    table.Cell().ColumnSpan(2).Box(right: true, bottom: true, minHeight: foot).AlignRight().Text("จำนวนเงินรวมทั้งสิ้น");
-                    table.Cell().Box(left: true, right: true, bottom: true, minHeight: foot).AlignRight().Text(Plain(r.Total));
+                    table.Cell().ColumnSpan(2).Box(right: true, bottom: !withheld, minHeight: foot).AlignRight().Text("จำนวนเงินรวมทั้งสิ้น");
+                    table.Cell().Box(left: true, right: true, bottom: !withheld, minHeight: foot).AlignRight().Text(Plain(r.Total));
+                    if (withheld)
+                    {
+                        var rate = r.WithholdingTaxRate is { } w ? $" {w.ToString("0.##", CultureInfo.InvariantCulture)}%" : "";
+                        Total($"หักภาษี ณ ที่จ่าย{rate}", Plain(r.WithholdingTaxAmount));
+                        table.Cell().ColumnSpan(2).Box(left: true, bottom: true, minHeight: foot);
+                        table.Cell().ColumnSpan(2).Box(right: true, bottom: true, minHeight: foot).AlignRight().Text("ยอดชำระสุทธิ");
+                        table.Cell().Box(left: true, right: true, bottom: true, minHeight: foot).AlignRight().Text(Plain(r.NettAmount));
+                    }
 
                     table.Cell().ColumnSpan(5).Box(left: true, right: true, minHeight: In(0.15625));
                     table.Cell().ColumnSpan(5).Box(left: true, right: true, minHeight: foot).Text("ได้รับสินค้าตามรายการข้างบนนี้ไว้ถูกต้อง");
@@ -256,6 +277,6 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
 }
 
 /// <param name="PayerPhone">MDM party.primary_phone of the payer — the bill's "โทร." line.</param>
-/// <param name="HaulierName">The truck's haulier — the bill's "ขนส่งโดย" line. TOS holds it and no contract carries it to Revenue yet: blank.</param>
+/// <param name="HaulierName">The haulier of the truck(s) the receipt was for (TOS) — the bill's "ขนส่งโดย" line.</param>
 /// <param name="ChargeNames">By charge code, the name Vector printed for it.</param>
 internal sealed record ReceiptPrintFacts(string? PayerPhone, string? HaulierName, IReadOnlyDictionary<string, string> ChargeNames);

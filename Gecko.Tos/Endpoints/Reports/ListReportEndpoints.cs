@@ -1,4 +1,4 @@
-using Gecko.Data;
+﻿using Gecko.Data;
 using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
@@ -93,7 +93,6 @@ internal static class ListReportEndpoints
     {
         var (context, refused) = await ContextAsync(branchId, format, clock, users, caller, scope, ct);
         if (refused is not null) return refused;
-        if (toDate < fromDate) return TosSupport.Invalid("toDate", "The last day is before the first.");
 
         var report = await InYardReports.EmptyAsync(db, master, context!.Branch, context.BranchName, context.PrintedBy, context.Now,
             clock.Today(context.Branch),
@@ -112,7 +111,6 @@ internal static class ListReportEndpoints
     {
         var (context, refused) = await ContextAsync(branchId, format, clock, users, caller, scope, ct);
         if (refused is not null) return refused;
-        if (toDate < fromDate) return TosSupport.Invalid("toDate", "The last day is before the first.");
 
         var report = await InYardReports.FullAsync(db, master, context!.Branch, context.BranchName, context.PrintedBy, context.Now,
             clock.Today(context.Branch),

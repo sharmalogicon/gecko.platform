@@ -8,7 +8,8 @@ namespace Gecko.Tos.Application.Reports;
 
 /// <summary>
 /// The in-yard reports' parameters: Vector's, with BranchID / YardLocation as Gecko's branch and yard.
-/// The dates are the gate-in day range (Vector's procs took them and printed them; Gecko applies them).
+/// The dates are printed in the heading and select nothing — Vector's procs took them and ignored them, and so does
+/// Gecko (owner 2026-10-09): the report is the whole stock standing now.
 /// </summary>
 internal sealed record InYardFilter(
     DateOnly? From = null, DateOnly? To = null,
@@ -82,8 +83,6 @@ internal static class InYardReports
         if (f.BookingBlNo?.Trim() is { Length: > 0 } blNo) rows = rows.Where(r => r.b.CarrierRef == blNo || r.b.CustomerRef == blNo || r.b.SubBlNo == blNo);
         if (Clean(f.HaulierCode) is { } haulier) rows = rows.Where(r => r.tv.HaulierPartyCode == haulier);
         if (f.YardId is { } yard) rows = rows.Where(r => r.v.YardId == yard);
-        if (f.From is { } from) { var at = BranchClock.StartOf(branch, from); rows = rows.Where(r => r.gi.TransactionAt >= at); }
-        if (f.To is { } to) { var at = BranchClock.StartOf(branch, to.AddDays(1)); rows = rows.Where(r => r.gi.TransactionAt < at); }
 
         return await rows.Select(r => new Box(
             r.gi.GateTransactionId, r.v.ContainerNo, r.v.LinePartyCode, r.v.EquipmentTypeCode, r.v.ConditionCode, r.v.GradeCode,

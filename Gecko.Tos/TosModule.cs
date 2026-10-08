@@ -73,6 +73,7 @@ public static class TosModule
             .MapTripEndpoints()
             .MapCorrectionEndpoints()
             .MapContainerStoryEndpoints()
+            .MapContainerInquiryEndpoints()
             .MapYardStockEndpoints()
             .MapReportEndpoints()
             .MapSurveyEndpoints()

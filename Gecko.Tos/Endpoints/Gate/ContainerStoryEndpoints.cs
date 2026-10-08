@@ -44,6 +44,13 @@ internal static class ContainerStoryEndpoints
         if (branchId is { } asked && !scope.HasAt(TosPermissions.GateView, asked))
             return TosScope.OutsideYourBranches("That depot is not one you cover.");
 
+        return TypedResults.Ok(await ReadAsync(box, branchId, db, clock, scope, time, ct));
+    }
+
+    /// <summary>The story of a well-formed, normalised number, inside the caller's depots. Also the container inquiry's.</summary>
+    internal static async Task<ContainerStoryResponse> ReadAsync(
+        string box, Guid? branchId, TosDbContext db, BranchClock clock, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
         // ── stays ────────────────────────────────────────────────────────────
         var visits = db.ContainerVisits.AsNoTracking().Where(v => v.ContainerNo == box);
         if (branchId is not null) visits = visits.Where(v => v.BranchId == branchId);
@@ -125,7 +132,7 @@ internal static class ContainerStoryEndpoints
             r.bc.AssignedAt, r.bc.EndedAt, r.bc.EndReason, r.bc.EndedAt is null)).ToList();
 
         var current = stayRows.FirstOrDefault(v => v.IsInYard);
-        return TypedResults.Ok(new ContainerStoryResponse(box, current is not null, current, stayRows, bookingRows));
+        return new ContainerStoryResponse(box, current is not null, current, stayRows, bookingRows);
     }
 }
 

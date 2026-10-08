@@ -89,6 +89,7 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
             var quoted = Assert.Single(expected.Boxes.Single().Lines, l => l.Charge.Status == "QUOTED");
             Assert.Equal(("GATEFEE", "FULL_OUT", 150.00m), (quoted.Charge.ChargeCode, quoted.Charge.MovementCode, quoted.Charge.Amount));
             Assert.Equal(160.50m, expected.Totals.ExpectedCash);
+            Assert.Equal(carrierRef, expected.CarrierRef);   // the header leads with the number the customer quotes
             Assert.Equal(160.50m, quote.Total);
 
             // "Today" is the DEPOT's day (Laem Chabang, +07:00), not the server's or the browser's.

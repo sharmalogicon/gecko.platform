@@ -116,6 +116,14 @@ internal static class HoldEndpoints
         if (!ContainerNumber.IsWellFormed(box))
             return TosSupport.Invalid("containerNo", $"'{containerNo}' is not a container number (4 to 11 letters or digits).");
 
+        var holds = await ActiveOnAsync(db, master, box, ct);
+        return TypedResults.Ok(new ContainerHoldsResponse(box, holds.Count > 0, holds));
+    }
+
+    /// <summary>The holds on a box right now, its own and its booking's, most urgent first. Also the container inquiry's.</summary>
+    internal static async Task<List<ActiveHoldResponse>> ActiveOnAsync(
+        TosDbContext db, IMasterDataReferences master, string box, CancellationToken ct)
+    {
         var active = await (
             from h in db.VwActiveHolds.AsNoTracking().Where(h => h.ContainerNo == box)
             join b in db.Bookings on h.BookingId equals b.BookingId into bookings
@@ -125,7 +133,7 @@ internal static class HoldEndpoints
 
         var definitions = await master.HoldsAsync(active.Select(x => x.h.HoldCode), ct);
 
-        var holds = active
+        return active
             .Select(x => new { x, d = definitions.GetValueOrDefault(x.h.HoldCode) })
             .OrderBy(x => x.d?.Priority ?? byte.MaxValue)
             .ThenBy(x => x.x.h.AppliedAt)
@@ -134,8 +142,6 @@ internal static class HoldEndpoints
                 x.d?.ReleaseAuthority, x.d?.Priority, x.d?.DisplayColorHex,
                 x.x.h.AppliedAt, x.x.h.ApplyReason, x.x.h.Source, x.x.h.HeldVia, x.x.h.BookingId, x.x.OrderNo))
             .ToList();
-
-        return TypedResults.Ok(new ContainerHoldsResponse(box, holds.Count > 0, holds));
     }
 
     // ── apply ───────────────────────────────────────────────────────────────

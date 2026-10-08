@@ -558,6 +558,8 @@ internal static class ChargeEndpoints
 
         var replacedBy = receipts.Where(r => r.ReplacesReceiptId is not null)
             .ToDictionary(r => r.ReplacesReceiptId!.Value, r => r.ReceiptNo);
+        // The numbers the customer quotes for this booking (2026-10-08): TOS's, as the unbilled register shows them.
+        var header = (await tos.HeadersAsync([plan.BookingId], ct)).GetValueOrDefault(plan.BookingId);
 
         return TypedResults.Ok(new BookingStatementResponse(
             plan.BookingId, plan.OrderNo, plan.BranchId, plan.Status, plan.OrderTypeCode,
@@ -568,7 +570,7 @@ internal static class ChargeEndpoints
                 r.VoidedAt, r.VoidReason,
                 r.ReplacesReceiptId is { } rep ? receiptNo.GetValueOrDefault(rep) : null,
                 replacedBy.GetValueOrDefault(r.ReceiptId))).ToList(),
-            Totals(lines)));
+            Totals(lines), header?.CarrierRef, header?.SubBlNo));
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -717,7 +719,9 @@ public sealed record StatementSearchHit(
 public sealed record BookingStatementResponse(
     Guid BookingId, string OrderNo, Guid BranchId, string BookingStatus, string OrderTypeCode,
     string? CustomerCode, string? CustomerName,
-    IReadOnlyList<StatementBoxResponse> Boxes, IReadOnlyList<StatementReceiptResponse> Receipts, StatementTotals Totals);
+    IReadOnlyList<StatementBoxResponse> Boxes, IReadOnlyList<StatementReceiptResponse> Receipts, StatementTotals Totals,
+    // The numbers the customer quotes for the booking (2026-10-08): the header leads with them, OrderNo behind.
+    string? CarrierRef = null, string? SubBlNo = null);
 
 /// <summary>Totals add across currencies only when there is one; the page shows them per payer.</summary>
 public sealed record UnbilledResponse(

@@ -91,6 +91,16 @@ internal static class TripEndpoints
         }
         if (rows.Count(r => r.Move?.Direction == GateRules.In) > 2 || rows.Count(r => r.Move?.Direction == GateRules.Out) > 2)
             errors.Add("rows", "A truck carries at most two boxes each way.");
+        // One box, or one booking place, on one row of the truck only.
+        for (var i = 0; i < rows.Count; i++)
+            for (var j = 0; j < i; j++)
+            {
+                var number = ContainerNumber.Normalise(rows[i].Move?.ContainerNo ?? "");
+                if (number.Length > 0 && number == ContainerNumber.Normalise(rows[j].Move?.ContainerNo ?? ""))
+                    errors.Add($"rows[{i}].move.containerNo", $"{number} is on this truck twice (row {j + 1}). Remove one of them.");
+                else if (rows[i].BookingContainerId is { } place && place == rows[j].BookingContainerId)
+                    errors.Add($"rows[{i}].bookingContainerId", $"This booking place is on this truck twice (row {j + 1}). Remove one of them.");
+            }
 
         // ── the truck: the open visit it is on (gate out), else the one this screen opened, else a new one ──
         TruckVisit? joined = null;

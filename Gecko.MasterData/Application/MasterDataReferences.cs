@@ -37,7 +37,8 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
                 db.ShippingLineExtensions.Any(x => x.PartyId == p.PartyId),
                 db.ForwarderExtensions.Any(x => x.PartyId == p.PartyId),
                 db.HaulierExtensions.Any(x => x.PartyId == p.PartyId),
-                db.ShippingLineExtensions.Where(x => x.PartyId == p.PartyId).Select(x => x.OperatorCode).FirstOrDefault()))
+                db.ShippingLineExtensions.Where(x => x.PartyId == p.PartyId).Select(x => x.OperatorCode).FirstOrDefault(),
+                p.PrimaryPhone))
             .ToDictionaryAsync(p => p.PartyCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 

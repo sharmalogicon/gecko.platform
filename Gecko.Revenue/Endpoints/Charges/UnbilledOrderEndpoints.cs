@@ -114,7 +114,12 @@ internal static class UnbilledOrderEndpoints
 
     // ── the one filter ─────────────────────────────────────────────────────
 
-    private sealed record Found(List<Charge> Lines, IReadOnlyDictionary<Guid, TosBookingHeader> Headers);
+    /// <param name="Empty">With includeSettled and no line filter: the latest bookings that have no billable line yet
+    /// (owner 2026-10-07 — the register lists bookings, so a clerk can open one and add a manual charge).</param>
+    private sealed record Found(List<Charge> Lines, IReadOnlyDictionary<Guid, TosBookingHeader> Headers, List<TosBookingHeader> Empty);
+
+    /// <summary>How many of the latest bookings without a billable line the register looks at.</summary>
+    private const int LatestBookings = 500;
 
     private sealed record Problem(IResult Result);
 
@@ -180,14 +185,42 @@ internal static class UnbilledOrderEndpoints
                                  // COMPLETED (Vector): only the boxes with no movement left.
                                  && (progress != "COMPLETED" || (l.BookingContainerId is { } box && h.CompletedBoxes.Contains(box))))
             .ToList();
-        return (new Found(lines, headers), null);
+
+        // Every booking, not only the ones with money on them — unless a filter is about the lines themselves.
+        var empty = new List<TosBookingHeader>();
+        var lineFilter = billTo is not null || Up(f.PaymentTermCode) is not null || Up(f.ChargeCode) is not null
+                         || Up(f.MovementCode) is not null || f.From is not null || f.To is not null || progress == "COMPLETED";
+        if (f.IncludeSettled == true && !lineFilter)
+        {
+            var have = lines.Select(l => l.BookingId!.Value).ToHashSet();
+            var latest = db.BookingPlans.AsNoTracking().Where(p => p.BranchId == branch && p.Status != "CANCELLED");
+            if (f.OrderNo is { Length: > 0 } named)
+            {
+                var wanted = named.Where(o => !string.IsNullOrWhiteSpace(o)).Select(o => o.Trim()).ToList();
+                latest = latest.Where(p => wanted.Contains(p.OrderNo));
+            }
+            var ids = (await latest.OrderByDescending(p => p.OrderNo).Select(p => p.BookingId).Take(LatestBookings).ToListAsync(ct))
+                .Where(id => !have.Contains(id)).ToList();
+            var more = await tos.HeadersAsync(ids, ct);
+            empty = more.Values.Where(Keep).ToList();
+            headers = headers.Concat(more.Where(m => !headers.ContainsKey(m.Key))).ToDictionary(m => m.Key, m => m.Value);
+        }
+        return (new Found(lines, headers, empty), null);
     }
 
     private static async Task<List<UnbilledOrderResponse>> OrdersOfAsync(Found found, IMasterDataReferences master, CancellationToken ct)
     {
         var groups = found.Lines.GroupBy(l => l.BookingId!.Value).ToList();
-        var codes = groups.Select(g => found.Headers[g.Key]).SelectMany(h => new[] { h.AgentCode, h.CustomerCode }).OfType<string>().Distinct();
+        var codes = groups.Select(g => found.Headers[g.Key]).Concat(found.Empty)
+            .SelectMany(h => new[] { h.AgentCode, h.CustomerCode }).OfType<string>().Distinct();
         var parties = await master.PartiesAsync(codes, ct);
+        // A booking with no billable line yet: listed with zeros, to be opened (and charged by hand).
+        var empty = found.Empty.Select(h => new UnbilledOrderResponse(
+            h.BookingId, h.OrderNo, h.CarrierRef, h.SubBlNo, h.BookedAt, h.BookingTypeCode, h.OrderTypeCode,
+            h.AgentCode, h.AgentCode is { } a ? parties.GetValueOrDefault(a)?.Name : null,
+            h.CustomerCode, h.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, h.ForwarderCode,
+            h.VesselCode, h.CallRef, h.Voyage, h.TerminalCode, [], [], 0, 0, 0m, 0m, 0m, "THB", h.StepsDone, h.StepsTotal, null, null,
+            TotalBillable: 0m, BilledAmount: 0m, UnbilledAmount: 0m));
         return groups.Select(g =>
             {
                 var h = found.Headers[g.Key];
@@ -208,7 +241,9 @@ internal static class UnbilledOrderEndpoints
                     list.Min(l => l.PricedForDate), list.Max(l => l.PricedForDate),
                     TotalBillable: billed + unbilled, BilledAmount: billed, UnbilledAmount: unbilled);
             })
-            .OrderBy(o => o.OrderNo, StringComparer.Ordinal).ToList();
+            .Concat(empty)
+            // Newest first (owner 2026-10-07): page 1 is the latest 50 bookings.
+            .OrderByDescending(o => o.BookedAt).ThenByDescending(o => o.OrderNo, StringComparer.Ordinal).ToList();
     }
 
     private static IEnumerable<Charge> Unbilled(IEnumerable<Charge> lines) => lines.Where(l => l.Status == ChargeStatus.Unbilled);

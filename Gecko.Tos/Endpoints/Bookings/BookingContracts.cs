@@ -104,7 +104,10 @@ public sealed record SaveBookingRequest(
     decimal? TotalVolumeCbm = null,
     decimal? TotalWeightKg = null,
     [property: MaxLength(200)] string? MarksAndNos = null,
-    [property: MaxLength(1000)] string? SpecialInstruction = null);
+    [property: MaxLength(1000)] string? SpecialInstruction = null,
+    // Create only (owner 2026-10-07): the booking this one is a clone of. Revenue copies the
+    // source's manual lines and price corrections onto the clone (BookingCloned).
+    Guid? ClonedFromBookingId = null);
 
 /// <summary><see cref="LineNo"/> null on create = next number; on replace, the line it updates.</summary>
 public sealed record RequirementItem(
@@ -158,7 +161,9 @@ public sealed record AssignContainerItem(
     [property: MaxLength(20)] string? StowageCode = null,
     [property: MaxLength(20)] string? StowageNo = null,
     bool? IsPreCool = null,
-    [property: MaxLength(500)] string? Remarks = null);
+    [property: MaxLength(500)] string? Remarks = null,
+    // On a clone: the source booking's box this place copies, so its statement lines follow it.
+    Guid? ClonedFromBookingContainerId = null);
 
 public sealed record AssignContainersRequest(
     [property: Required, MinLength(1)] IReadOnlyList<AssignContainerItem> Containers,
@@ -216,6 +221,15 @@ public sealed record UpdateContainerLineRequest(
     bool? IsPreCool = null,
     [property: MaxLength(500)] string? Remarks = null,
     [property: MaxLength(20)] string? HandoverMode = null);
+
+/// <summary>
+/// Move boxes to another OPEN booking of the same branch and order type (Vector "Transfer
+/// Container(s) to Existing Order", Operation.ContainerTransfer): each box keeps its moves —
+/// done ones too — its unspent coupons and its statement lines.
+/// </summary>
+public sealed record TransferContainersRequest(
+    [property: Required] Guid? TargetBookingId,
+    [property: Required, MinLength(1)] IReadOnlyList<Guid> BookingContainerIds);
 
 public sealed record EndBookingRequest(
     [property: Required, MinLength(5), MaxLength(500)] string Reason,

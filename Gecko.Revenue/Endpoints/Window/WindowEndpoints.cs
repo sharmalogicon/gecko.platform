@@ -207,7 +207,7 @@ internal static class WindowEndpoints
             ? await quoter.QuoteAsync(plan, box, first, context.Branch, null, context.Now, ct, terms with { TripChargeCarriedBy = carriedBy })
             : null;
         var note = quote is null ? $"{first.MovementCode} is not billable."
-            : quote.NoPrice.Count > 0 ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {first.MovementCode} (contract or standard tariff)."
+            : quote.NoPrice.Count > 0 ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {first.MovementCode} (contract or standard tariff): not charged."
             : quote.Lines.Count > 0 ? null
             : $"Nothing is charged in cash for {first.MovementCode}.";
         var lines = quote?.Lines ?? [];
@@ -432,11 +432,7 @@ internal static class WindowEndpoints
         var missing = request.BookingContainerIds!.Where(id => boxes.All(b => b.Box.BookingContainerId != id)).ToList();
         if (missing.Count > 0) return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", missing)}.");
         if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
-        // Taking the priced lines and issuing the coupon would let the unpriced one through for free.
-        if (boxes.Where(b => b.Quote is { NoPrice.Count: > 0 }).ToList() is { Count: > 0 } unpriced)
-            return RevenueSupport.Conflict("No price for some charges of these boxes.",
-                string.Join(" ", unpriced.Select(b => $"{b.Box.ContainerNo ?? b.Box.BookingContainerId.ToString()}: {b.Note}"))
-                + " Add the rate to the customer's tariff or the standard tariff, or a supervisor waives the line.");
+        // A cash charge no tariff prices is not charged (owner 2026-10-07, as Vector): the priced lines are taken.
         var payable = boxes.Where(b => b.Quote is { Lines.Count: > 0 }).ToList();
         var idle = boxes.Except(payable).ToList();
         if (idle.Count > 0)
@@ -800,7 +796,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
             if (carrier is null && quote.CarriesTripCharge) carrier = box.ContainerNo ?? $"box {box.BookingContainerId}";
             result.Add(new QuotedBox(box, step, rules, quote,
                 quote.NoPrice.Count > 0
-                    ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {step.MovementCode} (contract or standard tariff)."
+                    ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {step.MovementCode} (contract or standard tariff): not charged."
                 : quote.Lines.Count > 0 ? null
                 : quote.Tried.Any(t => t.Outcome == "SETTLED") ? $"{step.MovementCode} is already paid."
                 : $"Nothing is charged in cash for {step.MovementCode}."));
@@ -943,7 +939,7 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         if (waived.BookingContainerId is not { } boxId || waived.PaymentTermCode != "CASH") return null;
         var box = (await QuoteBoxesAsync(context, new HashSet<Guid> { boxId }, null, ct)).SingleOrDefault();
         if (box?.Quote is not { } quote || quote.MovementCode != waived.MovementCode
-            || quote.Lines.Count > 0 || quote.NoPrice.Count > 0 || string.IsNullOrEmpty(box.Box.ContainerNo))
+            || quote.Lines.Count > 0 || string.IsNullOrEmpty(box.Box.ContainerNo))
             return null;
 
         var now = context.Now;

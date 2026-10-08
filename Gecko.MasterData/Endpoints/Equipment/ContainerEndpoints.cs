@@ -43,7 +43,7 @@ public sealed record ContainerValidationResponse(
     bool WouldBeAcceptedAtGate, string? Note);
 
 public sealed record CreateContainerRequest(
-    [property: Required, RegularExpression("^[A-Za-z]{3}[UuJjZz][0-9]{7}$", ErrorMessage = "ISO 6346 format: 3 letters, U/J/Z, then 7 digits — e.g. MSKU1234567.")] string ContainerNo,
+    [property: Required, RegularExpression("^[A-Za-z0-9]{4,11}$", ErrorMessage = "4 to 11 letters or digits — e.g. MSKU1234567.")] string ContainerNo,
     [property: Required, AllowedValues("LINE_OWNED", "LEASED", "SHIPPER_OWNED", "DEPOT_OWNED")] string OwnershipType,
     Guid? EquipmentTypeId = null,
     [property: RegularExpression("^[A-Za-z0-9]{4}$")] string? IsoCode = null,

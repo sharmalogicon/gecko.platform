@@ -60,7 +60,7 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         if (!ContainerNumber.IsWellFormed(containerNo))
         {
             findings.Add(new GateFinding("NOT_A_CONTAINER_NUMBER",
-                $"'{rawContainerNo}' is not a container number (4 letters ending U/J/Z, then 7 digits).", GateSeverity.Block));
+                $"'{rawContainerNo}' is not a container number (4 to 11 letters or digits).", GateSeverity.Block));
             return new BarrierView { ContainerNo = containerNo, Direction = direction, At = at, Findings = findings };
         }
 

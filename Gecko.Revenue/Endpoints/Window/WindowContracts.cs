@@ -32,8 +32,8 @@ public sealed record BilledLaterResponse(decimal Subtotal, decimal Tax, decimal 
 public sealed record VoidedReceiptResponse(Guid ReceiptId, string ReceiptNo, DateTimeOffset? VoidedAt, string? VoidReason, decimal Total);
 
 /// <param name="Note">Why nothing is due, when nothing is (not billable, nothing pending, already paid…), or why it cannot be paid yet.</param>
-/// <param name="NoPrice">Cash charges of this movement that no tariff prices (contract or standard), at 0. While any is listed
-/// the box cannot be receipted and gets no coupon: add the rate, or a supervisor waives the line (POST /window/waive).</param>
+/// <param name="NoPrice">Cash charges of this movement that no tariff prices (contract or standard), at 0. They are NOT
+/// charged (owner 2026-10-07, as Vector): the receipt takes the priced lines; show these to the clerk as "no tariff, not charged".</param>
 public sealed record WindowBoxResponse(
     Guid BookingContainerId, string? ContainerNo, string? EquipmentTypeCode,
     string? NextMovementCode, string? Direction, bool IsBillable,

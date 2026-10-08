@@ -62,6 +62,8 @@ public static class RevenueModule
 
         // What Revenue hears from TOS, off gecko_tos's outbox (ADR-007: it never reads gecko_tos).
         services.AddScoped<IOutboxHandler, BookingChangedHandler>();
+        services.AddScoped<IOutboxHandler, BookingClonedHandler>();
+        services.AddScoped<IOutboxHandler, ContainersTransferredHandler>();
         services.AddScoped<IOutboxHandler, GateEventHandler>();
         services.AddScoped<IOutboxHandler, ReeferSessionHandler>();
 

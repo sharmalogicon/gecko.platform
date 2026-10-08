@@ -114,7 +114,7 @@ internal static class HoldEndpoints
     {
         var box = ContainerNumber.Normalise(containerNo);
         if (!ContainerNumber.IsWellFormed(box))
-            return TosSupport.Invalid("containerNo", $"'{containerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+            return TosSupport.Invalid("containerNo", $"'{containerNo}' is not a container number (4 to 11 letters or digits).");
 
         var active = await (
             from h in db.VwActiveHolds.AsNoTracking().Where(h => h.ContainerNo == box)
@@ -163,7 +163,7 @@ internal static class HoldEndpoints
         {
             box = ContainerNumber.Normalise(request.ContainerNo!);
             if (!ContainerNumber.IsWellFormed(box))
-                errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+                errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 to 11 letters or digits).");
             else if (!ContainerNumber.IsValid(box)
                      && await master.GetBoolSettingAsync(TosSettingKeys.EnforceCheckDigit, null, false, ct))
                 errors.Add("containerNo",

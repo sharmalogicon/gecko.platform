@@ -65,7 +65,7 @@ internal static class ReservationEndpoints
             return new(TosSupport.Invalid("bookingContainerId", "Name the booked box (bookingContainerId) or, for a box on no order, its containerNo."));
         var keyed = ContainerNumber.Normalise(request.ContainerNo ?? "") is { Length: > 0 } k ? k : null;
         if (keyed is not null && !ContainerNumber.IsWellFormed(keyed))
-            return new(TosSupport.Invalid("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits)."));
+            return new(TosSupport.Invalid("containerNo", $"'{request.ContainerNo}' is not a container number (4 to 11 letters or digits)."));
 
         var now = time.GetUtcNow();
         var bookingContainerId = request.BookingContainerId;

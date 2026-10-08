@@ -3,6 +3,7 @@ using Gecko.MasterData.Contracts;
 using Gecko.Revenue.Application;
 using Gecko.Revenue.Contracts;
 using Gecko.Revenue.Infrastructure.Persistence;
+using Gecko.Revenue.Infrastructure.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
 
 namespace Gecko.Revenue.Endpoints.Window;
@@ -69,10 +70,9 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
             var boxes = await window.QuoteBoxesAsync(context, booking.BookingContainerIds.ToHashSet(), null, ct, terms, carrier);
             var missing = booking.BookingContainerIds.Where(id => boxes.All(b => b.Box.BookingContainerId != id)).ToList();
             if (missing.Count > 0) return Refused(400, $"Not on {plan.OrderNo}: {string.Join(", ", missing)}.", null, "bookings");
-            if (boxes.Where(b => b.Quote is { NoPrice.Count: > 0 }).ToList() is { Count: > 0 } unpriced)
-                return Refused(409, "No price for some charges of these boxes.",
-                    string.Join(" ", unpriced.Select(b => $"{b.Box.ContainerNo ?? b.Box.BookingContainerId.ToString()}: {b.Note}"))
-                    + " Add the rate to the customer's tariff or the standard tariff, or a supervisor waives the line.");
+            // A cash charge no tariff prices is NOT charged (owner 2026-10-07, as Vector: usp_CalculateCashChargesByOrder
+            // keeps Price > 0 only, GateIn.cs shows amounts > 0). The priced lines are taken; the quote's noPrice list
+            // and note tell the clerk what was left out.
             carrier ??= boxes.FirstOrDefault(b => b.Quote is { CarriesTripCharge: true }) is { } carries
                 ? $"{carries.Box.ContainerNo ?? "a box"} on {plan.OrderNo}" : null;
             groups.Add((context, boxes.Where(b => b.Quote is { Lines.Count: > 0 }).ToList()));
@@ -109,9 +109,9 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
                 ? $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2} less ฿{withheld:N2} withholding tax = ฿{total - withheld:N2}."
                 : $"Payments add up to ฿{paid:N2}; the receipt is ฿{total:N2}.", null, "payments");
 
-        var shift = await db.Shifts.AsNoTracking()
-            .SingleOrDefaultAsync(s => s.BranchId == request.BranchId && s.CashierUserId == request.CashierUserId && s.Status == "OPEN", ct);
-        if (shift is null) return Refused(409, "Your drawer is not open at this branch.", "Open it (POST /api/revenue/window/shifts) before taking payment.");
+        // No drawer to open at the gate (owner 2026-10-07, as Vector: the gate just writes the cash invoice).
+        // A receipt still belongs to a shift, so the clerk's first gate Save opens one with no float.
+        var shift = await OpenShiftAsync(request.BranchId, request.CashierUserId, groups[0].Context.Plan.TenantId, groups[0].Context.Now, ct);
 
         var payerName = request.Payer?.Name?.Trim();
         // Vector GateIn.cs:2342: the invoice is made out to the first box's customer unless the clerk names a payer.
@@ -138,6 +138,31 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
             db.ChangeTracker.Clear();
             return Refused(409, "Already paid.", "Another receipt for these boxes was just issued. Refresh the charges.");
         }
+    }
+
+    /// <summary>The clerk's open shift at the branch, opened (float 0) when there is none.</summary>
+    private async Task<Shift> OpenShiftAsync(Guid branchId, Guid cashierUserId, Guid tenantId, DateTimeOffset now, CancellationToken ct)
+    {
+        Task<Shift?> Open() => db.Shifts.AsNoTracking()
+            .SingleOrDefaultAsync(s => s.BranchId == branchId && s.CashierUserId == cashierUserId && s.Status == "OPEN", ct);
+        if (await Open() is { } open) return open;
+
+        var shift = new Shift
+        {
+            ShiftId = Guid.CreateVersion7(), TenantId = tenantId, BranchId = branchId, CashierUserId = cashierUserId,
+            CurrencyCode = "THB", OpenedAt = now, OpeningFloat = 0m, Status = "OPEN",
+        };
+        db.Shifts.Add(shift);
+        try { await db.SaveChangesAsync(ct); }
+        catch (DbUpdateException)
+        {
+            // Two Saves of the same clerk at once: the other opened it.
+            db.ChangeTracker.Clear();
+            if (await Open() is { } other) return other;
+            throw;
+        }
+        db.Entry(shift).State = EntityState.Detached;
+        return shift;
     }
 
     /// <summary>The receipt an earlier call with this key issued, with its coupons; null when the key is new.</summary>

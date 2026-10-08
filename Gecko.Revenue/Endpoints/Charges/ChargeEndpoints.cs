@@ -4,6 +4,7 @@ using Gecko.Revenue.Application;
 using Gecko.Revenue.Infrastructure.Persistence;
 using Gecko.Revenue.Infrastructure.Persistence.Entities;
 using Gecko.SharedKernel;
+using Gecko.Tos.Contracts;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
@@ -42,7 +43,9 @@ internal static class ChargeEndpoints
         charges.MapGet("/unbilled", UnbilledAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Credit lines not yet invoiced (UNBILLED), totalled per payer");
         charges.MapGet("/statement", StatementAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
-            .WithSummary("One booking's statement: each box with its charge lines, and the receipts that paid them");
+            .WithSummary("One booking's statement (orderNo = the order no, or a Booking/B/L or sub-B/L no that names one booking): each box with its charge lines, and the receipts that paid them");
+        charges.MapGet("/statement/search", StatementSearchAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Find bookings for the statement as the clerk types: order no, Booking/B/L or sub-B/L contains q; exact first, then newest");
 
         // gecko_revenue 25: a supervisor corrects ONE quoted line, by id, with a reason.
         charges.MapPost("/{chargeId:guid}/price", PriceAsync).RequireBranchPermission(RevenuePermissions.ChargeOverride)
@@ -454,13 +457,40 @@ internal static class ChargeEndpoints
     /// changes a price. Boxes come from Revenue's copy of the booking, including boxes
     /// that have left it; a line whose box is unknown is listed under no box.
     /// </summary>
+    /// <summary>The statement's type-ahead (owner 2026-10-07): the clerk types part of an order or B/L no and picks one.</summary>
+    private static async Task<Results<Ok<IReadOnlyList<StatementSearchHit>>, ValidationProblem>> StatementSearchAsync(
+        string? q, Guid? branchId, ITosBookingHeaders tos, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct)
+    {
+        var text = q?.Trim() ?? "";
+        if (text.Length < 2) return RevenueSupport.Invalid("q", "Type at least 2 characters of the order or Booking/B/L number.");
+        IReadOnlyCollection<Guid>? branches = scope.BranchesFor(RevenuePermissions.ChargeView);
+        if (branchId is { } b) branches = branches is null || branches.Contains(b) ? [b] : [];
+        var hits = await tos.SearchAsync(text, branches, 20, ct);
+        var parties = await master.PartiesAsync(hits.Select(h => h.CustomerCode).OfType<string>().Distinct(), ct);
+        return TypedResults.Ok<IReadOnlyList<StatementSearchHit>>(hits.Select(h => new StatementSearchHit(
+            h.BookingId, h.OrderNo, h.CarrierRef, h.SubBlNo, h.BookedAt, h.Status, h.OrderTypeCode,
+            h.CustomerCode, h.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, h.VesselCode, h.Voyage)).ToList());
+    }
+
     private static async Task<Results<Ok<BookingStatementResponse>, NotFound<ProblemDetails>, ValidationProblem, ProblemHttpResult>> StatementAsync(
-        string? orderNo, RevenueDbContext db, IMasterDataReferences master, ICallerPermissions scope, CancellationToken ct)
+        string? orderNo, RevenueDbContext db, IMasterDataReferences master, ITosBookingHeaders tos, ICallerPermissions scope, CancellationToken ct)
     {
         var order = orderNo?.Trim();
         if (string.IsNullOrEmpty(order)) return RevenueSupport.Invalid("orderNo", "Which booking? Its order number.");
 
         var plan = await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.OrderNo == order, ct);
+        // Not an order no: a Booking/B/L (or sub-B/L) no that names exactly one booking in the caller's branches opens it.
+        if (plan is null)
+        {
+            var named = (await tos.SearchAsync(order, scope.BranchesFor(RevenuePermissions.ChargeView), 10, ct))
+                .Where(h => string.Equals(h.CarrierRef, order, StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(h.SubBlNo, order, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (named.Count > 1)
+                return RevenueSupport.Conflict($"'{order}' is the Booking/B/L of {named.Count} bookings: {string.Join(", ", named.Select(h => h.OrderNo))}.",
+                    "Open it by its order number.");
+            if (named.Count == 1)
+                plan = await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.BookingId == named[0].BookingId, ct);
+        }
         if (plan is null)
             return TypedResults.NotFound(new ProblemDetails
             {
@@ -679,6 +709,10 @@ public sealed record StatementReceiptResponse(
     Guid ReceiptId, string ReceiptNo, DateTimeOffset ReceiptAt, string Status, string PayerName, string CurrencyCode,
     decimal Subtotal, decimal Tax, decimal Total, DateTimeOffset? VoidedAt, string? VoidReason,
     string? ReplacesReceiptNo, string? ReplacedByReceiptNo);
+
+public sealed record StatementSearchHit(
+    Guid BookingId, string OrderNo, string? CarrierRef, string? SubBlNo, DateTimeOffset BookedAt, string Status, string OrderTypeCode,
+    string? CustomerCode, string? CustomerName, string? VesselCode, string? Voyage);
 
 public sealed record BookingStatementResponse(
     Guid BookingId, string OrderNo, Guid BranchId, string BookingStatus, string OrderTypeCode,

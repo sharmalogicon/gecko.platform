@@ -8,6 +8,12 @@ namespace Gecko.Tos.Contracts;
 public interface ITosBookingHeaders
 {
     Task<IReadOnlyDictionary<Guid, TosBookingHeader>> HeadersAsync(IReadOnlyCollection<Guid> bookingIds, CancellationToken ct);
+
+    /// <summary>
+    /// Bookings whose order no, Booking/B/L no or sub-B/L contains <paramref name="text"/>, at
+    /// <paramref name="branchIds"/> (null = any branch of the tenant), newest first: exact matches before the rest.
+    /// </summary>
+    Task<IReadOnlyList<TosBookingHeader>> SearchAsync(string text, IReadOnlyCollection<Guid>? branchIds, int take, CancellationToken ct);
 }
 
 /// <param name="StepsTotal">Every planned step of every box still on the booking (cancelled ones not counted).</param>

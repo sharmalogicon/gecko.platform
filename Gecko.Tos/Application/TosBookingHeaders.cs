@@ -43,4 +43,23 @@ internal sealed class TosBookingHeaders(TosDbContext db) : ITosBookingHeaders
                 h.VesselCode, h.CallRef, h.Voyage, h.TerminalCode, own.Count, own.Count(s => s.Done), completed);
         });
     }
+
+    public async Task<IReadOnlyList<TosBookingHeader>> SearchAsync(string text, IReadOnlyCollection<Guid>? branchIds, int take, CancellationToken ct)
+    {
+        var q = text.Trim().ToUpperInvariant();
+        if (q.Length == 0) return [];
+        var rows = db.Bookings.AsNoTracking()
+            .Where(b => b.OrderNo.Contains(q) || (b.CarrierRef != null && b.CarrierRef.Contains(q)) || (b.SubBlNo != null && b.SubBlNo.Contains(q)));
+        if (branchIds is not null)
+        {
+            var allowed = branchIds.ToList();
+            rows = rows.Where(b => allowed.Contains(b.BranchId));
+        }
+        var ids = await rows
+            .OrderByDescending(b => b.OrderNo == q || b.CarrierRef == q || b.SubBlNo == q)
+            .ThenByDescending(b => b.CreatedAt)
+            .Select(b => b.BookingId).Take(Math.Clamp(take, 1, 50)).ToListAsync(ct);
+        var headers = await HeadersAsync(ids, ct);
+        return ids.Where(headers.ContainsKey).Select(id => headers[id]).ToList();
+    }
 }

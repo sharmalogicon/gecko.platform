@@ -47,6 +47,7 @@ internal static class BookingEndpoints
         bookings.MapPost("/{id:guid}/containers/batch", AssignBatchAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<AssignContainersBatchRequest>().WithSummary("Save container rows one by one: each row stands alone, a retry with the same clientLineId gets the same line");
         bookings.MapPut("/{id:guid}/containers/{bookingContainerId:guid}", UpdateLineAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<UpdateContainerLineRequest>().WithSummary("Edit one container line's details (seals, weight, reefer, DG, stowage, remarks…) with its rowVersion");
         bookings.MapDelete("/{id:guid}/containers/{bookingContainerId:guid}", UnassignAsync).RequireBranchPermission(TosPermissions.BookingManage).WithSummary("Take a box off the booking (refused once it has done a step)");
+        bookings.MapPost("/{id:guid}/containers/transfer", TransferAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<TransferContainersRequest>().WithSummary("Move boxes to another OPEN booking of the same branch and order type, with their moves, coupons and statement lines");
         bookings.MapPost("/{id:guid}/cancel", CancelAsync).RequireBranchPermission(TosPermissions.BookingCancel).Validate<EndBookingRequest>().WithSummary("Cancel a booking no box has worked on");
         bookings.MapPost("/{id:guid}/close", CloseAsync).RequireBranchPermission(TosPermissions.BookingManage).Validate<EndBookingRequest>().WithSummary("Close a part-used booking; open boxes are released");
 
@@ -177,6 +178,18 @@ internal static class BookingEndpoints
         if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
         if (await CarrierRefTakenAsync(db, header.Branch.BranchId, request.CarrierRef, null, ct) is { } taken) return taken;
 
+        // A clone names its source; every box it copies must be one of the source's.
+        if (request.ClonedFromBookingId is { } sourceId)
+        {
+            if (!await db.Bookings.AsNoTracking().AnyAsync(b => b.BookingId == sourceId, ct)
+                || !await AllowedAsync(db, scope, TosPermissions.BookingView, sourceId, ct))
+                return TosSupport.Invalid("clonedFromBookingId", "No such booking in your branches.");
+            var sourceBoxes = (request.Containers ?? []).Select(c => c.ClonedFromBookingContainerId).OfType<Guid>().ToList();
+            if (sourceBoxes.Count > 0 && await db.BookingContainers.AsNoTracking()
+                    .CountAsync(x => x.BookingId == sourceId && sourceBoxes.Contains(x.BookingContainerId), ct) != sourceBoxes.Distinct().Count())
+                return TosSupport.Invalid("containers", "A clonedFromBookingContainerId that is not a box of the source booking.");
+        }
+
         var tenantId = caller.TenantId();
         await using var tx = await db.Database.BeginTransactionAsync(ct);
 
@@ -217,14 +230,19 @@ internal static class BookingEndpoints
             return TosSupport.Invalid("requirements", "Two requirement lines share a line number.");
         await db.SaveChangesAsync(ct);
 
+        var boxMap = new List<(Guid Box, Guid? Source)>();
         if (request.Containers is { Count: > 0 } boxes)
         {
             var assigned = await AssignBoxesAsync(db, master, caller, booking, header.Plan, created, boxes, "PRE_ADVISED", partial: false, ct);
             if (assigned.Problem?.Invalid is { } invalid) return invalid;
             if (assigned.Problem?.Refused is { } refused) return refused;
+            boxMap = assigned.Created.Select(c => (c.Box.BookingContainerId, boxes[c.Index].ClonedFromBookingContainerId)).ToList();
         }
 
         await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
+        // After BookingChanged, so Revenue has the clone's plan (and its quotes) when this arrives.
+        if (request.ClonedFromBookingId is { } clonedFrom)
+            await BookingEvents.QueueClonedAsync(db, booking, clonedFrom, boxMap, ct);
         await tx.CommitAsync(ct);
         return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, users, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
     }
@@ -246,7 +264,7 @@ internal static class BookingEndpoints
 
         var containerNo = ContainerNumber.Normalise(request.ContainerNo);
         if (!ContainerNumber.IsWellFormed(containerNo))
-            return TosSupport.Invalid("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+            return TosSupport.Invalid("containerNo", $"'{request.ContainerNo}' is not a container number (4 to 11 letters or digits).");
 
         var prior = await (
             from x in db.BookingContainers.AsNoTracking()
@@ -563,7 +581,7 @@ internal static class BookingEndpoints
             if (started)
                 errors.Add("containerNo", $"{box.ContainerNo} has already passed the gate on this booking; the box can no longer change.");
             else if (!ContainerNumber.IsWellFormed(nominate))
-                errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+                errors.Add("containerNo", $"'{request.ContainerNo}' is not a container number (4 to 11 letters or digits).");
             else
             {
                 nominatedDigitOk = ContainerNumber.IsValid(nominate);
@@ -676,6 +694,120 @@ internal static class BookingEndpoints
         return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
     }
 
+    // ── transfer (Vector Operation.ContainerTransfer) ────────────────────────
+
+    /// <summary>
+    /// Vector BookingEntry.cs:3358 mnuTransferContainerToExistingOrder_Click + Operation.ContainerTransfer:
+    /// the target is another booking of the same branch and order type; not every box may leave
+    /// (the source would be an empty order); a box that has moved may still go (Vector's check is
+    /// commented out). The box takes its moves (MovementPlan follows the box), its unspent
+    /// coupons and — via ContainersTransferred — its statement lines. Gate transactions are
+    /// immutable and stay on the order they were made under, like a printed EIR.
+    /// On the target it fills a line of its type (one more place when the line is full, a new
+    /// line with the old one's details when there is none); its old line gives the place back.
+    /// </summary>
+    private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> TransferAsync(
+        Guid id, TransferContainersRequest request, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock,
+        ITenantContext caller, ICallerPermissions scope, TimeProvider time, CancellationToken ct)
+    {
+        var targetId = request.TargetBookingId!.Value;
+        if (targetId == id) return TosSupport.Invalid("targetBookingId", "That is this booking. Pick another one.");
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        // Both bookings, always in the same order, so two opposite transfers cannot deadlock.
+        foreach (var lockId in new[] { id, targetId }.Order()) await LockAsync(db, lockId, ct);
+
+        var source = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == id, ct);
+        if (source is null || !scope.HasAt(TosPermissions.BookingManage, source.BranchId)) return TypedResults.NotFound();
+        var target = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == targetId, ct);
+        if (target is null || !scope.HasAt(TosPermissions.BookingManage, target.BranchId))
+            return TosSupport.Invalid("targetBookingId", "No such booking in your branches.");
+        if (source.Status != BookingRules.Open) return NotOpen(source);
+        if (target.Status != BookingRules.Open) return TosSupport.Conflict($"{target.OrderNo} is {target.Status}; boxes only go to an OPEN booking.");
+        if (target.BranchId != source.BranchId) return TosSupport.Conflict($"{target.OrderNo} is at another depot; a box is transferred within its depot.");
+        if (target.OrderTypeCode != source.OrderTypeCode)
+            return TosSupport.Conflict($"{target.OrderNo} is {target.OrderTypeCode}, this booking is {source.OrderTypeCode}. A box goes to a booking of the same order type.");
+
+        var asked = request.BookingContainerIds.Distinct().ToList();
+        var active = await db.BookingContainers.Where(x => x.BookingId == id && x.EndedAt == null).ToListAsync(ct);
+        var boxes = active.Where(x => asked.Contains(x.BookingContainerId)).ToList();
+        if (boxes.Count != asked.Count)
+            return TosSupport.Invalid("bookingContainerIds", "A box that is not (or no longer) on this booking.");
+        if (boxes.Count == active.Count)
+            return TosSupport.Conflict("Every box of this booking is chosen; at least one must stay.",
+                "To move the whole order, cancel it and use the other booking, or leave one box behind.");
+
+        var now = time.GetUtcNow();
+        var sourceLines = await db.EquipmentRequirements.Where(r => r.BookingId == id).ToListAsync(ct);
+        var targetLines = await db.EquipmentRequirements.Where(r => r.BookingId == targetId).ToListAsync(ct);
+        var targetUsed = await UsedPerLineAsync(db, targetId, ct);
+        var sourceUsed = await UsedPerLineAsync(db, id, ct);
+
+        foreach (var box in boxes)
+        {
+            var old = sourceLines.Single(r => r.EquipmentRequirementId == box.EquipmentRequirementId);
+            var line = targetLines.Where(r => string.Equals(r.EquipmentTypeCode, old.EquipmentTypeCode, StringComparison.OrdinalIgnoreCase)).MinBy(r => r.LineNo);
+            if (line is null)
+            {
+                line = new EquipmentRequirement
+                {
+                    TenantId = target.TenantId, BookingId = targetId, LineNo = (short)(targetLines.Select(r => (int)r.LineNo).DefaultIfEmpty(0).Max() + 1),
+                    EquipmentTypeId = old.EquipmentTypeId, EquipmentTypeCode = old.EquipmentTypeCode, Qty = 1,
+                    MinGradeCode = old.MinGradeCode, ReeferSetTempC = old.ReeferSetTempC, ReeferVentPct = old.ReeferVentPct,
+                    ReeferHumidityPct = old.ReeferHumidityPct, ImdgClass = old.ImdgClass, UnNumber = old.UnNumber,
+                    DeclaredGrossWeightKg = old.DeclaredGrossWeightKg,
+                    Remarks = $"Transferred from {source.OrderNo} on {now:yyyy-MM-dd}.",
+                    CreatedBy = caller.UserId(), UpdatedBy = caller.UserId(),
+                };
+                db.EquipmentRequirements.Add(line);
+                await db.SaveChangesAsync(ct);   // the id comes from NEWSEQUENTIALID()
+                targetLines.Add(line);
+            }
+            else if (targetUsed.GetValueOrDefault(line.EquipmentRequirementId) >= line.Qty)
+            {
+                if (line.Qty >= 999) return TosSupport.Conflict($"Line {line.LineNo} ({line.EquipmentTypeCode}) of {target.OrderNo} is full.");
+                line.Qty++;
+                line.UpdatedAt = now;
+                line.UpdatedBy = caller.UserId();
+            }
+            targetUsed[line.EquipmentRequirementId] = targetUsed.GetValueOrDefault(line.EquipmentRequirementId) + 1;
+
+            // The old line gives the place back, never below the boxes still on it, nor below one.
+            sourceUsed[old.EquipmentRequirementId] = sourceUsed.GetValueOrDefault(old.EquipmentRequirementId) - 1;
+            if (old.Qty > Math.Max(1, sourceUsed[old.EquipmentRequirementId]))
+            {
+                old.Qty--;
+                old.UpdatedAt = now;
+                old.UpdatedBy = caller.UserId();
+            }
+
+            box.BookingId = targetId;
+            box.EquipmentRequirementId = line.EquipmentRequirementId;
+        }
+
+        // Unspent coupons follow their box: the gate looks for them on the box's booking.
+        var numbers = boxes.Select(b => b.ContainerNo).OfType<string>().ToList();
+        if (numbers.Count > 0)
+            foreach (var coupon in await db.GateAuthorizations.Where(a => a.BookingId == id && a.ContainerNo != null && numbers.Contains(a.ContainerNo)
+                                                                         && a.ConsumedAt == null && a.RevokedAt == null).ToListAsync(ct))
+            {
+                coupon.BookingId = targetId;
+                coupon.UpdatedAt = now;
+                coupon.UpdatedBy = caller.UserId();
+            }
+
+        source.UpdatedAt = now;   // both rowVersions move: their boxes and lines are part of them
+        target.UpdatedAt = now;
+        if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
+
+        // Revenue moves the statement lines first, then both bookings are re-sent whole.
+        await BookingEvents.QueueTransferredAsync(db, source, target, boxes.Select(b => b.BookingContainerId), ct);
+        await BookingEvents.QueueChangedAsync(db, id, "CONTAINERS_TRANSFERRED_OUT", now, ct);
+        await BookingEvents.QueueChangedAsync(db, targetId, "CONTAINERS_TRANSFERRED_IN", now, ct);
+        await tx.CommitAsync(ct);
+        return TypedResults.Ok((await DetailAsync(db, clock, master, users, id, ct))!);
+    }
+
     // ── cancel / close ──────────────────────────────────────────────────────
 
     private static async Task<Results<Ok<BookingDetailResponse>, NotFound, ValidationProblem, ProblemHttpResult>> CancelAsync(
@@ -709,6 +841,13 @@ internal static class BookingEndpoints
 
         if (cancel && BookingRules.CannotCancel(booking.Status, steps.Count(s => s.Status == "DONE")) is { } refusal)
             return TosSupport.Conflict(refusal);
+        // Vector usp_CheckBookingActivity: nor once money is taken, nor while a truck is in for one of its boxes.
+        if (cancel && await db.GateAuthorizations.AnyAsync(a => a.BookingId == id && a.PaymentChannel != "CREDIT" && a.PaymentChannel != "WAIVED" && a.Amount > 0
+                                                               && a.ConsumedAt == null && a.RevokedAt == null, ct))
+            return TosSupport.Conflict("Charge(s) on this booking are already paid at the window.",
+                "Void the receipt first, or close the booking instead.");
+        if (cancel && await db.VisitPickups.AnyAsync(v => boxIds.Contains(v.BookingContainerId) && v.ReleasedAt == null && v.CancelledAt == null, ct))
+            return TosSupport.Conflict("A truck is in the yard for a box of this booking.", "Finish or cancel that visit first.");
 
         var now = time.GetUtcNow();
         var reason = request.Reason.Trim();
@@ -956,13 +1095,13 @@ internal static class BookingEndpoints
             ContainerRef? known = null;
             if (nominated)
             {
-                if (!ContainerNumber.IsWellFormed(no)) { errors.Add($"{key}.containerNo", $"'{item.ContainerNo}' is not a container number (4 letters ending U/J/Z, 7 digits)."); continue; }
+                if (!ContainerNumber.IsWellFormed(no)) { errors.Add($"{key}.containerNo", $"'{item.ContainerNo}' is not a container number (4 to 11 letters or digits)."); continue; }
                 if (numbers.Take(i).Contains(no)) { errors.Add($"{key}.containerNo", $"{no} is listed twice."); continue; }
 
                 digitOk = ContainerNumber.IsValid(no);
-                // Owner 2026-10-04: warn, do not refuse — unless the depot sets gate.enforce_check_digit.
-                if (!digitOk)
-                    (enforceDigit ? errors : warnings).Add($"{key}.containerNo",
+                // Owner 2026-10-08: no ISO check at all — unless the depot sets gate.enforce_check_digit.
+                if (!digitOk && enforceDigit)
+                    errors.Add($"{key}.containerNo",
                         $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
 
                 known = registry.GetValueOrDefault(no);

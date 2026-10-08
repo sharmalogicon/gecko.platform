@@ -517,14 +517,11 @@ internal sealed class AutomaticCoupons(
             var quote = await quoter.QuoteAsync(plan, box, rules, branch, null, now, ct);
             // Something is (or may become) payable in cash: that is the window's job.
             if (quote.Lines.Count > 0 || quote.StorageApplies || quote.ReeferApplies) continue;
-            // A cash charge with no rate anywhere is NOT "nothing to pay": no coupon, so
-            // the barrier holds the box until a rate is added or a supervisor waives it.
+            // A cash charge with no rate anywhere is not charged (owner 2026-10-07, as Vector): with
+            // nothing priced in cash the box owes nothing at the window and gets its coupon.
             if (quote.NoPrice.Count > 0)
-            {
-                log.LogWarning("Booking {OrderNo} box {Box} {Movement}: no tariff prices {Charges}; no automatic coupon.",
+                log.LogInformation("Booking {OrderNo} box {Box} {Movement}: no tariff prices {Charges}; not charged.",
                     plan.OrderNo, box.ContainerNo, step.MovementCode, string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode)));
-                continue;
-            }
 
             await RevenueOutbox.EnqueueAsync(db, plan.TenantId, "BOOKING", plan.BookingId, RevenueOutbox.CouponIssued,
                 new CouponIssuedPayload(

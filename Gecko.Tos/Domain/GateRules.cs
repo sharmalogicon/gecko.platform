@@ -102,18 +102,16 @@ public static class GateRules
                     GateSeverity.Override);
 
     /// <summary>Q6: 13 of Vector's 194K boxes fail the digit and still arrive. Allowed, never anonymously.</summary>
+    /// <remarks>Owner 2026-10-08: a depot that does not enforce it hears nothing about it — no note at all.</remarks>
     public static GateFinding? CheckDigit(string containerNo, bool isValid, bool enforced, int? expected) =>
-        isValid
+        isValid || !enforced
             ? null
-            : enforced
-                ? new GateFinding(
-                    "CHECK_DIGIT",
-                    $"{containerNo} fails the ISO 6346 check digit (expected {expected}). A supervisor may accept it with a reason.",
-                    GateSeverity.Override)
-                : new GateFinding(
-                    "CHECK_DIGIT_RECORDED",
-                    $"{containerNo} fails the ISO 6346 check digit (expected {expected}); the depot does not enforce it, so it is recorded and allowed.",
-                    GateSeverity.Info);
+            : new GateFinding(
+                "CHECK_DIGIT",
+                expected is null
+                    ? $"{containerNo} is not an ISO 6346 number. A supervisor may accept it with a reason."
+                    : $"{containerNo} fails the ISO 6346 check digit (expected {expected}). A supervisor may accept it with a reason.",
+                GateSeverity.Override);
 
     /// <summary>Q8: a release that has expired is refused at the gate; extending it is an edit to the booking.</summary>
     public static GateFinding? Expired(string orderNo, DateOnly? validTo, DateOnly today) =>

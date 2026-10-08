@@ -25,10 +25,23 @@ public static partial class ContainerNumber
     /// equipment) or Z (trailer/chassis) — no other letter is valid there.
     /// </summary>
     [GeneratedRegex("^[A-Z]{3}[UJZ][0-9]{7}$")]
-    private static partial Regex WellFormed { get; }
+    private static partial Regex IsoFormed { get; }
 
+    /// <summary>Any box number the depot may meet: 4–11 letters or digits (gecko_tos 28).</summary>
+    [GeneratedRegex("^[A-Z0-9]{4,11}$")]
+    private static partial Regex AnyFormed { get; }
+
+    /// <summary>
+    /// Owner 2026-10-08: "some containers don't follow ISO container specs" (TMSKORAKIT: ANVY6399011,
+    /// PLD9256601, RBI051, 4043535…). A number is accepted when it is 4–11 letters or digits; whether it
+    /// is ISO 6346 only matters where a depot sets gate.enforce_check_digit (<see cref="IsValid"/>).
+    /// </summary>
     public static bool IsWellFormed(string? containerNo) =>
-        !string.IsNullOrWhiteSpace(containerNo) && WellFormed.IsMatch(containerNo);
+        !string.IsNullOrWhiteSpace(containerNo) && AnyFormed.IsMatch(containerNo);
+
+    /// <summary>Owner code + U/J/Z + 7 digits: the ISO 6346 shape.</summary>
+    public static bool IsIsoFormed(string? containerNo) =>
+        !string.IsNullOrWhiteSpace(containerNo) && IsoFormed.IsMatch(containerNo);
 
     /// <summary>Normalises what a human or an OCR camera produced: trim, strip spaces and dashes, upper-case.</summary>
     public static string Normalise(string containerNo) =>
@@ -63,17 +76,17 @@ public static partial class ContainerNumber
         return remainder == 10 ? 0 : remainder;
     }
 
-    /// <summary>True when the number is well formed AND its eleventh character is the correct check digit.</summary>
+    /// <summary>True when the number is ISO 6346 shaped AND its eleventh character is the correct check digit.</summary>
     public static bool IsValid(string? containerNo)
     {
-        if (!IsWellFormed(containerNo)) return false;
+        if (!IsIsoFormed(containerNo)) return false;
         var value = Normalise(containerNo!);
         return CheckDigitOf(value) is { } expected && value[10] - '0' == expected;
     }
 
     /// <summary>The owner code and equipment category — 'MSKU' of 'MSKU1234567'. Used to resolve the owning line.</summary>
     public static string? PrefixOf(string? containerNo) =>
-        IsWellFormed(containerNo) ? Normalise(containerNo!)[..4] : null;
+        IsIsoFormed(containerNo) ? Normalise(containerNo!)[..4] : null;
 
     /// <summary>
     /// Letter values run 10..38 but SKIP every multiple of 11, because a value

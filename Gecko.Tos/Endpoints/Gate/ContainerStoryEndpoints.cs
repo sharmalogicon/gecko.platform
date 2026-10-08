@@ -40,7 +40,7 @@ internal static class ContainerStoryEndpoints
     {
         var box = ContainerNumber.Normalise(containerNo);
         if (!ContainerNumber.IsWellFormed(box))
-            return TosSupport.Invalid("containerNo", $"'{containerNo}' is not a container number (4 letters ending U/J/Z, 7 digits).");
+            return TosSupport.Invalid("containerNo", $"'{containerNo}' is not a container number (4 to 11 letters or digits).");
         if (branchId is { } asked && !scope.HasAt(TosPermissions.GateView, asked))
             return TosScope.OutsideYourBranches("That depot is not one you cover.");
 

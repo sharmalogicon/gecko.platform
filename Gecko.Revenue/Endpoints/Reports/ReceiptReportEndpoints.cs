@@ -139,7 +139,8 @@ internal static class ReceiptReportEndpoints
 
     private static async Task<IResult> ListAsync(
         Guid? branchId, DateOnly? from, DateOnly? to, [AsParameters] ListQuery query, RevenueDbContext db, BranchCalendar calendar,
-        IUserDirectory users, ICallerPermissions scope, CancellationToken ct, string? status = null, Guid? shiftId = null)
+        IUserDirectory users, ICallerPermissions scope, CancellationToken ct, string? status = null, Guid? shiftId = null,
+        string? issuedFrom = null)
     {
         var (range, refused) = await RangeAsync(branchId, from, to, calendar, scope, ct);
         if (refused is not null) return refused;
@@ -151,6 +152,12 @@ internal static class ReceiptReportEndpoints
         var rows = db.Receipts.AsNoTracking().Where(x => x.BranchId == r.Branch.BranchId && x.ReceiptAt >= r.Start && x.ReceiptAt < r.End);
         if (wanted is not null) rows = rows.Where(x => x.Status == wanted);
         if (shiftId is not null) rows = rows.Where(x => x.ShiftId == shiftId);
+        if (!string.IsNullOrWhiteSpace(issuedFrom))
+        {
+            var source = issuedFrom.Trim().ToUpperInvariant();
+            if (source is not ("GATE" or "WINDOW" or "CASH_BILL")) return RevenueSupport.Invalid("issuedFrom", "Use GATE, WINDOW or CASH_BILL.");
+            rows = rows.Where(x => x.IssuedFrom == source);
+        }
         if (!string.IsNullOrWhiteSpace(query.Search))
         {
             var q = query.Search.Trim();
@@ -164,13 +171,22 @@ internal static class ReceiptReportEndpoints
                 .Select(p => new { p.ReceiptId, p.Channel }).ToListAsync(ct))
             .ToLookup(p => p.ReceiptId, p => p.Channel);
         var names = await users.DisplayNamesAsync(page.Items.Select(x => x.CashierUserId), ct);
+        // The split trail, both ways, for the page's rows.
+        var fromIds = page.Items.Select(x => x.SplitFromReceiptId).OfType<Guid>().Distinct().ToList();
+        var splitFrom = fromIds.Count == 0 ? []
+            : await db.Receipts.AsNoTracking().Where(x => fromIds.Contains(x.ReceiptId)).ToDictionaryAsync(x => x.ReceiptId, x => x.ReceiptNo, ct);
+        var splitInto = (await db.Receipts.AsNoTracking().Where(x => x.SplitFromReceiptId != null && ids.Contains(x.SplitFromReceiptId.Value))
+                .Select(x => new { From = x.SplitFromReceiptId!.Value, x.ReceiptNo }).ToListAsync(ct))
+            .ToLookup(x => x.From, x => x.ReceiptNo);
 
         return TypedResults.Ok(new PagedResult<ReceiptRowResponse>(
             page.Items.Select(x => new ReceiptRowResponse(
                 x.ReceiptId, x.ReceiptNo, x.ReceiptAt, x.ShiftId, x.CashierUserId, names.GetValueOrDefault(x.CashierUserId),
                 x.OrderNo, x.PayerPartyCode, x.PayerName, x.PayerTaxId, x.PayerBranchNo, x.CurrencyCode,
                 x.SubtotalAmount, x.TaxAmount, x.TotalAmount, x.Status, x.VoidedAt, x.VoidReason,
-                channels[x.ReceiptId].Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList())).ToList(),
+                channels[x.ReceiptId].Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList(),
+                x.IssuedFrom, x.SplitFromReceiptId is { } fromId ? splitFrom.GetValueOrDefault(fromId) : null,
+                splitInto[x.ReceiptId].Any() ? splitInto[x.ReceiptId].OrderBy(n => n, StringComparer.Ordinal).ToList() : null)).ToList(),
             page.Page, page.PageSize, page.TotalCount));
     }
 
@@ -208,4 +224,6 @@ public sealed record ReceiptRowResponse(
     Guid ReceiptId, string ReceiptNo, DateTimeOffset ReceiptAt, Guid ShiftId, Guid CashierUserId, string? CashierName,
     string? OrderNo, string? PayerCode, string PayerName, string? PayerTaxId, string? PayerBranchNo, string CurrencyCode,
     decimal Subtotal, decimal Tax, decimal Total, string Status, DateTimeOffset? VoidedAt, string? VoidReason,
-    IReadOnlyList<string> Channels);
+    IReadOnlyList<string> Channels,
+    // gecko_revenue 29: GATE | WINDOW | CASH_BILL (null before 29), and the split trail both ways.
+    string? IssuedFrom = null, string? SplitFromReceiptNo = null, IReadOnlyList<string>? SplitIntoReceiptNos = null);

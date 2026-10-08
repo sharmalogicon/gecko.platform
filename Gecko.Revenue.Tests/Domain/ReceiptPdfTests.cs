@@ -51,4 +51,39 @@ public sealed class ReceiptPdfTests
         Assert.Equal("%PDF"u8.ToArray(), ReceiptDocument.Render(Receipt("ISSUED", sparse))[..4]);
         Assert.Equal("%PDF"u8.ToArray(), ReceiptDocument.Render(Receipt("ISSUED", null))[..4]);
     }
+
+    /// <summary>More lines than the KPS bill's 19 rows: the table runs onto a second page under the same header.</summary>
+    [Fact]
+    public void A_long_bill_runs_onto_another_page()
+    {
+        var many = Enumerable.Range(1, 30).Select(i => new ReceiptLineResponse((short)i, $"CHG{i:00}", $"Charge {i}", $"TSTU{i:0000000}", "FULL_OUT", 1, 10m, 10m, 7m, 0.70m)).ToList();
+        var facts = new ReceiptPrintFacts("+66 0 0000 0000", null, new Dictionary<string, string> { ["CHG01"] = "ค่าผ่านลาน" });
+
+        var pdf = ReceiptDocument.Render(Receipt("ISSUED", FullSeller) with { Lines = many }, facts);
+
+        Assert.Equal("%PDF"u8.ToArray(), pdf[..4]);
+    }
+
+    [Theory]
+    [InlineData("ISSUED")]
+    [InlineData("VOIDED")]
+    public void The_coupon_receipt_renders_as_a_pdf(string status)
+    {
+        var pdf = CouponSlipDocument.Render(Receipt(status, FullSeller));
+
+        Assert.Equal("%PDF"u8.ToArray(), pdf[..4]);
+        Assert.True(pdf.Length > 5_000, "a real page with embedded Thai fonts is not a few hundred bytes");
+    }
+
+    /// <summary>The KPS bill's amount in words, as its VB <c>Code.ExpandPrice</c> wrote it — doubled spaces and all.</summary>
+    [Theory]
+    [InlineData("1230.50", "One Thousand Two Hundred Thirty  Baht  And Fifty  Satang")]
+    [InlineData("160.50", "One Hundred Sixty  Baht  And Fifty  Satang")]
+    [InlineData("1500", "One Thousand Five Hundred  Baht  Zero Satang")]
+    [InlineData("1", "One  Baht Zero Satang")]
+    [InlineData("19", "Nineteen Baht  Zero Satang")]
+    [InlineData("1000000", "One Million  Baht  Zero Satang")]
+    [InlineData("21.01", "Twenty One  Baht  And One  Satang ")]
+    public void The_amount_in_words_reads_as_Vector_wrote_it(string amount, string expected) =>
+        Assert.Equal(expected, VectorAmountInWords.ExpandPrice(decimal.Parse(amount, System.Globalization.CultureInfo.InvariantCulture)));
 }

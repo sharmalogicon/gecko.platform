@@ -203,8 +203,9 @@ public sealed record CodeRef(Guid Id, string Code, bool IsActive);
 public sealed record BranchRef(Guid BranchId, string BranchCode, string? TimeZone);
 
 /// <param name="OperatorCode">A shipping line's operator code (MDM shipping_line_extension): Vector's booking "Owner Code".</param>
+/// <param name="Phone">The party's primary phone (MDM party.primary_phone): the tax invoice's "โทร." line.</param>
 public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool IsActive,
-    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null);
+    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null, string? Phone = null);
 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 

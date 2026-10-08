@@ -37,9 +37,16 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
     public async Task<bool> KnowsBoxNumbersAsync(IReadOnlyDictionary<Guid, string> containerNoByBookingContainerId, CancellationToken ct)
     {
         var ids = containerNoByBookingContainerId.Keys.ToList();
-        var known = await db.BookingPlanContainers.AsNoTracking().Where(c => ids.Contains(c.BookingContainerId))
-            .Select(c => new { c.BookingContainerId, c.ContainerNo }).ToListAsync(ct);
-        return known.Count == ids.Count && known.All(c => c.ContainerNo == containerNoByBookingContainerId[c.BookingContainerId]);
+        var known = await db.BookingPlanContainers.Where(c => ids.Contains(c.BookingContainerId)).ToListAsync(ct);
+        if (known.Count != ids.Count) return false;
+        // The gate just wrote the number onto an empty place: take it now rather than wait for the outbox
+        // (which repeats it a moment later, the same value).
+        var stale = known.Where(c => c.ContainerNo != containerNoByBookingContainerId[c.BookingContainerId]).ToList();
+        if (stale.Count == 0) return true;
+        foreach (var c in stale) { c.ContainerNo = containerNoByBookingContainerId[c.BookingContainerId]; c.UpdatedAt = DateTimeOffset.UtcNow; }
+        await db.SaveChangesAsync(ct);
+        db.ChangeTracker.Clear();
+        return true;
     }
 
     public async Task<TruckPaymentResult> PayAsync(TruckPaymentRequest request, CancellationToken ct)

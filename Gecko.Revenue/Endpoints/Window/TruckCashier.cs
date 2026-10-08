@@ -124,7 +124,7 @@ internal sealed class TruckCashier(RevenueDbContext db, WindowService window, IM
             var payments = request.Payments.Select(x => new PaymentRequest(x.Channel, x.Amount, x.TenderedAmount, x.ReferenceNo, x.BankName)).ToList();
             var (receipt, _) = await window.IssueReceiptAsync(payable, shift, payments,
                 string.IsNullOrEmpty(payerName) ? "Walk-in customer" : payerName, payer, request.CashierUserId, null, ct,
-                withheld, request.IdempotencyKey, hash);
+                withheld, request.IdempotencyKey, hash, issuedFrom: "GATE");
             return (await ReplayAsync(request.IdempotencyKey, hash, ct))!;
         }
         catch (DbUpdateException e) when (e.InnerException?.Message.Contains("uq_receipt__idempotency_key") == true)

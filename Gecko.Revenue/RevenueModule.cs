@@ -51,6 +51,7 @@ public static class RevenueModule
         services.AddScoped<ScheduleApprovalGuard>();
         services.AddScoped<Contracts.ITariffPricing, TariffPricer>();
         services.AddScoped<Contracts.ITruckCashier, Endpoints.Window.TruckCashier>();
+        services.AddScoped<Contracts.IRevenueBoxCharges, Application.RevenueBoxCharges>();
 
         // Phase 6, clock 1 — the cash window (PLAN_BILLING §4.2).
         services.AddScoped<ReeferPowerQuoter>();
@@ -84,6 +85,7 @@ public static class RevenueModule
             .MapInvoiceEndpoints()
             .MapManualChargeEndpoints()
             .MapCashBillEndpoints()
+            .MapReceiptSplitEndpoints()
             .MapUnbilledOrderEndpoints()
             .MapReceiptReportEndpoints();
 

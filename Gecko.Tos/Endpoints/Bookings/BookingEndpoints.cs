@@ -566,7 +566,7 @@ internal static class BookingEndpoints
     /// </summary>
     private static async Task<Results<Ok<BookingContainerResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateLineAsync(
         Guid id, Guid bookingContainerId, UpdateContainerLineRequest request, TosDbContext db, IMasterDataReferences master,
-        ICallerPermissions scope, CancellationToken ct)
+        ICallerPermissions scope, Gecko.Revenue.Contracts.IRevenueBoxCharges revenue, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(db, id, ct);
@@ -599,6 +599,9 @@ internal static class BookingEndpoints
             else if (box.ContainerNo is { } paidNo && await db.GateAuthorizations.AnyAsync(a => a.BookingId == id && a.ContainerNo == paidNo
                          && a.PaymentChannel != "CREDIT" && a.PaymentChannel != "WAIVED" && a.Amount > 0 && a.ConsumedAt == null && a.RevokedAt == null, ct))
                 errors.Add("equipmentTypeCode", $"{paidNo} is already paid at the window for its next move; void the receipt before changing its size/type.");
+            // Paid in advance (cash bill) or at the window, numbered or not (owner 2026-10-08).
+            else if (await revenue.PaidOnAsync(box.BookingContainerId, ct) is { } receiptNo)
+                errors.Add("equipmentTypeCode", $"This box has charges paid on {receiptNo}; void that receipt before changing its size/type.");
         }
         var typeCode = retype && newType is not null ? newType.TypeCode : line.EquipmentTypeCode;
 

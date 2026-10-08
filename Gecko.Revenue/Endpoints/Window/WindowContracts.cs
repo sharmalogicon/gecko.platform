@@ -163,7 +163,9 @@ public sealed record ReceiptResponse(
     string? ReplacesReceiptNo = null, string? ReplacedByReceiptNo = null,
     // Withholding tax the payer kept back (0 = none). Total is the tax invoice's; NettAmount is what was paid.
     decimal? WithholdingTaxRate = null, decimal WithholdingTaxAmount = 0, decimal NettAmount = 0,
-    string? PayerPartyCode = null, string? Remarks = null);
+    string? PayerPartyCode = null, string? Remarks = null,
+    // gecko_revenue 29: where it was issued (GATE | WINDOW | CASH_BILL), and the split trail both ways.
+    string? IssuedFrom = null, string? SplitFromReceiptNo = null, IReadOnlyList<string>? SplitIntoReceiptNos = null);
 
 /// <summary>
 /// The seller block of the tax invoice, exactly as MDM holds it. A null field is

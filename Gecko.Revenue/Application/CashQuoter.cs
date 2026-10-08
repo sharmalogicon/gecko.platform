@@ -209,7 +209,11 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         var settled = await db.Charges.AsNoTracking()
             .Where(c => c.BookingContainerId == box.BookingContainerId && c.MovementCode == step.MovementCode
                         && c.Source == ChargeSource.Window && Settled.Contains(c.Status))
-            .Select(c => new { c.ChargeCode, c.BillTo, c.PaymentTermCode, c.Amount, c.ServiceTo, c.Quantity })
+            .Select(c => new
+            {
+                c.ChargeCode, c.BillTo, c.PaymentTermCode, c.Amount, c.ServiceTo, c.Quantity, Total = c.Amount + c.TaxAmount, c.Status,
+                ReceiptNo = db.Receipts.Where(r => r.ReceiptId == c.ReceiptId).Select(r => r.ReceiptNo).FirstOrDefault(),
+            })
             .ToListAsync(ct);
 
         var equipment = box.EquipmentTypeCode is { Length: > 0 } type
@@ -265,10 +269,17 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
         foreach (var (item, kind) in cashMenu)
         {
-            if (settled.Any(s => s.ChargeCode == item.ChargeCode && s.BillTo == item.BillTo && s.PaymentTermCode == Cash)
-                || WaivedOnStatement(item.ChargeCode, item.BillTo, Cash))
+            if (settled.FirstOrDefault(s => s.ChargeCode == item.ChargeCode && s.BillTo == item.BillTo && s.PaymentTermCode == Cash) is { } prepaid)
             {
-                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "SETTLED", null, []));
+                // Paid before the gate — at the window or on a cash bill (owner 2026-10-08): the gate shows where.
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "SETTLED", prepaid.Status == ChargeStatus.Waived ? null : prepaid.Total,
+                    [prepaid.Status == ChargeStatus.Waived ? "Waived at the window."
+                        : prepaid.ReceiptNo is { } no ? $"Paid in advance on {no}." : "Paid in advance."]));
+                continue;
+            }
+            if (WaivedOnStatement(item.ChargeCode, item.BillTo, Cash))
+            {
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "SETTLED", null, ["Waived on the booking statement."]));
                 continue;
             }
             if (CarriedElsewhere(item.ChargeCode) is { } carried)

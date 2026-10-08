@@ -55,6 +55,12 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
             ? await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == replacedId).Select(r => r.ReceiptNo).SingleOrDefaultAsync(ct)
             : null;
         var replacedBy = await db.Receipts.AsNoTracking().Where(r => r.ReplacesReceiptId == receiptId).Select(r => r.ReceiptNo).SingleOrDefaultAsync(ct);
+        // A split gate receipt and its parts name each other (split_from_receipt_id).
+        var splitFrom = receipt.SplitFromReceiptId is { } fromId
+            ? await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == fromId).Select(r => r.ReceiptNo).SingleOrDefaultAsync(ct)
+            : null;
+        var splitInto = await db.Receipts.AsNoTracking().Where(r => r.SplitFromReceiptId == receiptId)
+            .OrderBy(r => r.ReceiptNo).Select(r => r.ReceiptNo).ToListAsync(ct);
 
         return new ReceiptResponse(receipt.ReceiptId, receipt.ReceiptNo,
             branch is null ? receipt.ReceiptAt : branch.Local(receipt.ReceiptAt),
@@ -73,7 +79,7 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
             receipt.VoidedAt is { } voided && branch is not null ? branch.Local(voided) : receipt.VoidedAt, receipt.VoidReason,
             replaces, replacedBy,
             receipt.WithholdingTaxRate, receipt.WithholdingTaxAmount, receipt.TotalAmount - receipt.WithholdingTaxAmount,
-            receipt.PayerPartyCode, receipt.Remarks);
+            receipt.PayerPartyCode, receipt.Remarks, receipt.IssuedFrom, splitFrom, splitInto.Count > 0 ? splitInto : null);
     }
 
     public async Task<Rendered?> RenderAsync(Guid receiptId, CancellationToken ct)

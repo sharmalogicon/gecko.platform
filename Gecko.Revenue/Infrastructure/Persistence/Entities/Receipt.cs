@@ -36,6 +36,12 @@ public partial class Receipt
     /// <summary>gecko_revenue 28: the clerk's remarks (desktop InvoiceHeader.Remarks).</summary>
     public string? Remarks { get; set; }
 
+    /// <summary>gecko_revenue 29: GATE | WINDOW | CASH_BILL (null before 29).</summary>
+    public string? IssuedFrom { get; set; }
+
+    /// <summary>gecko_revenue 29: on a split part, the gate receipt it was split from.</summary>
+    public Guid? SplitFromReceiptId { get; set; }
+
     public string CurrencyCode { get; set; } = null!;
 
     public decimal SubtotalAmount { get; set; }

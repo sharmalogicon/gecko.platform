@@ -83,6 +83,7 @@ internal static class CashBillEndpoints
 
     private static async Task<Results<Created<ReceiptResponse>, ValidationProblem, ForbidHttpResult, ProblemHttpResult>> CreateAsync(
         CreateCashBillRequest request, RevenueDbContext db, BranchCalendar calendar, IMasterDataReferences master, ReceiptDocument document,
+        WindowService window,
         ITenantContext caller, ICallerPermissions scope, HttpContext http, CancellationToken ct)
     {
         var (key, badKey) = Idempotency.KeyOf(http.Request);
@@ -150,6 +151,7 @@ internal static class CashBillEndpoints
         var shift = await OpenShiftAsync(db, branchId, me, caller.TenantId(), now, ct);
         var receiptNo = await RevenueNumberSeries.NextAsync(db, RevenueNumberSeries.Receipt, branchId, branch.BranchCode, branch.Local(now), ct);
         var bookings = charges.Select(c => (c.BookingId, c.OrderNo)).Distinct().ToList();
+        var paidLines = new List<Charge>();
         var payer = request.Payer;
         var receipt = new Receipt
         {
@@ -161,7 +163,7 @@ internal static class CashBillEndpoints
             Remarks = string.IsNullOrEmpty(remarks) ? null : remarks,
             CurrencyCode = charges.Select(c => c.CurrencyCode).First(), SubtotalAmount = subtotal, TaxAmount = tax, TotalAmount = total,
             Status = "ISSUED", WithholdingTaxRate = withheld > 0 ? rate : null, WithholdingTaxAmount = withheld,
-            IdempotencyKey = key, IdempotencyHash = hash,
+            IdempotencyKey = key, IdempotencyHash = hash, IssuedFrom = "CASH_BILL",
         };
         db.Receipts.Add(receipt);
 
@@ -200,6 +202,7 @@ internal static class CashBillEndpoints
             paidLine.ReceiptId = receipt.ReceiptId;
             paidLine.ReceiptLineId = line.ReceiptLineId;
             paidLine.UpdatedAt = now;
+            paidLines.Add(paidLine);
         }
 
         foreach (var p in request.Payments!)
@@ -215,6 +218,13 @@ internal static class CashBillEndpoints
         {
             return RevenueSupport.Conflict("A line changed while billing it.", "Refresh the lines and choose again.");
         }
+
+        // A box whose next move is now fully paid gets its gate coupon (owner 2026-10-08).
+        var channels = request.Payments!.Select(p => p.Channel.Trim().ToUpperInvariant()).Distinct().ToList();
+        foreach (var bookingId in paidLines.Where(c => c.BookingContainerId is not null).Select(c => c.BookingId).OfType<Guid>().Distinct())
+            if (await db.BookingPlans.AsNoTracking().SingleOrDefaultAsync(p => p.BookingId == bookingId && p.Status == "OPEN", ct) is { } plan
+                && await window.ContextAsync(plan, ct) is { } context)
+                await window.CouponsForPrepaidAsync(context, paidLines, receipt, channels.Count == 1 ? channels[0] : "MIXED", ct);
         await transaction.CommitAsync(ct);
         return TypedResults.Created($"/api/revenue/window/receipts/{receipt.ReceiptId}", (await document.ReadAsync(receipt.ReceiptId, ct))!);
     }

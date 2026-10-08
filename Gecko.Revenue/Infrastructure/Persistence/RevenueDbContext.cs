@@ -1449,6 +1449,11 @@ public partial class RevenueDbContext : DbContext
             entity.Property(e => e.Remarks)
                 .HasMaxLength(500)
                 .HasColumnName("remarks");
+            entity.Property(e => e.IssuedFrom)
+                .HasMaxLength(12)
+                .IsUnicode(false)
+                .HasColumnName("issued_from");
+            entity.Property(e => e.SplitFromReceiptId).HasColumnName("split_from_receipt_id");
             entity.Property(e => e.PayerBranchNo)
                 .HasMaxLength(10)
                 .IsUnicode(false)

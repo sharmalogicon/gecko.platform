@@ -284,7 +284,7 @@ public sealed record TripSaveResponse(
     DateTimeOffset? TruckLeftAt = null);
 
 /// <param name="Nett">What was paid: the total less withholding tax.</param>
-/// <param name="CouponPdfUrl">The coupon slips, one per box (A10).</param>
+/// <param name="CouponPdfUrl">The coupon: the receipt's KPS cash-sale bill (บิลเงินสด / CASH SALE), every box on it.</param>
 public sealed record TripReceiptResponse(
     Guid ReceiptId, string ReceiptNo, decimal Subtotal, decimal Tax, decimal Total, decimal WithholdingTax, decimal Nett,
     string CurrencyCode, string PdfUrl, string? CouponPdfUrl = null);

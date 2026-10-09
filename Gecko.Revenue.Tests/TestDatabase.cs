@@ -22,6 +22,9 @@ internal static class TestDatabase
         Environment.GetEnvironmentVariable("GECKO_REVENUE_ADMIN")
         ?? $"Server={Server};Database=gecko_revenue;Integrated Security=true;TrustServerCertificate=true";
 
+    /// <summary>The sysadmin door, for a test that tidies rows the app may not delete.</summary>
+    public static string AdminConnectionString => AdminConnection;
+
     // Fixture tenants — the GUIDs gecko_identity provisioned.
     public static readonly Guid Sct = Guid.Parse("C458E785-33A5-F111-9B0D-00919E4766D5");
     // SSS is the second tenant the tests use. KORAKIT is a real customer (its tariffs

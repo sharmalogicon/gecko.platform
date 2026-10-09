@@ -17,11 +17,14 @@ namespace Gecko.Revenue.Endpoints.Window;
 /// Split a gate receipt (owner 2026-10-08): after the gate Save the truck's one receipt is made out
 /// to several payers — some charges to another customer, the rest to the haulier. The money taken
 /// does not change; the tax invoices do.
-///   * gate receipts only (issued_from GATE), ISSUED, and only on the day they were issued;
-///   * every line goes to exactly one part; ONE part is a re-issue to another payer; each part is a NEW receipt
-///     (CA + branch + YYMM + 5) naming the original (split_from_receipt_id);
-///   * the original is cancelled "Split into …" — its coupons are NOT withdrawn and the charges
-///     keep their status (the boxes have moved): they are re-pointed to the parts, with the part's payer;
+///   * every line goes to exactly one part;
+///   * ONE part is a change of payer (owner 2026-10-09): any issued receipt, any day, keeps its number —
+///     the payer columns are updated in place, nothing else changes, nothing is voided;
+///   * two or more parts: gate receipts only (issued_from GATE), ISSUED, and only on the day they were issued.
+///     The FIRST part keeps the original receipt and number (its lines, payments and totals re-stated);
+///     every other part is a NEW receipt (CA + branch + YYMM + 5) naming it (split_from_receipt_id);
+///   * coupons are NOT withdrawn and the charges keep their status (the boxes have moved): they are
+///     re-pointed to their part, with the part's payer;
 ///   * each part's payments (channels as the clerk chooses) add up to its own nett, and per
 ///     channel the parts together take exactly what the original took — the drawer does not change;
 ///   * withholding tax only on a part over ฿1,000 (3% of its amount before VAT).
@@ -35,7 +38,7 @@ internal static class ReceiptSplitEndpoints
     {
         revenue.MapGroup("/window/receipts").WithTags("Revenue — cash window")
             .MapPost("/{id:guid}/split", SplitAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
-            .WithSummary("Split a gate receipt of today into new receipts for several payers; the original is cancelled, the money is unchanged");
+            .WithSummary("Change who a receipt is made out to (one part, keeps its number), or split a gate receipt of today among several payers (the first part keeps the number); the money is unchanged");
         return revenue;
     }
 
@@ -47,11 +50,13 @@ internal static class ReceiptSplitEndpoints
         if (original is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });
         if (!permissions.HasAt(RevenuePermissions.CashCollect, original.BranchId)) return TypedResults.Forbid();
         if (original.Status != "ISSUED") return RevenueSupport.Conflict($"{original.ReceiptNo} is {original.Status}; only an issued receipt is split.");
-        if (original.IssuedFrom != "GATE") return RevenueSupport.Conflict($"{original.ReceiptNo} was not issued at the gate; only a gate receipt is split.");
         var branch = await calendar.BranchAsync(original.BranchId, ct);
         if (branch is null) return RevenueSupport.Conflict("This depot has no master-data profile.");
         var now = calendar.Now;
-        if (branch.LocalDate(original.ReceiptAt) != branch.LocalDate(now))
+        // One part is a change of payer: any issued receipt, any day (owner 2026-10-09). Dividing one stays a gate, same-day thing.
+        var renaming = request.Parts is { Count: 1 };
+        if (!renaming && original.IssuedFrom != "GATE") return RevenueSupport.Conflict($"{original.ReceiptNo} was not issued at the gate; only a gate receipt is split.");
+        if (!renaming && branch.LocalDate(original.ReceiptAt) != branch.LocalDate(now))
             return RevenueSupport.Conflict($"{original.ReceiptNo} was issued on {branch.LocalDate(original.ReceiptAt):dd-MM-yyyy}; a receipt is split on the day it was issued only.");
 
         var lines = await db.ReceiptLines.AsNoTracking().Where(l => l.ReceiptId == id).OrderBy(l => l.LineNo).ToListAsync(ct);
@@ -116,39 +121,31 @@ internal static class ReceiptSplitEndpoints
             return RevenueSupport.Invalid("parts", $"'{unknown}' is not a party of this tenant.");
 
         // ── write it ────────────────────────────────────────────────────────────
+        // The FIRST part keeps the original receipt and its number (owner 2026-10-09): its payer —
+        // and, when the receipt is divided, its lines, payments and totals — are re-stated in place
+        // (30_receipt_amend grants). Only the other parts are new receipts naming it. One part is
+        // therefore a change of payer: nothing is voided and no number is used.
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         var chargeIds = lines.Select(l => l.ChargeId).ToList();
         var charges = await db.Charges.Where(c => chargeIds.Contains(c.ChargeId)).ToDictionaryAsync(c => c.ChargeId, ct);
         var me = caller.UserId();
-        var issued = new List<(Receipt Receipt, List<(ReceiptLine Old, ReceiptLine New)> Lines, string? PartyCode)>();
 
-        foreach (var (part, mine, subtotal, tax, withheld, partyCode) in planned)
+        (Guid? BookingId, string? OrderNo) BookingOf(List<ReceiptLine> mine)
         {
-            var receiptNo = await RevenueNumberSeries.NextAsync(db, RevenueNumberSeries.Receipt, original.BranchId, branch.BranchCode, branch.Local(now), ct);
             var bookings = mine.Select(l => charges.GetValueOrDefault(l.ChargeId)).OfType<Charge>().Select(c => (c.BookingId, c.OrderNo)).Distinct().ToList();
-            var payerName = part.Payer?.Name?.Trim() is { Length: > 0 } named ? named
-                : partyCode is not null ? parties[partyCode].Name : original.PayerName;
-            var receipt = new Receipt
-            {
-                ReceiptId = Guid.CreateVersion7(), TenantId = original.TenantId, BranchId = original.BranchId, ReceiptNo = receiptNo,
-                ReceiptAt = now, ShiftId = original.ShiftId, CashierUserId = original.CashierUserId,
-                BookingId = bookings.Count == 1 ? bookings[0].BookingId : null, OrderNo = bookings.Count == 1 ? bookings[0].OrderNo : null,
-                PayerPartyCode = partyCode ?? original.PayerPartyCode, PayerName = payerName,
-                PayerTaxId = part.Payer?.TaxId?.Trim(), PayerBranchNo = part.Payer?.BranchNo?.Trim(), PayerAddress = part.Payer?.Address?.Trim(),
-                Remarks = original.Remarks, CurrencyCode = original.CurrencyCode,
-                SubtotalAmount = subtotal, TaxAmount = tax, TotalAmount = subtotal + tax, Status = "ISSUED",
-                WithholdingTaxRate = withheld > 0 ? WithholdingTax.Rate : null, WithholdingTaxAmount = withheld,
-                IssuedFrom = "GATE", SplitFromReceiptId = original.ReceiptId, CreatedBy = me,
-            };
-            db.Receipts.Add(receipt);
-
+            return bookings.Count == 1 ? (bookings[0].BookingId, bookings[0].OrderNo) : (null, null);
+        }
+        string PayerName(SplitPartRequest part, string? partyCode) => part.Payer?.Name?.Trim() is { Length: > 0 } named ? named
+            : partyCode is not null ? parties[partyCode].Name : original.PayerName;
+        List<(ReceiptLine Old, ReceiptLine New)> Copy(Guid receiptId, List<ReceiptLine> mine)
+        {
             short lineNo = 0;
             var pairs = new List<(ReceiptLine Old, ReceiptLine New)>();
             foreach (var old in mine)
             {
                 var copy = new ReceiptLine
                 {
-                    ReceiptLineId = Guid.CreateVersion7(), TenantId = original.TenantId, ReceiptId = receipt.ReceiptId, LineNo = ++lineNo,
+                    ReceiptLineId = Guid.CreateVersion7(), TenantId = original.TenantId, ReceiptId = receiptId, LineNo = ++lineNo,
                     ChargeId = old.ChargeId, ChargeCode = old.ChargeCode, Description = old.Description, ContainerNo = old.ContainerNo,
                     MovementCode = old.MovementCode, Quantity = old.Quantity, UnitRate = old.UnitRate, Amount = old.Amount,
                     TaxCode = old.TaxCode, TaxRate = old.TaxRate, TaxAmount = old.TaxAmount,
@@ -156,48 +153,92 @@ internal static class ReceiptSplitEndpoints
                 db.ReceiptLines.Add(copy);
                 pairs.Add((old, copy));
             }
+            return pairs;
+        }
+        void Pay(Guid receiptId, SplitPartRequest part)
+        {
             foreach (var p in part.Payments!)
                 db.ReceiptPayments.Add(new ReceiptPayment
                 {
-                    TenantId = original.TenantId, ReceiptId = receipt.ReceiptId, Channel = p.Channel.Trim().ToUpperInvariant(),
+                    TenantId = original.TenantId, ReceiptId = receiptId, Channel = p.Channel.Trim().ToUpperInvariant(),
                     Amount = CashQuoter.Money(p.Amount), TenderedAmount = p.TenderedAmount is { } t ? CashQuoter.Money(t) : null,
                     ReferenceNo = p.ReferenceNo?.Trim(), BankName = p.BankName?.Trim(),
                 });
-            issued.Add((receipt, pairs, partyCode));
+        }
+
+        // The original first: it is the row two clerks could be changing at once.
+        var (first, firstLines, firstSubtotal, firstTax, firstWithheld, firstParty) = planned[0];
+        var (bookingId, orderNo) = renaming ? (original.BookingId, original.OrderNo) : BookingOf(firstLines);
+        var (subtotalAmount, taxAmount, withheldAmount, withheldRate) = renaming
+            ? (original.SubtotalAmount, original.TaxAmount, original.WithholdingTaxAmount, original.WithholdingTaxRate)
+            : (firstSubtotal, firstTax, firstWithheld, firstWithheld > 0 ? WithholdingTax.Rate : (decimal?)null);
+        var payerCode = firstParty ?? original.PayerPartyCode;
+        var payerName = PayerName(first, firstParty);
+        var amended = await db.Receipts.Where(r => r.ReceiptId == id && r.Status == "ISSUED" && r.RowVersion == original.RowVersion)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.PayerPartyCode, payerCode).SetProperty(r => r.PayerName, payerName)
+                .SetProperty(r => r.PayerTaxId, first.Payer?.TaxId?.Trim()).SetProperty(r => r.PayerBranchNo, first.Payer?.BranchNo?.Trim())
+                .SetProperty(r => r.PayerAddress, first.Payer?.Address?.Trim())
+                .SetProperty(r => r.BookingId, bookingId).SetProperty(r => r.OrderNo, orderNo)
+                .SetProperty(r => r.SubtotalAmount, subtotalAmount).SetProperty(r => r.TaxAmount, taxAmount)
+                .SetProperty(r => r.TotalAmount, subtotalAmount + taxAmount)
+                .SetProperty(r => r.WithholdingTaxRate, withheldRate).SetProperty(r => r.WithholdingTaxAmount, withheldAmount)
+                .SetProperty(r => r.UpdatedAt, now).SetProperty(r => r.UpdatedBy, me), ct);
+        if (amended == 0) return RevenueSupport.Conflict($"{original.ReceiptNo} was changed a moment ago.", "Reload it.");
+
+        // Divided: the original keeps the first part's lines (numbered from 1 again) and payments.
+        var kept = lines.Select(l => (Old: l, New: l)).ToList();
+        if (!renaming)
+        {
+            await db.ReceiptLines.Where(l => l.ReceiptId == id).ExecuteDeleteAsync(ct);
+            await db.ReceiptPayments.Where(p => p.ReceiptId == id).ExecuteDeleteAsync(ct);
+            kept = Copy(original.ReceiptId, firstLines);
+            Pay(original.ReceiptId, first);
+        }
+        var parted = new List<(Guid ReceiptId, List<(ReceiptLine Old, ReceiptLine New)> Lines, string? PartyCode)> { (original.ReceiptId, kept, firstParty) };
+
+        foreach (var (part, mine, subtotal, tax, withheld, partyCode) in planned.Skip(1))
+        {
+            var receiptNo = await RevenueNumberSeries.NextAsync(db, RevenueNumberSeries.Receipt, original.BranchId, branch.BranchCode, branch.Local(now), ct);
+            var (partBookingId, partOrderNo) = BookingOf(mine);
+            var receipt = new Receipt
+            {
+                ReceiptId = Guid.CreateVersion7(), TenantId = original.TenantId, BranchId = original.BranchId, ReceiptNo = receiptNo,
+                ReceiptAt = now, ShiftId = original.ShiftId, CashierUserId = original.CashierUserId,
+                BookingId = partBookingId, OrderNo = partOrderNo,
+                PayerPartyCode = partyCode ?? original.PayerPartyCode, PayerName = PayerName(part, partyCode),
+                PayerTaxId = part.Payer?.TaxId?.Trim(), PayerBranchNo = part.Payer?.BranchNo?.Trim(), PayerAddress = part.Payer?.Address?.Trim(),
+                Remarks = original.Remarks, CurrencyCode = original.CurrencyCode,
+                SubtotalAmount = subtotal, TaxAmount = tax, TotalAmount = subtotal + tax, Status = "ISSUED",
+                WithholdingTaxRate = withheld > 0 ? WithholdingTax.Rate : null, WithholdingTaxAmount = withheld,
+                IssuedFrom = "GATE", SplitFromReceiptId = original.ReceiptId, CreatedBy = me,
+            };
+            db.Receipts.Add(receipt);
+            parted.Add((receipt.ReceiptId, Copy(receipt.ReceiptId, mine), partyCode));
+            Pay(receipt.ReceiptId, part);
         }
         await db.SaveChangesAsync(ct);
 
-        // The charges follow their line to its part (status unchanged: the boxes have moved).
-        foreach (var (receipt, pairs, partyCode) in issued)
+        // The charges follow their line to its part (status unchanged: the boxes have moved), with the part's payer.
+        foreach (var (receiptId, pairs, partyCode) in parted)
             foreach (var (old, copy) in pairs)
                 if (charges.GetValueOrDefault(old.ChargeId) is { } charge)
                 {
-                    charge.ReceiptId = receipt.ReceiptId;
+                    charge.ReceiptId = receiptId;
                     charge.ReceiptLineId = copy.ReceiptLineId;
                     if (partyCode is not null) charge.PayerPartyCode = partyCode;
                     charge.UpdatedAt = now;
                 }
         await db.SaveChangesAsync(ct);
-
-        // The original is cancelled, naming its parts (only the void columns may change on a receipt).
-        var into = string.Join(", ", issued.Select(i => i.Receipt.ReceiptNo));
-        var reason = (issued.Count == 1 ? $"Re-issued as {into}" : $"Split into {into}") + (string.IsNullOrWhiteSpace(request.Remarks) ? "" : $": {request.Remarks.Trim()}");
-        if (reason.Length > 300) reason = reason[..300];
-        var cancelled = await db.Receipts.Where(r => r.ReceiptId == id && r.Status == "ISSUED")
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(r => r.Status, "VOIDED").SetProperty(r => r.VoidedAt, now)
-                .SetProperty(r => r.VoidedBy, me).SetProperty(r => r.VoidReason, reason)
-                .SetProperty(r => r.UpdatedAt, now).SetProperty(r => r.UpdatedBy, me), ct);
-        if (cancelled == 0) return RevenueSupport.Conflict($"{original.ReceiptNo} was changed a moment ago.", "Reload it.");
         await transaction.CommitAsync(ct);
 
         var result = new List<ReceiptResponse>();
-        foreach (var (receipt, _, _) in issued) result.Add((await document.ReadAsync(receipt.ReceiptId, ct))!);
+        foreach (var (receiptId, _, _) in parted) result.Add((await document.ReadAsync(receiptId, ct))!);
         return TypedResults.Ok<IReadOnlyList<ReceiptResponse>>(result);
     }
 }
 
-/// <param name="Remarks">Optional, added to the original's cancel reason ("Split into …: remarks").</param>
+/// <param name="Remarks">Not kept: the original is no longer cancelled, so there is no cancel reason to add it to (2026-10-09).</param>
 public sealed record SplitReceiptRequest(IReadOnlyList<SplitPartRequest>? Parts, string? Remarks);
 
 /// <param name="LineNos">The original receipt's line numbers this part takes.</param>

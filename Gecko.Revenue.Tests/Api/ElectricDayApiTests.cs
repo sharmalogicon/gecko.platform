@@ -131,6 +131,11 @@ public sealed class ElectricDayApiTests(RevenueApiFactory api)
             Assert.Contains(std, r => r[0] == "REEFER CONTAINERS MOVEMENT");
             Assert.DoesNotContain(std, r => r[0] == full.ContainerNo);
 
+            // Electricity STD (3): hours billed and their rate, TOTAL = pre-cool + electricity as billed.
+            var std3 = Rows(await client.GetByteArrayAsync($"/api/revenue/reports/accounting/electricity-standard-3.xlsx?branchId={SctLcb01}&{Window}", ct), 14);
+            Assert.Equal(["2", "150.00", "500.00", full.OrderType], std3.Single(r => r[1] == full.ContainerNo)[10..]);
+            Assert.Equal(["1", "50.00", "50.00"], std3.Single(r => r[1] == empty.ContainerNo)[10..13]);
+
             var pdf = await client.GetAsync($"/api/revenue/reports/accounting/electricity-day-precool.pdf?branchId={SctLcb01}&{Window}", ct);
             Assert.Equal("application/pdf", pdf.Content.Headers.ContentType?.MediaType);
             var bad = await client.GetAsync($"/api/revenue/reports/accounting/electricity-day.pdf?branchId={SctLcb01}&{Window}&bookingType=NOPE", ct);

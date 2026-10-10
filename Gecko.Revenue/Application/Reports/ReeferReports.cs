@@ -39,6 +39,8 @@ internal static class ReeferReports
         PreCool,
         /// <summary>Electricity STD: a full gate-out in the window.</summary>
         AnyFullOut,
+        /// <summary>Electricity STD (3): any gate move of the box in the window.</summary>
+        AnyMove,
     }
 
     /// <param name="BookingType">Gecko's booking type code; null = every type (the RDLs' blank).</param>
@@ -51,7 +53,8 @@ internal static class ReeferReports
 
     /// <param name="Rate">The highest unit rate charged (the matrices' SELLING RATE).</param>
     /// <param name="Tax">The charges' own VAT.</param>
-    public sealed record Charges(int Lines, decimal Rate, decimal Amount, decimal Tax);
+    /// <param name="Quantity">The quantity billed (chargeable, else charged): hours for an hourly electricity rate.</param>
+    public sealed record Charges(int Lines, decimal Rate, decimal Amount, decimal Tax, decimal Quantity = 0);
 
     public static async Task<List<ReeferLine>> LinesAsync(
         RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, IMasterDataReferences master,
@@ -62,6 +65,7 @@ internal static class ReeferReports
             {
                 Driver.GateOut => m.Direction == "OUT",
                 Driver.FullOut or Driver.AnyFullOut => m.Direction == "OUT" && m.FullEmpty == "FULL",
+                Driver.AnyMove => true,
                 _ => m.BookingTypeCode == "EXPORT" ? m.Direction == "OUT" && m.FullEmpty == "EMPTY" : m.Direction == "IN" && m.FullEmpty == "FULL",
             })
             .ToList();
@@ -83,13 +87,13 @@ internal static class ReeferReports
         var tenant = await OperationChargeReports.TenantMapAsync(db, ElectricityKey, ct);
         string? Column(string code) => tenant.GetValueOrDefault(code) ?? ElectricityCodes.GetValueOrDefault(code);
         var ids = wanted.Select(b => b.BookingContainerId).ToList();
-        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount, decimal Tax)>();
+        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount, decimal Tax, decimal Quantity)>();
         foreach (var slice in ids.Chunk(2000))
             charges.AddRange((await db.Charges.AsNoTracking()
                     .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
-                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount, x.TaxAmount })
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount, x.TaxAmount, Quantity = x.ChargeableQuantity ?? x.Quantity })
                     .ToListAsync(ct))
-                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount, x.TaxAmount)));
+                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount, x.TaxAmount, x.Quantity)));
         var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
 
         var vesselCodes = wanted.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
@@ -102,7 +106,7 @@ internal static class ReeferReports
                 Charges Of(string column)
                 {
                     var hit = mine.Where(x => x.Column == column).ToList();
-                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount), hit.Sum(x => x.Tax));
+                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount), hit.Sum(x => x.Tax), hit.Sum(x => x.Quantity));
                 }
                 var (size, type) = OperationChargeReports.SizeType(types, b.EquipmentTypeCode);
                 var days = b.LadenIn is { } on && b.LadenOut is { } off
@@ -398,5 +402,66 @@ internal static class ReeferReports
                     ],
                     summary),
             ]);
+    }
+
+    /// <summary>
+    /// TMS.Accounting.ElectricStandard3 (Report.usp_Accounting_ElectricSTD3) — ELECTRICITY CHARGE FOR REEFER CONTAINER, by
+    /// the hour: a line per reefer box moved through the gate in the window, its pre-cool (empty gate-out date and time,
+    /// hours empty), its laden plug on/off (gate date and time), the electricity hours billed and their rate, the TOTAL in
+    /// baht (pre-cool + electricity) and the order type; then the total row.
+    /// Owner 2026-10-10 defaults: TOTAL is what was billed (the RDL repriced rate × hours, with a "CHINA SHIP" first-24-hours
+    /// rule — the charge already carries the tariff's answer); PRE COOL TIME is hours:minutes (the RDL printed the month);
+    /// hours empty are whole hours elapsed; NO counts boxes; cancelled bookings left out; the rate column is not totalled.
+    /// </summary>
+    public static TabularReport ElectricStandard3(AccountingReportContext c, IReadOnlyList<ReeferLine> lines)
+    {
+        string? Date(DateTimeOffset? at) => at is { } a ? c.Branch.Local(a).ToString("dd/MM/yy", CultureInfo.InvariantCulture) : null;
+        string? Time(DateTimeOffset? at) => at is { } a ? c.Branch.Local(a).ToString("HH:mm", CultureInfo.InvariantCulture) : null;
+        int EmptyHours(TosBookedBox b) => b.EmptyIn is { } i && b.EmptyOut is { } o && o > i ? (int)(o - i).TotalHours : 0;
+
+        var ordered = lines.OrderBy(x => x.Box.ContainerNo, StringComparer.Ordinal).ToList();
+        var rows = ordered.Select((x, n) => new TabularRow([
+            n + 1, x.Box.ContainerNo, x.Label, Date(x.Box.EmptyOut), Time(x.Box.EmptyOut), EmptyHours(x.Box),
+            Date(x.Box.LadenIn), Time(x.Box.LadenIn), Date(x.Box.LadenOut), Time(x.Box.LadenOut),
+            x.Electricity.Quantity, x.Electricity.Rate, x.PreCool.Amount + x.Electricity.Amount, x.Box.OrderTypeCode])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null, null, null, null, null, null, ordered.Sum(x => x.Electricity.Quantity), null,
+            ordered.Sum(x => x.PreCool.Amount + x.Electricity.Amount), null], RowKind.Total));
+
+        var first = ordered.FirstOrDefault();
+        var eta = first?.Box.Eta is { } at ? c.Branch.LocalDate(at).ToString("dd/MM/yyyy", CultureInfo.InvariantCulture) : "";
+        const string Hours = "#,0";   // Gecko bills reefer power by the started hour
+        return new TabularReport(
+            FileName: $"ElectricStandard3_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("ELECTRICITY CHARGE FOR REEFER CONTAINER", 10, Bold: true),
+                new($"VESSEL/VOY: {first?.VesselName} {first?.Box.Voyage}"),
+                new($"ETD : {eta}"),
+                new($"CARRIER: {first?.Box.LineCode}"),
+            ],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.0, null, CellAlign.Center), new(2.8), new(1.4, null, CellAlign.Center),
+                new(1.7, null, CellAlign.Center), new(1.3, null, CellAlign.Center), new(1.4, null, CellAlign.Right),
+                new(1.7, null, CellAlign.Center), new(1.3, null, CellAlign.Center), new(1.7, null, CellAlign.Center), new(1.3, null, CellAlign.Center),
+                new(1.5, Hours, CellAlign.Right), new(1.8, "#,0.00;(#,0.00)", CellAlign.Right), new(2.2, "#,0.00;(#,0.00)", CellAlign.Right), new(2.6),
+            ],
+            HeaderRows:
+            [
+                [new("NO"), new("CONTAINER"), new("SIZE"), new("EMPTY CONT FOR PRECOOL", ColSpan: 3), new("FULL CONTAINER ELECTRIC", ColSpan: 6),
+                 new("TOTAL"), new("STATUS")],
+                [new(""), new("NO"), new(""), new("PRE COOL", ColSpan: 2), new("NO. OF"), new("PLUG ON", ColSpan: 2), new("PLUG OFF", ColSpan: 2),
+                 new("NO. OF"), new("AMOUNT"), new("AMOUNT"), new("")],
+                [new(""), new(""), new(""), new("DATE"), new("TIME"), new("HOUR"), new("DATE"), new("TIME"), new("DATE"), new("TIME"), new("HOUR"),
+                 new("OF HOUR"), new("(BATH)"), new("")],
+            ],
+            Rows: rows);
     }
 }

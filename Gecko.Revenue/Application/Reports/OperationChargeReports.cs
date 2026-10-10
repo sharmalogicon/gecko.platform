@@ -195,31 +195,58 @@ internal static class OperationChargeReports
     /// no vessel call; a lift charge mapped LOLO is empty or laden by its move; totals corrected (the charge's amount,
     /// cancelled charges out, no whole-baht rounding, no HYUNDAI special case, no empty dates copied across bookings).
     /// </summary>
-    public static async Task<TabularReport> StorageActivityAsync(
+    public static Task<TabularReport> StorageActivityAsync(
         RevenueDbContext db, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
-        TosBookedBoxFilter filter, CancellationToken ct)
+        TosBookedBoxFilter filter, CancellationToken ct) =>
+        StorageActivityAsync(db, booked, master, c, filter, apl: false, ct);
+
+    /// <summary>Vector's order type → shipment type, printed by the APL cut as STATUS: FCL CY, LCL-CYD CYD, LCL-CFS CFS.</summary>
+    private static readonly IReadOnlyDictionary<string, string> AplStatus = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
-        var boxes = await booked.BoxesAsync(c.Branch.BranchId, c.Start, c.End, filter, ct);
+        ["EXP CY/CY"] = "CY", ["EXP CY/CY-IN"] = "CY", ["IMP CY/CY"] = "CY", ["IMP CYD"] = "CYD", ["EXP CFS"] = "CFS", ["IMP CFS"] = "CFS",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.APLContainerStorageActivity (inline SQL; never launched by the desktop) — the earlier, APL cut of the
+    /// Standard report: EXPORT boxes by vessel ETA, STATUS as the shipment type (CY / CYD / CFS, else "-"), the count by
+    /// that status, and LIFT OFF EMPTY as the cash lift-off (the RDL's SL001-CA). Owner 2026-10-10 defaults: storage and
+    /// LO/LO as the Standard report computes them (the RDL priced full storage at the empty rate and totalled days ×
+    /// one row's rate); built as all 33 are.
+    /// </summary>
+    public static Task<TabularReport> AplStorageActivityAsync(
+        RevenueDbContext db, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        TosBookedBoxFilter filter, CancellationToken ct) =>
+        StorageActivityAsync(db, booked, master, c, filter with { BookingTypeCode = "EXPORT" }, apl: true, ct);
+
+    private static async Task<TabularReport> StorageActivityAsync(
+        RevenueDbContext db, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        TosBookedBoxFilter filter, bool apl, CancellationToken ct)
+    {
+        var boxes = (await booked.BoxesAsync(c.Branch.BranchId, c.Start, c.End, filter, ct))
+            .Where(b => !apl || b.Eta is not null)
+            .ToList();
+        string Status(TosBookedBox b) => apl ? AplStatus.GetValueOrDefault(b.OrderTypeCode) ?? "-" : b.OrderTypeCode;
         var typeCodes = boxes.Select(b => b.EquipmentTypeCode).Distinct().ToList();
         var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
         var vessels = boxes.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
         var vesselNames = vessels.Count == 0 ? new Dictionary<string, VesselRef>() : await master.VesselsAsync(vessels, ct);
 
         var ids = boxes.Select(b => b.BookingContainerId).ToList();
-        var charges = new List<(Guid Box, string Code, string? Movement, string BillTo, decimal Days, decimal Amount)>();
+        var charges = new List<(Guid Box, string Code, string? Movement, string BillTo, string Term, decimal Days, decimal Amount)>();
         foreach (var slice in ids.Chunk(2000))
             charges.AddRange((await db.Charges.AsNoTracking()
                     .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
-                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.MovementCode, x.BillTo, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.MovementCode, x.BillTo, x.PaymentTermCode, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
                     .ToListAsync(ct))
-                .Select(x => (x.Box, x.ChargeCode, x.MovementCode, x.BillTo, x.Days, x.Amount)));
+                .Select(x => (x.Box, x.ChargeCode, x.MovementCode, x.BillTo, x.PaymentTermCode, x.Days, x.Amount)));
         var tenant = await TenantMapAsync(db, StorageActivityKey, ct);
         string? Column(string code, string? movement) => (tenant.GetValueOrDefault(code) ?? StorageActivityCodes.GetValueOrDefault(code)) switch
         {
             "LOLO" => movement is not null && movement.StartsWith("FULL", StringComparison.OrdinalIgnoreCase) ? "LOLO_LADEN" : "LOLO_EMPTY",
             var other => other,
         };
-        var byBox = charges.Select(x => (x.Box, Column: Column(x.Code, x.Movement), x.BillTo, x.Days, x.Amount))
+        var byBox = charges.Select(x => (x.Box, Column: apl && string.Equals(x.Code, "SL001-CA", StringComparison.OrdinalIgnoreCase)
+                ? "LOLO_EMPTY" : Column(x.Code, x.Movement), x.BillTo, x.Term, x.Days, x.Amount))
             .Where(x => x.Column is not null).ToLookup(x => x.Box);
 
         DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
@@ -235,7 +262,7 @@ internal static class OperationChargeReports
         var rows = lines.Select(x => new TabularRow([
             x.Box.ContainerNo, x.Box.EquipmentTypeCode, Day(x.Box.EmptyIn), Day(x.Box.EmptyOut), x.EmptyDays, x.EmptyAmount, x.LoloEmpty,
             Day(x.Box.LadenIn), Day(x.Box.LadenOut), x.FullDays, x.FullAmount, x.LoloLaden,
-            x.EmptyAmount + x.FullAmount, x.LoloEmpty + x.LoloLaden, x.Facility, x.Stuffing, x.Box.OrderTypeCode])).ToList();
+            x.EmptyAmount + x.FullAmount, x.LoloEmpty + x.LoloLaden, x.Facility, x.Stuffing, Status(x.Box)])).ToList();
         decimal Total(Func<StorageLine, decimal> pick) => lines.Sum(pick);
         rows.Add(new TabularRow([
             null, null, null, null, null, Total(x => x.EmptyAmount), Total(x => x.LoloEmpty), null, null, null, Total(x => x.FullAmount),
@@ -252,13 +279,15 @@ internal static class OperationChargeReports
                     .Select(b => b.ContainerNo).Distinct().Count()))
                 .ToArray();
         }
-        var matrix = boxes.GroupBy(b => b.OrderTypeCode).OrderBy(g => g.Key, StringComparer.Ordinal)
+        var matrix = boxes.GroupBy(Status).OrderBy(g => g.Key, StringComparer.Ordinal)
             .Select(g => new TabularRow([g.Key, .. Count(g)])).ToList();
         matrix.Add(new TabularRow(["Total", .. Count(boxes)], RowKind.Total));
 
-        // LIFT OFF EMPTY: the empty lift-off billed to the line or agent, a line per container.
+        // LIFT OFF EMPTY: the empty lift-off billed to the line or agent, a line per container (APL: the cash lift-off).
+        bool LiftOffEmpty((Guid Box, string? Column, string BillTo, string Term, decimal Days, decimal Amount) y) =>
+            y.Column == "LOLO_EMPTY" && (apl ? y.Term == "CASH" : y.BillTo != "CUSTOMER");
         var billed = lines
-            .Select(x => (x.Box, Amount: byBox[x.Box.BookingContainerId].Where(y => y.Column == "LOLO_EMPTY" && y.BillTo != "CUSTOMER").Sum(y => y.Amount)))
+            .Select(x => (x.Box, Amount: byBox[x.Box.BookingContainerId].Where(LiftOffEmpty).Sum(y => y.Amount)))
             .Where(x => x.Amount != 0)
             .GroupBy(x => x.Box.ContainerNo).OrderBy(g => g.Key, StringComparer.Ordinal)
             .Select(g => (Box: g.First().Box, Amount: g.Sum(x => x.Amount)))
@@ -271,8 +300,9 @@ internal static class OperationChargeReports
         var window = $"ETD : {c.From.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)} - {c.To.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}";
         const string Days = "#,0;(#,0);\"-\"";
 
+        if (apl) window = $"ETD: {c.From.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}";
         return new TabularReport(
-            FileName: $"ContainerStorageActivity_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            FileName: $"{(apl ? "APLContainerStorageActivity" : "ContainerStorageActivity")}_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
             Page: ReportPage.A4Landscape,
             MarginCm: 0.25,
             Heading:

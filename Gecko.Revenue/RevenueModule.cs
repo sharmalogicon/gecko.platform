@@ -87,7 +87,8 @@ public static class RevenueModule
             .MapCashBillEndpoints()
             .MapReceiptSplitEndpoints()
             .MapUnbilledOrderEndpoints()
-            .MapReceiptReportEndpoints();
+            .MapReceiptReportEndpoints()
+            .MapAccountingReportEndpoints();
 
         return endpoints;
     }

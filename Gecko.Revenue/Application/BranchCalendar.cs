@@ -70,6 +70,13 @@ internal sealed record BranchClockInfo(Guid BranchId, string BranchCode, TimeZon
 
     public DateOnly LocalDate(DateTimeOffset instant) => DateOnly.FromDateTime(Local(instant).DateTime);
 
+    /// <summary>The first instant of a local calendar day: a day's range is [StartOfDay(d), StartOfDay(d + 1)).</summary>
+    public DateTimeOffset StartOfDay(DateOnly day)
+    {
+        var local = day.ToDateTime(TimeOnly.MinValue);
+        return new DateTimeOffset(local, Zone.GetUtcOffset(local)).ToUniversalTime();
+    }
+
     /// <summary>The last instant of a local calendar day — when a coupon "paid until the 25th" stops working.</summary>
     public DateTimeOffset EndOfDay(DateOnly day)
     {

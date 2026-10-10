@@ -12,6 +12,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
     <PackageReference Include="QuestPDF" />
+    <PackageReference Include="ClosedXML" />
   </ItemGroup>
 
   <!-- Noto Sans Thai (SIL Open Font Licence): Thai names on EIRs and receipts, on any host. -->

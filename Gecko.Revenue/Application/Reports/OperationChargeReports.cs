@@ -138,4 +138,151 @@ internal static class OperationChargeReports
             Rows: rows,
             PageLabel: null);
     }
+
+    public const string StorageActivityKey = "STORAGE_ACTIVITY";
+
+    /// <summary>TMS.Accounting.ContainerStorageActivityStandard's codes (the RDL's credit codes).</summary>
+    public static readonly IReadOnlyDictionary<string, string> StorageActivityCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SC006-CR"] = "EMPTY_STORAGE", ["SC010-CR"] = "FULL_STORAGE", ["SL001-CR"] = "LOLO_EMPTY", ["SL002-CR"] = "LOLO_LADEN",
+        ["SF001-CR"] = "FACILITY", ["SS001-CR"] = "STUFFING",
+    };
+
+    private sealed record StorageLine(
+        TosBookedBox Box, decimal EmptyDays, decimal EmptyAmount, decimal LoloEmpty, decimal FullDays, decimal FullAmount,
+        decimal LoloLaden, decimal Facility, decimal Stuffing);
+
+    /// <summary>
+    /// TMS.Accounting.ContainerStorageActivityStandard — CONTAINER STORAGE ACTIVITY: a line per booked box (container ×
+    /// order type) with its empty and laden gate dates, storage days and amounts, LO/LO, facility and stuffing, and the
+    /// grand total (no label); then the boxes counted by order type × size × dry/reefer; then LIFT OFF EMPTY, the empty
+    /// lift-off billed to the line or agent rather than the customer.
+    /// Owner 2026-10-10 defaults: the window is the booking's vessel ETA, or the box's first gate-in when the booking has
+    /// no vessel call; a lift charge mapped LOLO is empty or laden by its move; totals corrected (the charge's amount,
+    /// cancelled charges out, no whole-baht rounding, no HYUNDAI special case, no empty dates copied across bookings).
+    /// </summary>
+    public static async Task<TabularReport> StorageActivityAsync(
+        RevenueDbContext db, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        TosBookedBoxFilter filter, CancellationToken ct)
+    {
+        var boxes = await booked.BoxesAsync(c.Branch.BranchId, c.Start, c.End, filter, ct);
+        var typeCodes = boxes.Select(b => b.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var vessels = boxes.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
+        var vesselNames = vessels.Count == 0 ? new Dictionary<string, VesselRef>() : await master.VesselsAsync(vessels, ct);
+
+        var ids = boxes.Select(b => b.BookingContainerId).ToList();
+        var charges = new List<(Guid Box, string Code, string? Movement, string BillTo, decimal Days, decimal Amount)>();
+        foreach (var slice in ids.Chunk(2000))
+            charges.AddRange((await db.Charges.AsNoTracking()
+                    .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.MovementCode, x.BillTo, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
+                    .ToListAsync(ct))
+                .Select(x => (x.Box, x.ChargeCode, x.MovementCode, x.BillTo, x.Days, x.Amount)));
+        var tenant = await TenantMapAsync(db, StorageActivityKey, ct);
+        string? Column(string code, string? movement) => (tenant.GetValueOrDefault(code) ?? StorageActivityCodes.GetValueOrDefault(code)) switch
+        {
+            "LOLO" => movement is not null && movement.StartsWith("FULL", StringComparison.OrdinalIgnoreCase) ? "LOLO_LADEN" : "LOLO_EMPTY",
+            var other => other,
+        };
+        var byBox = charges.Select(x => (x.Box, Column: Column(x.Code, x.Movement), x.BillTo, x.Days, x.Amount))
+            .Where(x => x.Column is not null).ToLookup(x => x.Box);
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var lines = boxes.Select(b =>
+        {
+            var mine = byBox[b.BookingContainerId].ToList();
+            decimal Amount(string column) => mine.Where(x => x.Column == column).Sum(x => x.Amount);
+            decimal Days(string column) => mine.Where(x => x.Column == column).Sum(x => x.Days);
+            return new StorageLine(b, Days("EMPTY_STORAGE"), Amount("EMPTY_STORAGE"), Amount("LOLO_EMPTY"),
+                Days("FULL_STORAGE"), Amount("FULL_STORAGE"), Amount("LOLO_LADEN"), Amount("FACILITY"), Amount("STUFFING"));
+        }).ToList();
+
+        var rows = lines.Select(x => new TabularRow([
+            x.Box.ContainerNo, x.Box.EquipmentTypeCode, Day(x.Box.EmptyIn), Day(x.Box.EmptyOut), x.EmptyDays, x.EmptyAmount, x.LoloEmpty,
+            Day(x.Box.LadenIn), Day(x.Box.LadenOut), x.FullDays, x.FullAmount, x.LoloLaden,
+            x.EmptyAmount + x.FullAmount, x.LoloEmpty + x.LoloLaden, x.Facility, x.Stuffing, x.Box.OrderTypeCode])).ToList();
+        decimal Total(Func<StorageLine, decimal> pick) => lines.Sum(pick);
+        rows.Add(new TabularRow([
+            null, null, null, null, null, Total(x => x.EmptyAmount), Total(x => x.LoloEmpty), null, null, null, Total(x => x.FullAmount),
+            Total(x => x.LoloLaden), Total(x => x.EmptyAmount + x.FullAmount), Total(x => x.LoloEmpty + x.LoloLaden),
+            Total(x => x.Facility), Total(x => x.Stuffing), null], RowKind.Total));
+
+        // The count: distinct containers by order type × 20'/40'/45' × DRY/REEFER.
+        string[] sizes = ["20", "40", "45"];
+        object?[] Count(IEnumerable<TosBookedBox> set)
+        {
+            var list = set.ToList();
+            return sizes.SelectMany(size => new[] { false, true }.Select(reefer => (object?)list
+                    .Where(b => SizeType(types, b.EquipmentTypeCode).Size == size && (types.GetValueOrDefault(b.EquipmentTypeCode)?.IsReefer ?? false) == reefer)
+                    .Select(b => b.ContainerNo).Distinct().Count()))
+                .ToArray();
+        }
+        var matrix = boxes.GroupBy(b => b.OrderTypeCode).OrderBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => new TabularRow([g.Key, .. Count(g)])).ToList();
+        matrix.Add(new TabularRow(["Total", .. Count(boxes)], RowKind.Total));
+
+        // LIFT OFF EMPTY: the empty lift-off billed to the line or agent, a line per container.
+        var billed = lines
+            .Select(x => (x.Box, Amount: byBox[x.Box.BookingContainerId].Where(y => y.Column == "LOLO_EMPTY" && y.BillTo != "CUSTOMER").Sum(y => y.Amount)))
+            .Where(x => x.Amount != 0)
+            .GroupBy(x => x.Box.ContainerNo).OrderBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => (Box: g.First().Box, Amount: g.Sum(x => x.Amount)))
+            .ToList();
+        var agentBilled = billed.Select(x => new TabularRow([x.Box.ContainerNo, x.Box.EquipmentTypeCode, Day(x.Box.EmptyIn), x.Amount])).ToList();
+        agentBilled.Add(new TabularRow(["Total", null, null, billed.Sum(x => x.Amount)], RowKind.Total));
+
+        var first = boxes.FirstOrDefault();
+        var vesselName = first?.VesselCode is { } code ? vesselNames.GetValueOrDefault(code)?.VesselName ?? code : "";
+        var window = $"ETD : {c.From.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)} - {c.To.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}";
+        const string Days = "#,0;(#,0);\"-\"";
+
+        return new TabularReport(
+            FileName: $"ContainerStorageActivity_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.25,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("CONTAINER STORAGE ACTIVITY", 10, Bold: true),
+                new($"AGENT : {first?.LineCode}"),
+                new($"VESSEL/VOY :{vesselName}    VOYAGE :{first?.Voyage}"),
+                new(window),
+            ],
+            HeadingRight:
+            [
+                new($"Printed By: {c.PrintedBy}"),
+                new($"Printed On: {c.PrintedOn.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.6), new(1.2, null, CellAlign.Center), new(1.5, "dd/MM/yy", CellAlign.Center), new(1.5, "dd/MM/yy", CellAlign.Center),
+                new(1.4, Days, CellAlign.Right), new(1.9, Money, CellAlign.Right), new(1.7, Money, CellAlign.Right),
+                new(1.5, "dd/MM/yy", CellAlign.Center), new(1.5, "dd/MM/yy", CellAlign.Center), new(1.4, Days, CellAlign.Right),
+                new(1.9, Money, CellAlign.Right), new(1.7, Money, CellAlign.Right), new(1.9, Money, CellAlign.Right), new(1.9, Money, CellAlign.Right),
+                new(1.7, Money, CellAlign.Right), new(1.7, Money, CellAlign.Right), new(2.4),
+            ],
+            HeaderRows:
+            [
+                [new("CONTAINER\nNO."), new("SIZE/\nTYPE"), new("EMPTY\nGATE IN DATE"), new("EMPTY\nGATE OUT DATE"), new("EMPTY\nSTORAGE\nDAYS"),
+                 new("STORAGE\nAMOUNT"), new("LOLO EMPTY"), new("LADEN\nIN"), new("LADEN\nOUT"), new("FULL\nSTORAGE\nDAYS"),
+                 new("STORAGE\nAMOUNT"), new("LOLO\nLADEN"), new("TOTAL\nSTORAGE"), new("TOTAL\nLOLO"), new("FACILITY CHARGE"),
+                 new("STUFFING"), new("STATUS")],
+            ],
+            Rows: rows,
+            After:
+            [
+                new TabularBlock(null,
+                    [new(3.0), .. Enumerable.Range(0, 6).Select(_ => new TabularColumn(1.6, null, CellAlign.Center))],
+                    [[new("", RowSpan: 2), new("20'", ColSpan: 2), new("40'", ColSpan: 2), new("45'", ColSpan: 2)],
+                     [new("DRY"), new("REEFER"), new("DRY"), new("REEFER"), new("DRY"), new("REEFER")]],
+                    matrix),
+                new TabularBlock($"AGENT : {first?.LineCode}    {first?.Voyage}    {window}",
+                    [new(3.0), new(2.0, null, CellAlign.Center), new(2.0, "dd/MM/yy", CellAlign.Center), new(2.6, Money, CellAlign.Right)],
+                    [[new(""), new("SIZE/TYPE"), new("EMPTY"), new("LIFT OFF EMPTY")]],
+                    agentBilled),
+            ]);
+    }
 }

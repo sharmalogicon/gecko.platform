@@ -25,6 +25,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/cash-receipt-by-company.{pdf|xlsx}   TMS.Accounting.CashReceiptByCompany
 ///   GET /reports/accounting/credit-invoice-listing.{pdf|xlsx}    TMS.Accounting.CreditInvoiceListing
 ///   GET /reports/accounting/lift-off-washing.{pdf|xlsx}          TMS.Accounting.LiftOffWashing
+///   GET /reports/accounting/container-storage-activity.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityStandard
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -54,6 +55,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/credit-invoice-listing.{format}", CreditInvoiceListingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Credit Invoice Listing (Vector TMS.Accounting.CreditInvoiceListing): issued credit invoices, EXS and IMS, as PDF or Excel")
             .WithDescription("agentCode = a shipping line on the invoice's bookings; customerCode = the payer; bookingType as for sales-tax.");
+        reports.MapGet("/container-storage-activity.{format}", StorageActivityAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Container Storage Activity (Vector TMS.Accounting.ContainerStorageActivityStandard), as PDF or Excel")
+            .WithDescription("dateFrom/dateTo: the booking's vessel ETA, or the box's first gate-in when the booking has no vessel call. agentCode = the shipping line; voyageNo matches voyage in or out; bookingBlNo = the carrier's B/L or booking no.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -213,5 +217,22 @@ internal static class AccountingReportEndpoints
         var movement = Clean(movementCode)?.Replace(' ', '_') ?? "MTY_IN";
         var filter = new TosGateMoveFilter(movement, Clean(agentCode), bt, Clean(orderType));
         return File(await OperationChargeReports.LiftOffWashingAsync(db, gate, master, context!, filter, Clean(size), Clean(type), ct), format);
+    }
+
+    private static async Task<IResult> StorageActivityAsync(
+        string format, RevenueDbContext db, ITosBookedBoxes booked, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null, string? bookingType = null, string? orderType = null, string? bookingBlNo = null)
+    {
+        var bt = string.IsNullOrWhiteSpace(bookingType) ? null : bookingType.Trim().ToUpperInvariant();
+        if (bt is not null && !BookingTypes.Contains(bt))
+            return RevenueSupport.Invalid("bookingType", "Use IMPORT, EXPORT, REPO or INTERNAL, or leave it out for all.");
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim().ToUpperInvariant();
+        var filter = new TosBookedBoxFilter(Clean(agentCode), Clean(vesselCode), Clean(voyageNo), bt, Clean(orderType), Clean(bookingBlNo));
+        return File(await OperationChargeReports.StorageActivityAsync(db, booked, master, context!, filter, ct), format);
     }
 }

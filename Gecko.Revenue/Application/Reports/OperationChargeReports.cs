@@ -498,4 +498,99 @@ internal static class OperationChargeReports
             ],
             Rows: rows);
     }
+
+    public const string MonitoringKey = "MONITORING";
+
+    /// <summary>TMS.Accounting.MonitoringDay's code: Vector's system setting MONITORING CHARGE (CREDIT), SM001-CR (KORAKIT's too).</summary>
+    public static readonly IReadOnlyDictionary<string, string> MonitoringCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SM001-CR"] = "MONITORING",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.MonitoringDay (Report.usp_Accounting_MonitoringDay) — MONITORING CHARGES FOR REEFER CONTAINER: a line
+    /// per monitoring charge on a reefer box that has come in laden, with its plug-on dates (the box's laden gate-in and
+    /// gate-out, as Vector's LoadedIn/OutDate), days and amount under 20' or 40' (any size not 20'), total and order type;
+    /// then the total row (no label). No date: all of the depot's history that matches the filters, as the RDL.
+    /// Owner 2026-10-10 defaults: totals corrected — the 20' and 40' amounts are their own sums (the RDL printed the first
+    /// row's amount, or the grand sum or 0 by the first row's size); cancelled charges and bookings left out.
+    /// </summary>
+    public static async Task<TabularReport> MonitoringDayAsync(
+        RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        string? lineCode, string? bookingType, string? vesselCode, string? voyage, CancellationToken ct)
+    {
+        var tenant = await TenantMapAsync(db, MonitoringKey, ct);
+        var codes = MonitoringCodes.Keys.Concat(tenant.Where(m => m.Value == "MONITORING").Select(m => m.Key))
+            .Where(code => (tenant.GetValueOrDefault(code) ?? MonitoringCodes.GetValueOrDefault(code)) == "MONITORING")
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var charges = await db.Charges.AsNoTracking()
+            .Where(x => x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED" && codes.Contains(x.ChargeCode))
+            .OrderBy(x => x.CreatedAt)
+            .Select(x => new { Box = x.BookingContainerId!.Value, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
+            .ToListAsync(ct);
+
+        var boxes = await booked.BoxesByIdAsync(charges.Select(x => x.Box).Distinct().ToList(), ct);
+        var headers = await tos.HeadersAsync(boxes.Values.Select(b => b.BookingId).Distinct().ToList(), ct);
+        var typeCodes = boxes.Values.Select(b => b.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        bool Wanted(TosBookedBox b) => b.LadenIn is not null && (types.GetValueOrDefault(b.EquipmentTypeCode)?.IsReefer ?? false)
+            && headers.TryGetValue(b.BookingId, out var h) && h.Status != "CANCELLED"
+            && (lineCode is null || string.Equals(b.LineCode, lineCode, StringComparison.OrdinalIgnoreCase))
+            && (bookingType is null || string.Equals(b.BookingTypeCode, bookingType, StringComparison.OrdinalIgnoreCase))
+            && (vesselCode is null || string.Equals(b.VesselCode, vesselCode, StringComparison.OrdinalIgnoreCase))
+            && (voyage is null || string.Equals(b.Voyage, voyage, StringComparison.OrdinalIgnoreCase));
+
+        var lines = charges.Where(x => boxes.TryGetValue(x.Box, out var b) && Wanted(b))
+            .Select(x =>
+            {
+                var box = boxes[x.Box];
+                var (size, type) = SizeType(types, box.EquipmentTypeCode);
+                return (Box: box, Label: size is null ? box.EquipmentTypeCode : $"{size}'{type}", Twenty: size == "20", x.Days, x.Amount);
+            })
+            .ToList();
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var rows = lines.Select((x, n) => new TabularRow([
+            n + 1, x.Box.ContainerNo, x.Label, Day(x.Box.LadenIn), Day(x.Box.LadenOut),
+            x.Twenty ? x.Days : 0m, x.Twenty ? x.Amount : 0m, x.Twenty ? 0m : x.Days, x.Twenty ? 0m : x.Amount, x.Amount, x.Box.OrderTypeCode])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null,
+            lines.Where(x => x.Twenty).Sum(x => x.Days), lines.Where(x => x.Twenty).Sum(x => x.Amount),
+            lines.Where(x => !x.Twenty).Sum(x => x.Days), lines.Where(x => !x.Twenty).Sum(x => x.Amount),
+            lines.Sum(x => x.Amount), null], RowKind.Total));
+
+        const string Days = "#,0;(#,0);\"-\"";
+        return new TabularReport(
+            FileName: $"MonitoringDay_{c.Branch.BranchCode}_{c.PrintedOn:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("MONITORING CHARGES FOR REEFER CONTAINER", 10, Bold: true),
+                new($"VESSEL & VOY   {vesselCode}   {voyage}"),
+            ],
+            HeadingRight:
+            [
+                new($"Printed By: {c.PrintedBy}"),
+                new($"Printed On: {c.PrintedOn.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.2, null, CellAlign.Center), new(3.0), new(1.8, null, CellAlign.Center),
+                new(2.0, "dd/MM/yy", CellAlign.Center), new(2.0, "dd/MM/yy", CellAlign.Center),
+                new(1.6, Days, CellAlign.Right), new(2.4, Money, CellAlign.Right), new(1.6, Days, CellAlign.Right), new(2.4, Money, CellAlign.Right),
+                new(2.6, Money, CellAlign.Right), new(3.0),
+            ],
+            HeaderRows:
+            [
+                [new(""), new(""), new(""), new("MORNITERING", ColSpan: 2), new("NO.OF"), new(""), new("NO.OF"), new(""), new(""), new("")],
+                [new("ITEM"), new("CONTAINER NO."), new("SIZE/TYPE"), new("DATE"), new("DATE"), new("DAY"), new("AMOUNT"), new("DAY"),
+                 new("AMOUNT"), new("TOTAL"), new("REMARK")],
+                [new(""), new(""), new(""), new("PLUG ON"), new("PLUG ON"), new("20'"), new(""), new("40'"), new(""), new(""), new("")],
+            ],
+            Rows: rows);
+    }
 }

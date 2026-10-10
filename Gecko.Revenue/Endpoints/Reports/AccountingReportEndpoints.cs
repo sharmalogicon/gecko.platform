@@ -28,6 +28,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/container-storage-activity.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityStandard
 ///   GET /reports/accounting/container-storage-activity-by-vessel.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityByVslVoy
 ///   GET /reports/accounting/export-full-out.{pdf|xlsx}   TMS.Accounting.ExportFullOut
+///   GET /reports/accounting/monitoring-day.{pdf|xlsx}   TMS.Accounting.MonitoringDay
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -66,6 +67,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/export-full-out.{format}", ExportFullOutAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Export Full Out (CY/CY) (Vector ExportFullOut), as PDF or Excel")
             .WithDescription("Laden lift-on of EXPORT boxes' full gate-outs billed in dateFrom..dateTo (receipt date for cash, invoice date for credit), a row per receipt/invoice. agentCode = the shipping line; voyageNo.");
+        reports.MapGet("/monitoring-day.{format}", MonitoringDayAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Monitoring (Day) (Vector MonitoringDay): monitoring charges for reefer containers, as PDF or Excel")
+            .WithDescription("No dates: all of the depot's history, as the RDL. agentCode = the shipping line; bookingType IMPORT/EXPORT/REPO/INTERNAL; vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -270,5 +274,24 @@ internal static class AccountingReportEndpoints
         static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
         return File(await OperationChargeReports.ExportFullOutAsync(db, booked, master, context!,
             Clean(agentCode), Clean(vesselCode), Clean(voyageNo), ct), format);
+    }
+
+    private static async Task<IResult> MonitoringDayAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, string? agentCode = null, string? bookingType = null, string? vesselCode = null, string? voyageNo = null)
+    {
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        var type = Clean(bookingType)?.ToUpperInvariant();
+        if (type is not null && !BookingTypes.Contains(type))
+            return RevenueSupport.Invalid("bookingType", "IMPORT, EXPORT, REPO or INTERNAL.");
+
+        // The RDL has no dates; the shared checks get today's.
+        var today = DateOnly.FromDateTime(calendar.Now.UtcDateTime);
+        var (context, refused) = await ContextAsync(format, branchId, today, today, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        return File(await OperationChargeReports.MonitoringDayAsync(db, tos, booked, master, context!,
+            Clean(agentCode), type, Clean(vesselCode), Clean(voyageNo), ct), format);
     }
 }

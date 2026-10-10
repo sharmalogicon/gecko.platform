@@ -54,7 +54,8 @@ internal static class ReeferReports
     /// <param name="Rate">The highest unit rate charged (the matrices' SELLING RATE).</param>
     /// <param name="Tax">The charges' own VAT.</param>
     /// <param name="Quantity">The quantity billed (chargeable, else charged): hours for an hourly electricity rate.</param>
-    public sealed record Charges(int Lines, decimal Rate, decimal Amount, decimal Tax, decimal Quantity = 0);
+    /// <param name="BilledNo">The first invoice (credit) or receipt (cash) the charges are billed on; null while unbilled.</param>
+    public sealed record Charges(int Lines, decimal Rate, decimal Amount, decimal Tax, decimal Quantity = 0, string? BilledNo = null);
 
     public static async Task<List<ReeferLine>> LinesAsync(
         RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, IMasterDataReferences master,
@@ -82,19 +83,41 @@ internal static class ReeferReports
             && (f.Voyage is null || string.Equals(b.Voyage, f.Voyage, StringComparison.OrdinalIgnoreCase))
             && (f.BookingType is null || string.Equals(b.BookingTypeCode, f.BookingType, StringComparison.OrdinalIgnoreCase))
             && (f.OrderType is null || string.Equals(b.OrderTypeCode, f.OrderType, StringComparison.OrdinalIgnoreCase));
-        var wanted = boxes.Values.Where(Wanted).ToList();
+        return await ShapeAsync(db, master, c, boxes.Values.Where(Wanted).ToList(), types, ct);
+    }
 
+    /// <summary>The boxes' PTI, pre-cool and electricity charges by column, their laden days and vessel name.</summary>
+    private static async Task<List<ReeferLine>> ShapeAsync(
+        RevenueDbContext db, IMasterDataReferences master, AccountingReportContext c, IReadOnlyList<TosBookedBox> wanted,
+        IReadOnlyDictionary<string, EquipmentTypeRef> types, CancellationToken ct)
+    {
         var tenant = await OperationChargeReports.TenantMapAsync(db, ElectricityKey, ct);
         string? Column(string code) => tenant.GetValueOrDefault(code) ?? ElectricityCodes.GetValueOrDefault(code);
         var ids = wanted.Select(b => b.BookingContainerId).ToList();
-        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount, decimal Tax, decimal Quantity)>();
+        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount, decimal Tax, decimal Quantity, Guid? Invoice, Guid? Receipt)>();
         foreach (var slice in ids.Chunk(2000))
             charges.AddRange((await db.Charges.AsNoTracking()
                     .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
-                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount, x.TaxAmount, Quantity = x.ChargeableQuantity ?? x.Quantity })
+                    .Select(x => new
+                    {
+                        Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount, x.TaxAmount,
+                        Quantity = x.ChargeableQuantity ?? x.Quantity, x.InvoiceId, x.ReceiptId,
+                    })
                     .ToListAsync(ct))
-                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount, x.TaxAmount, x.Quantity)));
+                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount, x.TaxAmount, x.Quantity, x.InvoiceId, x.ReceiptId)));
         var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
+
+        // The invoice (credit) or receipt (cash) each charge was billed on — Reefer Service Charge's INV NO.
+        var invoiceIds = charges.Select(x => x.Invoice).OfType<Guid>().Distinct().ToList();
+        var receiptIds = charges.Select(x => x.Receipt).OfType<Guid>().Distinct().ToList();
+        var invoiceNos = invoiceIds.Count == 0 ? new Dictionary<Guid, string>()
+            : await db.Invoices.AsNoTracking().Where(i => invoiceIds.Contains(i.InvoiceId) && i.Status == "ISSUED")
+                .ToDictionaryAsync(i => i.InvoiceId, i => i.InvoiceNo, ct);
+        var receiptNos = receiptIds.Count == 0 ? new Dictionary<Guid, string>()
+            : await db.Receipts.AsNoTracking().Where(r => receiptIds.Contains(r.ReceiptId) && r.Status == "ISSUED")
+                .ToDictionaryAsync(r => r.ReceiptId, r => r.ReceiptNo, ct);
+        string? BilledNo(Guid? invoice, Guid? receipt) =>
+            invoice is { } i && invoiceNos.TryGetValue(i, out var inv) ? inv : receipt is { } r && receiptNos.TryGetValue(r, out var rec) ? rec : null;
 
         var vesselCodes = wanted.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
         var vessels = vesselCodes.Count == 0 ? new Dictionary<string, VesselRef>() : await master.VesselsAsync(vesselCodes, ct);
@@ -106,7 +129,8 @@ internal static class ReeferReports
                 Charges Of(string column)
                 {
                     var hit = mine.Where(x => x.Column == column).ToList();
-                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount), hit.Sum(x => x.Tax), hit.Sum(x => x.Quantity));
+                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount), hit.Sum(x => x.Tax),
+                        hit.Sum(x => x.Quantity), hit.Select(x => BilledNo(x.Invoice, x.Receipt)).OfType<string>().Order(StringComparer.Ordinal).FirstOrDefault());
                 }
                 var (size, type) = OperationChargeReports.SizeType(types, b.EquipmentTypeCode);
                 var days = b.LadenIn is { } on && b.LadenOut is { } off
@@ -461,6 +485,80 @@ internal static class ReeferReports
                  new("NO. OF"), new("AMOUNT"), new("AMOUNT"), new("")],
                 [new(""), new(""), new(""), new("DATE"), new("TIME"), new("HOUR"), new("DATE"), new("TIME"), new("DATE"), new("TIME"), new("HOUR"),
                  new("OF HOUR"), new("(BATH)"), new("")],
+            ],
+            Rows: rows);
+    }
+
+    /// <summary>
+    /// TMS.Accounting.ReeferServiceCharge (Report.usp_Accounting_ReeferServiceCharge) — REEFER SERVICE CHARGE, the agent's
+    /// reefer bill: a line per reefer container on bookings whose vessel ETA falls in the window — depot code, I/O bound,
+    /// PTI date, laden in/out, electricity days, TFC code (voyage and vessel), PTI and power cost, the PTI's invoice no;
+    /// Monitor / Plug / Misc / Repair cost blank as in the RDL; then the PTI and Power totals.
+    /// Owner 2026-10-10 defaults: Depot Code is the branch's code (the RDL hard-coded BKK05/LCH01 for its two); PTI Date
+    /// blank (no work orders, D8); costs are the charges' amounts summed (the RDL took each container's highest line);
+    /// Days are the laden days of a box charged electricity; INV NO is the PTI's invoice or receipt, whichever line came
+    /// first; cancelled bookings left out; boxes with no vessel call are not in it (no ETA), as the RDL.
+    /// </summary>
+    public static async Task<TabularReport> ServiceChargeAsync(
+        RevenueDbContext db, ITosBookedBoxes booked, ITosBookingHeaders tos, IMasterDataReferences master, AccountingReportContext c,
+        TosBookedBoxFilter filter, CancellationToken ct)
+    {
+        var boxes = (await booked.BoxesAsync(c.Branch.BranchId, c.Start, c.End, filter, ct)).Where(b => b.Eta is not null).ToList();
+        var headers = await tos.HeadersAsync(boxes.Select(b => b.BookingId).Distinct().ToList(), ct);
+        var typeCodes = boxes.Select(b => b.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var wanted = boxes.Where(b => (types.GetValueOrDefault(b.EquipmentTypeCode)?.IsReefer ?? false)
+                                      && headers.TryGetValue(b.BookingId, out var h) && h.Status != "CANCELLED").ToList();
+        var lines = await ShapeAsync(db, master, c, wanted, types, ct);
+
+        var perContainer = lines
+            .GroupBy(x => x.Box.ContainerNo)
+            .Select(g =>
+            {
+                var ordered = g.OrderBy(x => headers[x.Box.BookingId].OrderNo, StringComparer.Ordinal).ToList();
+                var first = ordered[0];
+                return (Order: headers[first.Box.BookingId].OrderNo, First: first,
+                    Days: ordered.Where(x => x.Electricity.Lines > 0).Sum(x => x.LoadedDays),
+                    Pti: ordered.Sum(x => x.Pti.Amount), Power: ordered.Sum(x => x.Electricity.Amount),
+                    Invoice: ordered.Select(x => x.Pti.BilledNo).OfType<string>().FirstOrDefault());
+            })
+            .OrderBy(x => x.Order, StringComparer.Ordinal).ThenBy(x => x.First.Box.ContainerNo, StringComparer.Ordinal)
+            .ToList();
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var rows = perContainer.Select(x => new TabularRow([
+            c.Branch.BranchCode, x.First.Box.ContainerNo, x.First.BookingType == "EXPORT" ? "O" : "I", null,
+            Day(x.First.Box.LadenIn), Day(x.First.Box.LadenOut), x.Days, $"{x.First.Box.Voyage} {x.First.Box.VesselCode}".Trim(),
+            x.Pti, null, x.Power, null, null, null, x.Invoice])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null, null, null, null, perContainer.Sum(x => x.Pti), null, perContainer.Sum(x => x.Power),
+            null, null, null, null], RowKind.Total));
+
+        const string Cost = "#,0.00;(#,0.00)";
+        return new TabularReport(
+            FileName: $"ReeferServiceCharge_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading: [new(c.BranchName, 10, Bold: true), new("REEFER SERVICE CHARGE", 10, Bold: true)],
+            HeadingRight:
+            [
+                new($"Printed By : {c.PrintedBy}"),
+                new($"Printed On : {c.PrintedOn.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.8), new(2.6), new(1.4, null, CellAlign.Center), new(1.8, "dd/MM/yy", CellAlign.Center),
+                new(2.0, "dd/MM/yyyy", CellAlign.Center), new(2.0, "dd/MM/yyyy", CellAlign.Center), new(1.2, null, CellAlign.Right),
+                new(2.8, null, CellAlign.Center), new(2.0, Cost, CellAlign.Right), new(2.0), new(2.0, Cost, CellAlign.Right),
+                new(1.8), new(1.8), new(1.8), new(2.6),
+            ],
+            HeaderRows:
+            [
+                [new("Depot Code"), new("Container"), new("I/O bound"), new("PTI Date"), new("From Date"), new("To Date "), new("Days"),
+                 new("TFC code"), new("PTI Cost"), new("Monitor Cost"), new("Power Cost"), new("Plug Cost"), new("Misc Cost"),
+                 new("Repair Cost"), new("INV NO.")],
             ],
             Rows: rows);
     }

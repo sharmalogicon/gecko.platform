@@ -35,6 +35,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/electricity-day-pti.{pdf|xlsx}   TMS.Accounting.ElectricDay_PTI
 ///   GET /reports/accounting/electricity-standard.{pdf|xlsx}   TMS.Accounting.ElectricStandard
 ///   GET /reports/accounting/electricity-standard-3.{pdf|xlsx}   TMS.Accounting.ElectricStandard3
+///   GET /reports/accounting/reefer-service-charge.{pdf|xlsx}   TMS.Accounting.ReeferServiceCharge
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -94,6 +95,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/electricity-standard-3.{format}", ElectricStandard3Async).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Electricity STD (3) (Vector ElectricStandard3): hourly electricity of reefer boxes, as PDF or Excel")
             .WithDescription("Reefer boxes with any gate move in dateFrom..dateTo. agentCode = the shipping line; vesselCode; voyageNo.");
+        reports.MapGet("/reefer-service-charge.{format}", ReeferServiceChargeAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Reefer Service Charge (Vector ReeferServiceCharge): the agent's reefer PTI and power bill, as PDF or Excel")
+            .WithDescription("Reefer boxes on bookings whose vessel ETA is in dateFrom..dateTo. agentCode = the shipping line; vesselCode; voyageNo; bookingBlNo = the carrier's B/L; bookingType; orderType.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -385,4 +389,21 @@ internal static class AccountingReportEndpoints
         string? voyageNo = null) =>
         ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
             agentCode, vesselCode, voyageNo, null, null, ReeferReports.Driver.AnyMove, ReeferReports.ElectricStandard3);
+
+    private static async Task<IResult> ReeferServiceChargeAsync(
+        string format, RevenueDbContext db, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null, string? bookingBlNo = null, string? bookingType = null, string? orderType = null)
+    {
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        var type = Clean(bookingType)?.ToUpperInvariant();
+        if (type is not null && !BookingTypes.Contains(type))
+            return RevenueSupport.Invalid("bookingType", "IMPORT, EXPORT, REPO or INTERNAL.");
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var filter = new TosBookedBoxFilter(Clean(agentCode), Clean(vesselCode), Clean(voyageNo), type, Clean(orderType), Clean(bookingBlNo));
+        return File(await ReeferReports.ServiceChargeAsync(db, booked, tos, master, context!, filter, ct), format);
+    }
 }

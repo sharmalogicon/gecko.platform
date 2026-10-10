@@ -42,6 +42,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/inbound-sct1.{pdf|xlsx}   TMS.Accounting.InboundSCT1
 ///   GET /reports/accounting/lift-on-refund-summary.{pdf|xlsx}   TMS.Accounting.LiftOnChargeRefundSummary
 ///   GET /reports/accounting/hyundai-lift-off-summary.{pdf|xlsx}   TMS.Accounting.HyundaiLiftOffSummary (also the "HYUNDAI Refund" menu)
+///   GET /reports/accounting/hyundai-lift-on-summary.{pdf|xlsx}   TMS.Accounting.HyundaiLiftOnSummary
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -122,6 +123,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/hyundai-lift-off-summary.{format}", LiftOffSummaryAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("HYUNDAI LIFT-OFF Summary (Vector HyundaiLiftOffSummary): an agent's empties in by size/type with lift-off and cleaning, as PDF or Excel")
             .WithDescription("Empty gate-ins in dateFrom..dateTo. agentCode = the gate move's line (the RDL's default HYUNDAI); blank = every line. The desktop's HYUNDAI Refund menu prints this report.");
+        reports.MapGet("/hyundai-lift-on-summary.{format}", LiftOnSummaryAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("HYUNDAI LIFT-ON Summary (Vector HyundaiLiftOnSummary): an agent's empties out by size/type with lift-on, storage, PTI and pre-cool, as PDF or Excel")
+            .WithDescription("Empty gate-outs in dateFrom..dateTo. agentCode = the gate move's line (the RDL's default HYUNDAI); blank = every line.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -511,5 +515,17 @@ internal static class AccountingReportEndpoints
 
         var line = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
         return File(await OperationChargeReports.LiftOffSummaryAsync(db, gate, master, context!, line, ct), format);
+    }
+
+    private static async Task<IResult> LiftOnSummaryAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var line = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
+        return File(await OperationChargeReports.LiftOnSummaryAsync(db, gate, master, context!, line, ct), format);
     }
 }

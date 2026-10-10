@@ -23,7 +23,7 @@ internal static class OperationChargeReports
     /// move (gate_transaction_id) or earned by it (earned_gate_transaction_id), else one on the same box for the same
     /// movement. A charge counts for one move only. Cancelled charges are left out.
     /// </summary>
-    public static async Task<ILookup<Guid, (string Code, decimal Amount, string BillTo, decimal Rate)>> ChargesOfAsync(
+    public static async Task<ILookup<Guid, (string Code, decimal Amount, string BillTo, decimal Rate, decimal Quantity, decimal Tax)>> ChargesOfAsync(
         RevenueDbContext db, IReadOnlyList<TosGateMove> moves, CancellationToken ct)
     {
         var ids = moves.Select(m => m.GateTransactionId).ToList();
@@ -33,11 +33,15 @@ internal static class OperationChargeReports
                         && ((c.GateTransactionId != null && ids.Contains(c.GateTransactionId.Value))
                             || (c.EarnedGateTransactionId != null && ids.Contains(c.EarnedGateTransactionId.Value))
                             || (c.BookingContainerId != null && boxes.Contains(c.BookingContainerId.Value))))
-            .Select(c => new { c.ChargeCode, c.Amount, c.BillTo, c.UnitRate, c.GateTransactionId, c.EarnedGateTransactionId, c.BookingContainerId, c.MovementCode })
+            .Select(c => new
+            {
+                c.ChargeCode, c.Amount, c.BillTo, c.UnitRate, Quantity = c.ChargeableQuantity ?? c.Quantity, c.TaxAmount,
+                c.GateTransactionId, c.EarnedGateTransactionId, c.BookingContainerId, c.MovementCode,
+            })
             .ToListAsync(ct);
 
         var byId = moves.ToDictionary(m => m.GateTransactionId);
-        var owned = new List<(Guid Move, string Code, decimal Amount, string BillTo, decimal Rate)>();
+        var owned = new List<(Guid Move, string Code, decimal Amount, string BillTo, decimal Rate, decimal Quantity, decimal Tax)>();
         foreach (var c in charges)
         {
             Guid? move = c.GateTransactionId is { } g && byId.ContainsKey(g) ? g
@@ -45,9 +49,9 @@ internal static class OperationChargeReports
                 : c.GateTransactionId is null && c.EarnedGateTransactionId is null
                     ? moves.FirstOrDefault(m => m.BookingContainerId == c.BookingContainerId && m.MovementCode == c.MovementCode)?.GateTransactionId
                     : null;
-            if (move is { } owner) owned.Add((owner, c.ChargeCode, c.Amount, c.BillTo, c.UnitRate ?? 0m));
+            if (move is { } owner) owned.Add((owner, c.ChargeCode, c.Amount, c.BillTo, c.UnitRate ?? 0m, c.Quantity, c.TaxAmount));
         }
-        return owned.ToLookup(o => o.Move, o => (o.Code, o.Amount, o.BillTo, o.Rate));
+        return owned.ToLookup(o => o.Move, o => (o.Code, o.Amount, o.BillTo, o.Rate, o.Quantity, o.Tax));
     }
 
     /// <summary>The tenant's own codes for a report (gecko_revenue 31/32), read under its RLS.</summary>
@@ -868,5 +872,129 @@ internal static class OperationChargeReports
             ],
             Rows: rows,
             PageLabel: null);
+    }
+
+    public const string LiftOnSummaryKey = "LIFT_ON_SUMMARY";
+
+    private sealed record MappedCharge(string Column, decimal Amount, decimal Rate, decimal Quantity, decimal Tax);
+    private sealed record ChargedMove(string ContainerNo, (string? Size, string? Type) Group, IReadOnlyList<MappedCharge> Charges);
+
+    /// <summary>TMS.Accounting.HyundaiLiftOnSummary's codes: SL001-CR lift-on empty, SC006-CR empty storage, SE003-CR PTI, SE002-CR pre-cool.</summary>
+    public static readonly IReadOnlyDictionary<string, string> LiftOnSummaryCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SL001-CR"] = "LIFT_ON", ["SC006-CR"] = "STORAGE", ["SE003-CR"] = "PTI", ["SE002-CR"] = "PRECOOL",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.HyundaiLiftOnSummary (Report.usp_Accounting_LiftONSummary / …Reefer) — &lt;&lt;SUMMARY LIFT ON REPORT&gt;&gt;
+    /// for an agent: the empties it took out during the window by size/type — lift-ons billed to the line, their rate and
+    /// total, boxes and days of empty storage and its total, the total — then the Total row; below, by size/type, PTI
+    /// units, rate and amount, boxes out, pre-cool units, rate and amount, and their total; then S.TOTAL, VAT, G.TOTAL.
+    /// Owner 2026-10-10 defaults: money is the charges' (no whole-baht rounding); the reefer rows are labelled by
+    /// size/type (the RDL printed a count there) and its total row counts boxes out and pre-cool units (the RDL repeated
+    /// the lift-on count, and counted MTY IN moves it never had); VAT is the charges' own tax (not 7 % on top).
+    /// </summary>
+    public static async Task<TabularReport> LiftOnSummaryAsync(
+        RevenueDbContext db, ITosGateMoves gate, IMasterDataReferences master, AccountingReportContext c, string? lineCode, CancellationToken ct)
+    {
+        var moves = (await gate.MovesAsync(c.Branch.BranchId, c.Start, c.End, new TosGateMoveFilter(LineCode: lineCode), ct))
+            .Where(m => m.Direction == "OUT" && m.FullEmpty == "EMPTY")
+            .ToList();
+        var typeCodes = moves.Select(m => m.EquipmentTypeCode).OfType<string>().Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var charges = await ChargesOfAsync(db, moves, ct);
+        var tenant = await TenantMapAsync(db, LiftOnSummaryKey, ct);
+        string? Column(string code) => tenant.GetValueOrDefault(code) ?? LiftOnSummaryCodes.GetValueOrDefault(code);
+
+        // Each move's charges in this report's columns; lift-on only when billed to the line, as the RDL's credit code.
+        var mapped = moves.Select(m => new ChargedMove(m.ContainerNo, SizeType(types, m.EquipmentTypeCode), charges[m.GateTransactionId]
+                .Where(x => Column(x.Code) is { } col && (col != "LIFT_ON" || x.BillTo != "CUSTOMER"))
+                .Select(x => new MappedCharge(Column(x.Code)!, x.Amount, x.Rate, x.Quantity, x.Tax))
+                .ToList()))
+            .ToList();
+
+        (int Boxes, decimal Rate, decimal Quantity, decimal Amount, decimal Tax) Of(IEnumerable<ChargedMove> set, string column)
+        {
+            var hit = set.SelectMany(x => x.Charges.Where(y => y.Column == column).Select(y => (x.ContainerNo, Charge: y))).ToList();
+            return (hit.Select(x => x.ContainerNo).Distinct().Count(), hit.Select(x => x.Charge.Rate).DefaultIfEmpty().Max(),
+                hit.Sum(x => x.Charge.Quantity), hit.Sum(x => x.Charge.Amount), hit.Sum(x => x.Charge.Tax));
+        }
+
+        var groups = mapped.GroupBy(x => x.Group)
+            .OrderBy(g => g.Key.Size, StringComparer.Ordinal).ThenBy(g => g.Key.Type, StringComparer.Ordinal)
+            .ToList();
+        string Label((string? Size, string? Type) key) => $"{key.Size} {key.Type}".Trim();
+
+        object?[] Top(IEnumerable<ChargedMove> rowSet, bool total)
+        {
+            var set = rowSet.ToList();
+            var lift = Of(set, "LIFT_ON");
+            var storage = Of(set, "STORAGE");
+            return [lift.Boxes, total ? null : lift.Rate, lift.Amount, null, storage.Boxes, storage.Quantity, storage.Amount, lift.Amount + storage.Amount];
+        }
+        object?[] Bottom(IEnumerable<ChargedMove> rowSet, bool total)
+        {
+            var set = rowSet.ToList();
+            var pti = Of(set, "PTI");
+            var preCool = Of(set, "PRECOOL");
+            var boxesOut = Of(set, "LIFT_ON").Boxes;
+            return [pti.Quantity, total ? null : pti.Rate, pti.Amount, boxesOut, preCool.Boxes, total ? null : preCool.Rate, preCool.Amount, pti.Amount + preCool.Amount];
+        }
+
+        var rows = groups.Select(g => new TabularRow([Label(g.Key), .. Top(g, false)])).ToList();
+        rows.Add(new TabularRow(["Total", .. Top(mapped, true)], RowKind.Total));
+
+        var reefer = groups.Select(g => new TabularRow([Label(g.Key), .. Bottom(g, false)])).ToList();
+        reefer.Add(new TabularRow(["Total", .. Bottom(mapped, true)], RowKind.Total));
+        var subTotal = new[] { "LIFT_ON", "STORAGE", "PTI", "PRECOOL" }.Sum(column => Of(mapped, column).Amount);
+        var vat = new[] { "LIFT_ON", "STORAGE", "PTI", "PRECOOL" }.Sum(column => Of(mapped, column).Tax);
+        reefer.Add(new TabularRow([null, null, null, null, null, null, null, "S.TOTAL", subTotal]));
+        reefer.Add(new TabularRow([null, null, null, null, null, null, null, "VAT", vat]));
+        reefer.Add(new TabularRow([null, null, null, null, null, null, null, "G.TOTAL", subTotal + vat], RowKind.Total));
+
+        string D(DateOnly d) => d.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+        const string Bath = "#,0.00;(#,0.00)";
+        const string Units = "#,0;(#,0)";
+        return new TabularReport(
+            FileName: $"HyundaiLiftOnSummary_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 2.0,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("<<SUMMARY LIFT ON REPORT>>", 10, Bold: true),
+                new($"EMPTY OUT DATE FROM: {D(c.From)}EMPTY OUT DATE TO: {D(c.To)}"),
+                new($"AGENT:{lineCode}"),
+            ],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.5, null, CellAlign.Center), new(2.5, Units, CellAlign.Center), new(2.5, Bath, CellAlign.Right), new(2.5, Bath, CellAlign.Right),
+                new(2.5), new(2.5, Units, CellAlign.Center), new(2.5, Units, CellAlign.Center), new(2.5, Bath, CellAlign.Right),
+                new(2.5, Bath, CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new(""), new("LIFT ON CHARGE = 531101", ColSpan: 4), new("STORAGE CHARGE = 531201", ColSpan: 3), new("")],
+                [new(""), new("TOTAL"), new("RATE"), new("TOTAL"), new(""), new("UNIT"), new("DAY"), new("TOTAL"), new("TOTAL")],
+                [new("TY/SZ"), new("OUT"), new("BTH"), new("BTH"), new(""), new(""), new(""), new("BTH"), new("BTH")],
+            ],
+            Rows: rows,
+            After:
+            [
+                new TabularBlock(null,
+                    [
+                        new(2.5, null, CellAlign.Center), new(2.5, Units, CellAlign.Center), new(2.5, Bath, CellAlign.Right), new(2.5, Bath, CellAlign.Right),
+                        new(2.5, Units, CellAlign.Center), new(2.5, Units, CellAlign.Center), new(2.5, Bath, CellAlign.Right), new(2.5, Bath, CellAlign.Right),
+                        new(2.5, Bath, CellAlign.Right),
+                    ],
+                    [
+                        [new(""), new("ELECTRIC CHARGE PTI = 250310", ColSpan: 3), new("ELECTRIC CHARGE PCOOL = 250310", ColSpan: 4), new("")],
+                        [new("RF IN"), new("UNIT"), new("RATE"), new("BTH"), new("RF OUT"), new("UNIT"), new("RATE"), new("BTH"), new("TOTAL")],
+                    ],
+                    reefer),
+            ]);
     }
 }

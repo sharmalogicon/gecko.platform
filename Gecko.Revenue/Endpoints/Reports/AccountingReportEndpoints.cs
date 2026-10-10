@@ -47,6 +47,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/hyundai-refund.{pdf|xlsx}   TMS.Accounting.HyundaiRefund (the RDL the desktop never showed)
 ///   GET /reports/accounting/apl-container-storage-activity.{pdf|xlsx}   TMS.Accounting.APLContainerStorageActivity (never launched)
 ///   GET /reports/accounting/pti-standard.{pdf|xlsx}   TMS.Accounting.StandardPTI
+///   GET /reports/accounting/credit-receipt-detail.{pdf|xlsx}   TMS.Accounting.CreditReceiptDetailList
 ///   GET /reports/accounting/unstuffing-activity.{pdf|xlsx}   TMS.Accounting.UnstuffingActivity (no lines until unstuffing is recorded)
 ///   GET /reports/accounting/inbound-container.{pdf|xlsx}   TMS.Accounting.InBoundContainer "UNSTUFFING" (likewise)
 ///
@@ -150,6 +151,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/inbound-container.{format}", InboundContainerAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("UNSTUFFING / Container Inbound Report (Vector InBoundContainer), as PDF or Excel")
             .WithDescription("Import CFS/CYD boxes unstuffed in dateFrom..dateTo with LO/LO, unstuffing and FSC. Gecko records no unstuffing yet, so it prints no lines. agentCode; vesselCode; voyageNo.");
+        reports.MapGet("/credit-receipt-detail.{format}", CreditReceiptDetailAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Credit Receipt Detail List (Vector CreditReceiptDetailList): credit invoices with VAT split and a charge-code summary, as PDF or Excel")
+            .WithDescription("Credit invoices issued in dateFrom..dateTo. W/H Tax, Net Received and the payment channels print blank until Gecko records credit-invoice payments.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -630,5 +634,15 @@ internal static class AccountingReportEndpoints
         var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
         static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
         return refused ?? File(UnstuffingReports.Inbound(context!, Clean(agentCode), Clean(vesselCode), Clean(voyageNo)), format);
+    }
+
+    private static async Task<IResult> CreditReceiptDetailAsync(
+        string format, RevenueDbContext db, BranchCalendar calendar, IMasterDataReferences master, IUserDirectory users,
+        ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+        return File(await AccountingReports.CreditReceiptDetailAsync(db, context!, ct), format);
     }
 }

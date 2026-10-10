@@ -268,4 +268,96 @@ internal static class AccountingReports
                     [new TabularRow(["Total", null, null, null, null, null, allService, allVat, allService + allVat, null], RowKind.Total)]),
             ]);
     }
+
+    /// <summary>
+    /// TMS.Accounting.CreditReceiptDetailList (Report.usp_Accounting_CreditReceiptDetailList) — CREDIT RECEIPT DETAIL LIST: a
+    /// row per credit invoice issued in the window — no, date, ICD NO. (the first line's order), payer code and name,
+    /// non-VAT and VAT-able amounts, VAT, NET — with W/H Tax, Net Received, DEDUCT, Cash, Tranfer and Cheque; the Grand
+    /// Total; then the Summary by Charge Code (non-VAT, amount, VAT and their total) with its Total.
+    /// Owner 2026-10-10 defaults: exact amounts (the RDL rounded every figure to whole baht) at rate × quantity (the RDL
+    /// took the unit rate); W/H Tax, Net Received and the payment channels print blank — Gecko records no payment of a
+    /// credit invoice yet (gap D7); the RDL's title lines kept.
+    /// </summary>
+    public static async Task<TabularReport> CreditReceiptDetailAsync(RevenueDbContext db, AccountingReportContext c, CancellationToken ct)
+    {
+        var invoices = await db.Invoices.AsNoTracking()
+            .Where(i => i.BranchId == c.Branch.BranchId && i.IssuedAt >= c.Start && i.IssuedAt < c.End
+                        && i.InvoiceType == "CREDIT" && i.Status == Issued)
+            .OrderBy(i => i.InvoiceNo)
+            .Select(i => new { i.InvoiceId, i.InvoiceNo, i.IssuedAt, i.PayerPartyCode, i.PayerName, i.TotalAmount })
+            .ToListAsync(ct);
+        var ids = invoices.Select(i => i.InvoiceId).ToList();
+        var lines = await db.InvoiceLines.AsNoTracking()
+            .Where(l => ids.Contains(l.InvoiceId))
+            .Select(l => new { l.InvoiceId, l.LineNo, l.OrderNo, l.ChargeCode, l.ChargeName, l.Amount, l.TaxAmount })
+            .ToListAsync(ct);
+        var byInvoice = lines.ToLookup(l => l.InvoiceId);
+
+        (decimal NonVat, decimal Vatable, decimal Vat) Split(IEnumerable<(decimal Amount, decimal Tax)> set)
+        {
+            var list = set.ToList();
+            return (list.Where(x => x.Tax == 0).Sum(x => x.Amount), list.Where(x => x.Tax != 0).Sum(x => x.Amount), list.Sum(x => x.Tax));
+        }
+
+        var rows = invoices.Select(i =>
+        {
+            var mine = byInvoice[i.InvoiceId].OrderBy(l => l.LineNo).ToList();
+            var (nonVat, vatable, vat) = Split(mine.Select(l => (l.Amount, l.TaxAmount)));
+            return new TabularRow([i.InvoiceNo, c.Branch.LocalDate(i.IssuedAt), mine.FirstOrDefault()?.OrderNo, i.PayerPartyCode, i.PayerName,
+                nonVat, vatable, vat, i.TotalAmount, null, null, null, null, null, null]);
+        }).ToList();
+        var (totalNonVat, totalVatable, totalVat) = Split(lines.Select(l => (l.Amount, l.TaxAmount)));
+        rows.Add(new TabularRow([null, null, null, null, "Grand Total :", totalNonVat, totalVatable, totalVat, invoices.Sum(i => i.TotalAmount),
+            null, null, null, null, null, null], RowKind.Total));
+
+        var byCharge = lines.GroupBy(l => l.ChargeCode).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g =>
+        {
+            var (nonVat, vatable, vat) = Split(g.Select(l => (l.Amount, l.TaxAmount)));
+            return new TabularRow([g.Key, null, g.Select(l => l.ChargeName).FirstOrDefault(n => !string.IsNullOrEmpty(n)), nonVat, vatable, vat,
+                nonVat + vatable + vat]);
+        }).ToList();
+        byCharge.Add(new TabularRow([null, null, "Total :", totalNonVat, totalVatable, totalVat, totalNonVat + totalVatable + totalVat], RowKind.Total));
+
+        string D(DateOnly d) => d.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+        TabularColumn M() => new(2.2, Money, CellAlign.Right);
+        return new TabularReport(
+            FileName: $"CreditReceiptDetailList_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 0.5,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("CREDIT RECEIPT DETAIL LIST", 10, Bold: true),
+                new("บิลเงินสด-บริการ ICD - 002  (SU)", 10, Bold: true),
+                new($"From Date: {D(c.From)} To:{D(c.To)}"),
+            ],
+            HeadingRight:
+            [
+                new($"Printed By: {c.PrintedBy}"),
+                new($"Printed On: {c.PrintedOn.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(3.2), new(2.2, "dd/MM/yyyy", CellAlign.Center), new(3.2), new(2.2), new(6.0), M(), M(), M(), M(), M(), M(),
+                new(1.8), M(), M(), M(),
+            ],
+            HeaderRows:
+            [
+                [new("Receipt No"), new("Date"), new("ICD NO."), new("Code"), new("Customer Name"), new("Non-vat"), new("Amount"), new("Vat 7%"),
+                 new("NET"), new("W/H Tax"), new("Net Received"), new("DEDUCT"), new("Cash"), new("Tranfer"), new("Cheque")],
+            ],
+            Rows: rows,
+            After:
+            [
+                new TabularBlock("Summary by Charge Code for all above Invoices",
+                    [new(2.6), new(2.0), new(6.0), M(), M(), M(), M()],
+                    [
+                        [new(""), new(""), new(""), new("REVENUE", ColSpan: 4)],
+                        [new("CHG CODE"), new("ACT CODE"), new("CHARGE NAME"), new("NON-VAT"), new("AMOUNT"), new("VAT 7 %"), new("AMOUNT")],
+                    ],
+                    byCharge),
+            ]);
+    }
 }

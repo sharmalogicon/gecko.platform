@@ -24,6 +24,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/cash-receipt-by-liner.{pdf|xlsx}     Tms.Accounting.CashReceiptByLiner
 ///   GET /reports/accounting/cash-receipt-by-company.{pdf|xlsx}   TMS.Accounting.CashReceiptByCompany
 ///   GET /reports/accounting/credit-invoice-listing.{pdf|xlsx}    TMS.Accounting.CreditInvoiceListing
+///   GET /reports/accounting/lift-off-washing.{pdf|xlsx}          TMS.Accounting.LiftOffWashing
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -53,6 +54,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/credit-invoice-listing.{format}", CreditInvoiceListingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Credit Invoice Listing (Vector TMS.Accounting.CreditInvoiceListing): issued credit invoices, EXS and IMS, as PDF or Excel")
             .WithDescription("agentCode = a shipping line on the invoice's bookings; customerCode = the payer; bookingType as for sales-tax.");
+        reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
+            .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
 
         return revenue;
     }
@@ -190,5 +194,24 @@ internal static class AccountingReportEndpoints
         return File(await AccountingReports.CreditInvoiceListingAsync(db, tos, context!,
             string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim(),
             string.IsNullOrWhiteSpace(customerCode) ? null : customerCode.Trim(), type, ct), format);
+    }
+
+    private static async Task<IResult> LiftOffWashingAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? size = null,
+        string? type = null, string? bookingType = null, string? orderType = null, string? movementCode = null)
+    {
+        var bt = string.IsNullOrWhiteSpace(bookingType) ? null : bookingType.Trim().ToUpperInvariant();
+        if (bt is not null && !BookingTypes.Contains(bt))
+            return RevenueSupport.Invalid("bookingType", "Use IMPORT, EXPORT, REPO or INTERNAL, or leave it out for all.");
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim().ToUpperInvariant();
+        // The desktop never sent a blank movement: blank meant MTY IN. Vector wrote it with a space, Gecko with "_".
+        var movement = Clean(movementCode)?.Replace(' ', '_') ?? "MTY_IN";
+        var filter = new TosGateMoveFilter(movement, Clean(agentCode), bt, Clean(orderType));
+        return File(await OperationChargeReports.LiftOffWashingAsync(db, gate, master, context!, filter, Clean(size), Clean(type), ct), format);
     }
 }

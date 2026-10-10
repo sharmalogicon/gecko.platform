@@ -72,7 +72,7 @@ public sealed record TabularReport(
     IReadOnlyList<TabularColumn> Columns,
     IReadOnlyList<IReadOnlyList<HeaderCell>> HeaderRows,
     IReadOnlyList<TabularRow> Rows,
-    string PageLabel = "Page No#",
+    string? PageLabel = "Page No#",
     IReadOnlyList<TabularBlock>? After = null)
 {
     public const string PdfType = "application/pdf";
@@ -169,11 +169,13 @@ public sealed record TabularReport(
                 }
             });
 
-            p.Footer().AlignRight().Text(t =>
-            {
-                t.Span(PageLabel + " ").FontSize(size);
-                t.CurrentPageNumber().FontSize(size);
-            });
+            // An RDL with an empty page footer prints no page number (PageLabel null).
+            if (PageLabel is not null)
+                p.Footer().AlignRight().Text(t =>
+                {
+                    t.Span(PageLabel + " ").FontSize(size);
+                    t.CurrentPageNumber().FontSize(size);
+                });
         })).GeneratePdf();
     }
 

@@ -51,6 +51,7 @@ public static class TosModule
         services.AddScoped<Gecko.Tos.Contracts.ITosBookingHeaders, TosBookingHeaders>();
         services.AddScoped<Gecko.Tos.Contracts.ITosGateCoupons, TosGateCoupons>();
         services.AddScoped<Gecko.Tos.Contracts.ITosTruckVisits, TosTruckVisits>();
+        services.AddScoped<Gecko.Tos.Contracts.ITosGateMoves, TosGateMoves>();
         services.AddScoped<EirDocument>();
         services.AddScoped<TruckInDocument>();
         services.AddGeckoFileStore(configuration);

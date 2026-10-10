@@ -338,7 +338,7 @@ public sealed class BookingApiTests(TosApiFactory api)
     }
 
     [Fact]
-    public async Task Parties_must_play_the_role_they_are_named_for_and_a_reefer_needs_its_set_point()
+    public async Task Parties_must_play_the_role_they_are_named_for()
     {
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
@@ -351,16 +351,17 @@ public sealed class BookingApiTests(TosApiFactory api)
                 orderTypeCode = "NO SUCH TYPE", lineCode = "CUS-TAE", customerCode = "MAEU", carrierRef,
                 requirements = new object[]
                 {
-                    new { equipmentTypeCode = "40RH", qty = 1 },                          // reefer without set point
+                    new { equipmentTypeCode = "40RH", qty = 1 },                          // owner 2026-10-08: no set point is allowed
                     new { equipmentTypeCode = "20GP", qty = 1, declaredGrossWeightKg = 0 }, // V-15: zero is not a weight
                     new { equipmentTypeCode = "NOPE", qty = 1 },
                 },
             }, ct);
             var body = await ExpectAsync(response, HttpStatusCode.BadRequest, ct);
+            Assert.DoesNotContain("requirements[0]", body);
             foreach (var expected in new[]
                      {
                          "\"branchId\"", "\"orderTypeCode\"", "CUS-TAE is not a shipping line", "MAEU is not a customer",
-                         "requirements[0].reeferSetTempC", "requirements[1].declaredGrossWeightKg", "requirements[2].equipmentTypeCode",
+                         "requirements[1].declaredGrossWeightKg", "requirements[2].equipmentTypeCode",
                      })
                 Assert.Contains(expected, body);
         }
@@ -425,9 +426,10 @@ public sealed class BookingApiTests(TosApiFactory api)
             Assert.Equal("UNASSIGNED", ended.EndReason);
             Assert.All(ended.Steps, s => Assert.Equal("CANCELLED", s.Status));
             Assert.Equal(1, off.QtyAssigned);
-
-            // Its place is free again — the same box can come back.
-            await ExpectAsync(await AssignAsync(client, id, ct, new { containerNo = Gp20A }), HttpStatusCode.OK, ct);
+            // Owner 2026-10-08 (desktop parity): deleting a box lowers its line's quantity, so the place goes with it.
+            Assert.Equal(1, off.QtyRequired);
+            Assert.Contains("The line is full", await ExpectAsync(
+                await AssignAsync(client, id, ct, new { containerNo = Gp20A }), HttpStatusCode.BadRequest, ct));
 
             // Once a box has passed the gate it stays.
             await TestDatabase.MarkFirstStepDoneAsync(second.BookingContainerId);
@@ -846,9 +848,12 @@ public sealed class BookingApiTests(TosApiFactory api)
         finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
     }
 
-    /// <summary>Owner 2026-10-04 (CHECKDIGIT_WARNING_FOR_API): where the depot does not enforce it, a wrong check digit is saved with a warning.</summary>
+    /// <summary>
+    /// Owner 2026-10-08 ("don't check any ISO thingy", replacing the 2026-10-04 warning): where the depot does not enforce
+    /// it, a wrong check digit is saved with no warning; the line still records that the digit does not add up.
+    /// </summary>
     [Fact]
-    public async Task A_wrong_check_digit_is_saved_with_a_warning_where_the_depot_does_not_enforce_it()
+    public async Task A_wrong_check_digit_is_saved_without_a_warning_where_the_depot_does_not_enforce_it()
     {
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
@@ -860,12 +865,12 @@ public sealed class BookingApiTests(TosApiFactory api)
             var misread = Gp20A[..10] + ((Gp20A[10] - '0' + 1) % 10);
             var rows = Read<ContainerBatchResponse>(await ExpectAsync(await BatchAsync(client, booking.Booking.BookingId, ct,
                 new { clientLineId = Guid.NewGuid(), containerNo = misread },
-                new { clientLineId = Guid.NewGuid(), containerNo = "NOTABOX" }), HttpStatusCode.OK, ct));
+                new { clientLineId = Guid.NewGuid(), containerNo = "NOT_A_BOX" }), HttpStatusCode.OK, ct));
 
             var saved = rows.Items[0];
             Assert.Equal("CREATED", saved.Outcome);
             Assert.False(saved.Line!.IsCheckDigitValid);
-            Assert.Contains("check digit", Assert.Single(saved.Warnings!["containerNo"]));
+            Assert.True(saved.Warnings is null || !saved.Warnings.ContainsKey("containerNo"));
             // Not a container number at all is still a typo, refused.
             Assert.Equal("REJECTED", rows.Items[1].Outcome);
         }

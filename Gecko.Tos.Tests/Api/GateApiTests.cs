@@ -191,7 +191,7 @@ public sealed class GateApiTests(TosApiFactory api)
         Assert.Equal("NO_ASSIGNMENT", finding.Code);
         Assert.Contains("walk-in", finding.Message, StringComparison.OrdinalIgnoreCase);
 
-        var nonsense = await client.GetAsync($"{Gate}/preflight?branchId={SctLcb01}&containerNo=NOTABOX&direction=IN", ct);
+        var nonsense = await client.GetAsync($"{Gate}/preflight?branchId={SctLcb01}&containerNo=NOT_A_BOX&direction=IN", ct);
         Assert.Equal(HttpStatusCode.OK, nonsense.StatusCode);
         Assert.Equal("NOT_A_CONTAINER_NUMBER",
             (await nonsense.Content.ReadFromJsonAsync<GatePreflightResponse>(ct))!.Findings.Single().Code);

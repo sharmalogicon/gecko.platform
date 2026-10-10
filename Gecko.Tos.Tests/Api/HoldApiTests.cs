@@ -90,7 +90,7 @@ public sealed class HoldApiTests(TosApiFactory api)
         Assert.False(free.IsHeld);
         Assert.Empty(free.Holds);
 
-        var nonsense = await client.GetAsync("/api/tos/containers/NOTABOX/holds", ct);
+        var nonsense = await client.GetAsync("/api/tos/containers/NOT_A_BOX/holds", ct);
         Assert.Equal(HttpStatusCode.BadRequest, nonsense.StatusCode);
     }
 

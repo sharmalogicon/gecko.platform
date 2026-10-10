@@ -57,10 +57,21 @@ public sealed class CutoffExceptionApiTests(TosApiFactory api)
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
         var carrierRef = NewRef();
+        // Its own call, sailing in twelve days: a fixture call sails on a fixed date and the test would expire with it.
+        var callRef = $"ZZ-{Guid.NewGuid():N}"[..14].ToUpperInvariant();
+        var sails = new DateTimeOffset(DateTime.UtcNow.Date.AddDays(12), TimeSpan.Zero).AddHours(15);
+        var voyage = $"T{Random.Shared.Next(100000, 999999)}";
         try
         {
-            var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>(
-                "/api/tos/vessel-calls?pageSize=200", ct))!.Items.Single(c => c.CallRef == "EASTPIONEER-069S");
+            var made = await client.PostAsJsonAsync("/api/tos/vessel-calls", new
+            {
+                callRef, vesselCode = "CHAOPHRAYA", portCode = "THLCH", terminalCode = "LCB-A0", operatorVoyageOut = voyage,
+                eta = sails.AddHours(-30), etd = sails,
+                lines = new object[] { new { lineCode = "ONEY", voyageOut = voyage + "O" } },
+                cutoffs = new object[] { new { kind = "PORT_DRY", at = sails.AddHours(-36) }, new { kind = "YARD_DRY", at = sails.AddHours(-60) } },
+            }, ct);
+            Assert.True(made.StatusCode == HttpStatusCode.Created, await made.Content.ReadAsStringAsync(ct));
+            var call = (await made.Content.ReadFromJsonAsync<VesselCallDetailResponse>(ct))!.Call;
 
             var created = await client.PostAsJsonAsync(Bookings, new
             {
@@ -121,7 +132,7 @@ public sealed class CutoffExceptionApiTests(TosApiFactory api)
             // Withdrawn, so the same approval can be given again if the line relents.
             Assert.Equal(HttpStatusCode.OK, (await ApproveAsync(etd.AddHours(-6))).StatusCode);
         }
-        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); }
+        finally { await TestDatabase.RemoveBookingsAsync(carrierRef); await TestDatabase.RemoveCallAsync(callRef); }
     }
 
     [Fact]

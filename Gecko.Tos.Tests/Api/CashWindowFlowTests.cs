@@ -108,7 +108,7 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
             var paid = await client.PostAsJsonAsync($"{Window}/receipts", Pay(booking, quote, expected: 160.50m, cash: 160.50m, tendered: 200m), ct);
             Assert.True(paid.StatusCode == HttpStatusCode.Created, await paid.Content.ReadAsStringAsync(ct));
             var receipt = (await paid.Content.ReadFromJsonAsync<ReceiptResponse>(ct))!;
-            Assert.Matches(@"^RCT-SCT-LCB01-\d{4}-\d{5}$", receipt.ReceiptNo);
+            Assert.Matches(@"^CA[A-Z0-9-]*LCB01\d{4}\d{5}$", receipt.ReceiptNo);   // owner 2026-10-08: the desktop's CA + branch + YYMM + 5 digits
             Assert.Equal((160.50m, 39.50m), (receipt.Total, receipt.Change));
             var coupon = Assert.Single(receipt.Coupons);
             Assert.Equal(("FULL_OUT", Box), (coupon.MovementCode, coupon.ContainerNo));
@@ -189,13 +189,12 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
     }
 
     /// <summary>
-    /// Owner 2026-10-03: a cash charge no tariff prices is never a free pass. Before,
-    /// FULL_IN with an unpriced cash charge got an automatic coupon and went through at 0.
-    /// Now: no coupon, the barrier holds the box, the window lists the charge under noPrice
-    /// and refuses a receipt, and a supervisor's waiver releases the box.
+    /// Owner 2026-10-07 (desktop parity, replacing the 2026-10-03 hold): a cash charge no tariff
+    /// prices is not charged and holds nothing. The window still lists it under noPrice so the
+    /// clerk sees "no tariff, not charged", and with nothing else due the box gets its coupon.
     /// </summary>
     [Fact]
-    public async Task A_cash_charge_no_tariff_prices_holds_the_box_until_a_supervisor_waives_it()
+    public async Task A_cash_charge_no_tariff_prices_is_shown_but_not_charged_and_the_box_goes_through()
     {
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
@@ -231,30 +230,8 @@ public sealed class CashWindowFlowTests(TosApiFactory api)
             Assert.Equal(("VASSEAL", "CUSTOMER", 0m), (hole.ChargeCode, hole.BillTo, hole.Amount));
             Assert.Contains("VASSEAL", box.Note);
 
-            // No automatic coupon: the barrier holds the box.
-            await Task.Delay(1500, ct);
-            var held = await PreflightAsync(client, "IN", ct);
-            Assert.Equal("BLOCKED", held.Decision);
-            Assert.Contains(held.Findings, f => f.Code == "NO_COUPON");
-
-            // The window will not take money around the hole.
-            var opened = await client.PostAsJsonAsync($"{Window}/shifts", new { branchId = SctLcb01, openingFloat = 0m }, ct);
-            Assert.Equal(HttpStatusCode.Created, opened.StatusCode);
-            shiftId = (await opened.Content.ReadFromJsonAsync<ShiftResponse>(ct))!.ShiftId;
-            var refused = await client.PostAsJsonAsync($"{Window}/receipts", Pay(booking, quote, expected: 0m, cash: 1m), ct);
-            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
-            Assert.Contains("No price", await refused.Content.ReadAsStringAsync(ct));
-
-            // A supervisor waives it, with a reason: nothing else is due, so the waiver is the coupon.
-            var waived = await client.PostAsJsonAsync($"{Window}/waive", new
-            {
-                bookingContainerId = box.BookingContainerId, chargeCode = "VASSEAL", billTo = "CUSTOMER",
-                reason = "Seal fee not in the contract; waived for this release",
-            }, ct);
-            Assert.True(waived.StatusCode == HttpStatusCode.OK, await waived.Content.ReadAsStringAsync(ct));
-            Assert.NotNull((await waived.Content.ReadFromJsonAsync<WaiveResponse>(ct))!.Coupon);
-
-            var cleared = await EventuallyAsync(() => PreflightAsync(client, "IN", ct), v => v.Decision == "ALLOWED", "the waiver coupon", ct);
+            // Only the unpriced charge is due, so the coupon is automatic: the barrier lets the box in.
+            var cleared = await EventuallyAsync(() => PreflightAsync(client, "IN", ct), v => v.Decision == "ALLOWED", "the automatic coupon", ct);
             Assert.DoesNotContain(cleared.Findings, f => f.Code == "NO_COUPON");
         }
         finally

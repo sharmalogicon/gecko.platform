@@ -122,7 +122,7 @@ public sealed class ContainerStoryApiTests(TosApiFactory api)
     {
         var ct = TestContext.Current.CancellationToken;
         var client = await api.ClientForAsync(TosApiFactory.SctOwner);
-        var response = await client.GetAsync(Story("NOTABOX1"), ct);
+        var response = await client.GetAsync(Story("NOT_A_BOX"), ct);
         var text = await response.Content.ReadAsStringAsync(ct);
         Assert.True(response.StatusCode == HttpStatusCode.BadRequest, text);
         using var body = JsonDocument.Parse(text);

@@ -309,7 +309,10 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
         finally { await CleanAsync(carrierRef, shiftId, box); }
     }
 
-    /// <summary>A2: the money could not be taken (no drawer open), so the blind order the Save raised is cancelled: no orphan.</summary>
+    /// <summary>
+    /// A2: the money could not be taken, so the blind order the Save raised is cancelled: no orphan. The gate Save opens
+    /// the clerk's drawer itself (owner 2026-10-07), so what fails here is the total: the clerk saw a price that is not the one due.
+    /// </summary>
     [Fact]
     public async Task A_blind_order_is_undone_when_the_money_cannot_be_taken()
     {
@@ -332,9 +335,9 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
                         move = new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m },
                     },
                 },
-                payment = new { payments = new[] { new { channel = "CASH", amount = 107m } }, expectedTotal = 107m },
+                payment = new { payments = new[] { new { channel = "CASH", amount = 1m } }, expectedTotal = 1m },
             }, ct);
-            Assert.Equal(HttpStatusCode.Conflict, saved.StatusCode);   // no drawer open (or the price differs): nothing taken
+            Assert.True(saved.StatusCode == HttpStatusCode.Conflict, await saved.Content.ReadAsStringAsync(ct));   // not the price due: nothing taken
             var preflight = await PreflightAsync(client, box, "IN", ct);
             Assert.Contains(preflight.Findings, f => f.Code == "NO_ASSIGNMENT");   // the blind order did not stay behind
         }

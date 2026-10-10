@@ -23,6 +23,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/cash-receipt-by-user.{pdf|xlsx}      TMS.Accounting.CashReceiptByUser
 ///   GET /reports/accounting/cash-receipt-by-liner.{pdf|xlsx}     Tms.Accounting.CashReceiptByLiner
 ///   GET /reports/accounting/cash-receipt-by-company.{pdf|xlsx}   TMS.Accounting.CashReceiptByCompany
+///   GET /reports/accounting/credit-invoice-listing.{pdf|xlsx}    TMS.Accounting.CreditInvoiceListing
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -49,6 +50,9 @@ internal static class AccountingReportEndpoints
             .WithDescription("dateFrom/dateTo are depot date-times (yyyy-MM-ddTHH:mm). agentCode keeps one shipping line's receipts.");
         reports.MapGet("/cash-receipt-by-company.{format}", ByCompanyAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Cash Receipt Detail List by company (Vector CashReceiptByCompany), as PDF or Excel");
+        reports.MapGet("/credit-invoice-listing.{format}", CreditInvoiceListingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Credit Invoice Listing (Vector TMS.Accounting.CreditInvoiceListing): issued credit invoices, EXS and IMS, as PDF or Excel")
+            .WithDescription("agentCode = a shipping line on the invoice's bookings; customerCode = the payer; bookingType as for sales-tax.");
 
         return revenue;
     }
@@ -169,5 +173,22 @@ internal static class AccountingReportEndpoints
         if (refused is not null) return refused;
 
         return File(await CashReceiptReports.ByCompanyAsync(db, tos, trucks, master, context!, ct), format);
+    }
+
+    private static async Task<IResult> CreditInvoiceListingAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null,
+        string? agentCode = null, string? customerCode = null, string? bookingType = null)
+    {
+        var type = string.IsNullOrWhiteSpace(bookingType) ? null : bookingType.Trim().ToUpperInvariant();
+        if (type is not null && !BookingTypes.Contains(type))
+            return RevenueSupport.Invalid("bookingType", "Use IMPORT, EXPORT, REPO or INTERNAL, or leave it out for all.");
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        return File(await AccountingReports.CreditInvoiceListingAsync(db, tos, context!,
+            string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim(),
+            string.IsNullOrWhiteSpace(customerCode) ? null : customerCode.Trim(), type, ct), format);
     }
 }

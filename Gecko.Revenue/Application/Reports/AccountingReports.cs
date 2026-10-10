@@ -178,4 +178,94 @@ internal static class AccountingReports
             ],
             Rows: rows);
     }
+
+    /// <summary>
+    /// TMS.Accounting.CreditInvoiceListing (Report.usp_Accounting_CreditInvoiceListing) — รายงานการออกใบแจ้งหนี้: the issued
+    /// credit invoices of the depot days in two tables, EXS (EXPORT and REPO bookings) then IMS (IMPORT), each with its
+    /// unlabelled total, and the "Total" of both under them. As in the RDL an invoice for an INTERNAL booking is in neither.
+    /// An invoice is listed once (Vector's DISTINCT repeated one spanning booking types or lines), under the booking type
+    /// of its first line on a booking. Filters: <paramref name="agentCode"/> (a line on a booking of that shipping line),
+    /// <paramref name="customerCode"/> (the payer), <paramref name="bookingType"/>.
+    /// </summary>
+    public static async Task<TabularReport> CreditInvoiceListingAsync(
+        RevenueDbContext db, ITosBookingHeaders tos, AccountingReportContext c,
+        string? agentCode, string? customerCode, string? bookingType, CancellationToken ct)
+    {
+        var invoices = await db.Invoices.AsNoTracking()
+            .Where(i => i.BranchId == c.Branch.BranchId && i.IssuedAt >= c.Start && i.IssuedAt < c.End
+                        && i.InvoiceType == "CREDIT" && i.Status == Issued
+                        && (customerCode == null || i.PayerPartyCode == customerCode))
+            .Select(i => new { i.InvoiceId, i.InvoiceNo, i.PayerName, i.IssuedAt, i.SubtotalAmount, i.TaxAmount, i.TotalAmount })
+            .ToListAsync(ct);
+        var ids = invoices.Select(i => i.InvoiceId).ToList();
+        var lines = (await db.InvoiceLines.AsNoTracking()
+                .Where(l => ids.Contains(l.InvoiceId) && l.BookingId != null)
+                .Select(l => new { l.InvoiceId, l.LineNo, BookingId = l.BookingId!.Value }).ToListAsync(ct))
+            .ToLookup(l => l.InvoiceId);
+        var headers = await tos.HeadersAsync(lines.SelectMany(g => g.Select(l => l.BookingId)).Distinct().ToList(), ct);
+
+        var rows = invoices
+            .Select(i =>
+            {
+                var booked = lines[i.InvoiceId].OrderBy(l => l.LineNo).Select(l => headers.GetValueOrDefault(l.BookingId)).OfType<TosBookingHeader>().ToList();
+                return (Invoice: i, Type: booked.FirstOrDefault()?.BookingTypeCode, Bookings: booked);
+            })
+            .Where(x => agentCode is null || x.Bookings.Any(b => string.Equals(b.LineCode, agentCode, StringComparison.OrdinalIgnoreCase)))
+            .Where(x => bookingType is null || x.Bookings.Any(b => b.BookingTypeCode == bookingType))
+            .OrderBy(x => x.Invoice.InvoiceNo, StringComparer.Ordinal)
+            .ToList();
+
+        TabularColumn[] columns =
+        [
+            new(1.2, null, CellAlign.Center), new(3.6), new(8.0), new(2.2, null, CellAlign.Center), new(2.4), new(2.4),
+            new(3.0, Money, CellAlign.Right), new(2.6, Money, CellAlign.Right), new(3.0, Money, CellAlign.Right), new(1.6),
+        ];
+        IReadOnlyList<IReadOnlyList<HeaderCell>> Header(string first) =>
+            [[new(first), new("Invoice No"), new("Customer Name"), new("Date"), new("Reimbursement"), new("Transport"),
+              new("Service"), new("VAT 7 %"), new("TOTAL"), new("COM")]];
+
+        (List<TabularRow> Rows, decimal Service, decimal Vat) Section(params string[] types)
+        {
+            var mine = rows.Where(x => x.Type is not null && types.Contains(x.Type)).ToList();
+            var output = mine.Select((x, n) => new TabularRow([
+                n + 1, x.Invoice.InvoiceNo, x.Invoice.PayerName,
+                c.Branch.LocalDate(x.Invoice.IssuedAt).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                null, null, x.Invoice.SubtotalAmount, x.Invoice.TaxAmount, x.Invoice.TotalAmount, null])).ToList();
+            var (service, vat) = (mine.Sum(x => x.Invoice.SubtotalAmount), mine.Sum(x => x.Invoice.TaxAmount));
+            // The RDL's section TOTAL is Σ Service + Σ VAT.
+            output.Add(new TabularRow([null, null, null, null, null, null, service, vat, service + vat, null], RowKind.Subtotal));
+            return (output, service, vat);
+        }
+        var exs = Section("EXPORT", "REPO");
+        var ims = Section("IMPORT");
+        var (allService, allVat) = (exs.Service + ims.Service, exs.Vat + ims.Vat);
+
+        return new TabularReport(
+            FileName: $"CreditInvoiceListing_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading:
+            [
+                new(c.Letterhead.Name, 10, Bold: true),
+                new("รายงานการออกใบแจ้งหนี้ /INVOICE ", 10, Bold: true),
+                new($"From : {c.From.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}  To : {c.To.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}", 10, Bold: true),
+                new($"AgentCode: {agentCode} BookingType: {bookingType}", 10, Bold: true),
+            ],
+            HeadingRight:
+            [
+                new($"Printed By : {c.PrintedBy}"),
+                new($"Printed On : {c.PrintedOn.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: columns,
+            HeaderRows: Header("EXS"),
+            Rows: exs.Rows,
+            After:
+            [
+                new TabularBlock(null, columns, Header("IMS"), ims.Rows),
+                new TabularBlock(null, columns, [],
+                    [new TabularRow(["Total", null, null, null, null, null, allService, allVat, allService + allVat, null], RowKind.Total)]),
+            ]);
+    }
 }

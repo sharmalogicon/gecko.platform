@@ -1,4 +1,4 @@
-using Gecko.Identity.Infrastructure.Auth;
+﻿using Gecko.Identity.Infrastructure.Auth;
 using Gecko.Identity.Infrastructure.Persistence;
 using Gecko.Identity.Infrastructure.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -10,7 +10,7 @@ public enum LoginStatus
 {
     Succeeded,
 
-    /// <summary>Wrong email, wrong password, locked, disabled, invited, tenant not active — deliberately indistinguishable to the caller.</summary>
+    /// <summary>Wrong email or user name, wrong password, locked, disabled, invited, tenant not active — deliberately indistinguishable to the caller.</summary>
     Failed,
 
     /// <summary>The password was right (so revealing this leaks nothing) but must be changed before a token is issued.</summary>
@@ -19,13 +19,15 @@ public enum LoginStatus
 
 public sealed record LoginOutcome(LoginStatus Status, IssuedAccessToken? Token = null, IssuedSession? Session = null);
 
-public sealed record LoginAttempt(string Email, string Password, ClientInfo Client);
+/// <param name="Login">An e-mail (it has an '@') or a user name (26_user_name.sql) — whichever the user has.</param>
+public sealed record LoginAttempt(string Login, string Password, ClientInfo Client);
 
 /// <summary>
 /// POST /auth/login. The most security-sensitive code path on the platform.
 ///
 /// Follows 06_rls_security.sql to the letter:
-///   1. The email lookup is the ONLY query on system context, and filters on email_normalised alone.
+///   1. The account lookup is the ONLY query on system context, and filters on email_normalised
+///      (or, for an identifier without '@', on user_name) alone.
 ///   2. It returns the minimum needed to authenticate.
 ///   3. After the password verifies, claims are read through a TENANT-scoped context (RLS applies).
 ///
@@ -44,10 +46,10 @@ public sealed class LoginService(
 {
     public async Task<LoginOutcome> LoginAsync(LoginAttempt attempt, CancellationToken ct)
     {
-        var email = attempt.Email.Trim().ToLowerInvariant();
+        var email = attempt.Login.Trim().ToLowerInvariant();
         var now = clock.GetUtcNow();
 
-        var account = await FindByEmailForAuthentication_SystemContext(email, ct);
+        var account = await FindForAuthentication_SystemContext(email, ct);
 
         Task Record(string eventType, string? failureReason) =>
             events.RecordAsync(attempt.Client, eventType, failureReason, account?.TenantId, account?.UserId, email, ct);
@@ -116,10 +118,16 @@ public sealed class LoginService(
 
     private sealed record AccountRow(Guid UserId, Guid TenantId, string UserType, string Status, DateTimeOffset? LockedUntil, int FailedLoginCount, string? TenantStatus, CredentialRow? Credential);
 
-    /// <summary>The one system-context lookup. Named so nobody reuses it by accident.</summary>
-    private Task<AccountRow?> FindByEmailForAuthentication_SystemContext(string emailNormalised, CancellationToken ct) =>
-        system.Users
-            .Where(u => u.EmailNormalised == emailNormalised)
+    /// <summary>
+    /// The one system-context lookup. Named so nobody reuses it by accident.
+    /// An identifier with '@' is an e-mail, anything else a user name; a user name never
+    /// contains '@' (ck_user__user_name), so the two can never find different accounts.
+    /// user_name compares case-insensitively through the database collation.
+    /// </summary>
+    private Task<AccountRow?> FindForAuthentication_SystemContext(string login, CancellationToken ct) =>
+        (login.Contains('@')
+            ? system.Users.Where(u => u.EmailNormalised == login)
+            : system.Users.Where(u => u.UserName == login && u.DeletedAt == null))
             .Select(u => new AccountRow(
                 u.UserId,
                 u.TenantId,

@@ -86,6 +86,50 @@ public class SessionApiTests(ApiFactory api)
     }
 
     [Fact]
+    public async Task A_signed_in_user_changes_their_password_with_a_new_one_typed_twice()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string who = "gate2.lcb@sct.co.th";
+        const string fresh = "A-new-Password-2026";
+        using var anonymous = api.CreateClient();
+        Task<HttpResponseMessage> Login(string password) => anonymous.PostAsJsonAsync("/auth/login", new { email = who, password }, ct);
+        async Task<HttpClient> SignedIn(string password)
+        {
+            var body = await (await Login(password)).Content.ReadFromJsonAsync<LoginResponse>(ct);
+            var client = api.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new("Bearer", body!.AccessToken);
+            return client;
+        }
+
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anonymous.PostAsJsonAsync("/auth/password", new { newPassword = fresh, confirmPassword = fresh }, ct)).StatusCode);
+
+        using var user = await SignedIn(ApiFactory.Password);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await user.PostAsJsonAsync("/auth/password", new { newPassword = fresh, confirmPassword = fresh + "x" }, ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await user.PostAsJsonAsync("/auth/password", new { newPassword = "short", confirmPassword = "short" }, ct)).StatusCode);
+
+        try
+        {
+            Assert.Equal(HttpStatusCode.NoContent,
+                (await user.PostAsJsonAsync("/auth/password", new { newPassword = fresh, confirmPassword = fresh }, ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await Login(fresh)).StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, (await Login(ApiFactory.Password)).StatusCode);
+        }
+        finally
+        {
+            // Back to the fixture password, through the same endpoint.
+            Assert.Equal(HttpStatusCode.NoContent,
+                (await user.PostAsJsonAsync("/auth/password", new { newPassword = ApiFactory.Password, confirmPassword = ApiFactory.Password }, ct)).StatusCode);
+        }
+        Assert.Equal(HttpStatusCode.OK, (await Login(ApiFactory.Password)).StatusCode);
+
+        await using var db = TestDatabase.ForTenant(TestDatabase.Sct);
+        Assert.True(await db.AuthEvents.AnyAsync(e => e.EventType == "PASSWORD_CHANGED" && e.OccurredAt > DateTimeOffset.UtcNow.AddMinutes(-2), ct));
+    }
+
+    [Fact]
     public async Task Logout_kills_the_session_and_is_idempotent()
     {
         var ct = TestContext.Current.CancellationToken;

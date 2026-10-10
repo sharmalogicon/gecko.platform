@@ -2,6 +2,9 @@ using System.ComponentModel.DataAnnotations;
 using Gecko.Data;
 using Gecko.Identity.Application.Auth;
 using Gecko.Identity.Infrastructure.Auth;
+using Gecko.Identity.Infrastructure.Persistence;
+using Gecko.Identity.Infrastructure.Persistence.Entities;
+using Microsoft.EntityFrameworkCore;
 using Gecko.SharedKernel;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -10,8 +13,9 @@ using Microsoft.AspNetCore.Routing;
 
 namespace Gecko.Identity.Endpoints;
 
+/// <param name="Email">The user's e-mail, or their user name — whichever they have (an identifier without '@' is a user name).</param>
 public sealed record LoginRequest(
-    [property: Required, EmailAddress, MaxLength(256)] string Email,
+    [property: Required, MaxLength(256)] string Email,
     [property: Required, MaxLength(256)] string Password);
 
 /// <summary>The refresh token is NOT in the body — it is set as an HttpOnly cookie the page's JavaScript cannot read.</summary>
@@ -30,6 +34,11 @@ public sealed record AcceptInvitationRequest(
     [property: Required, StringLength(128, MinimumLength = 12, ErrorMessage = "Password must be 12-128 characters.")] string Password,
     [property: MaxLength(200)] string? FullName = null);
 
+/// <summary>The signed-in user's new password, typed twice.</summary>
+public sealed record ChangePasswordRequest(
+    [property: Required, StringLength(128, MinimumLength = 12, ErrorMessage = "Password must be 12-128 characters.")] string NewPassword,
+    [property: Required] string ConfirmPassword);
+
 internal static class AuthEndpoints
 {
     public const string LoginRateLimitPolicy = "identity-login";
@@ -42,8 +51,8 @@ internal static class AuthEndpoints
             .AllowAnonymous()
             .Validate<LoginRequest>()
             .RequireRateLimiting(LoginRateLimitPolicy)
-            .WithSummary("Exchange email + password for an access token (+ refresh cookie)")
-            .WithDescription("Accounts are created by invitation; there is no self-service signup. A wrong email and a wrong password both return the same 401.");
+            .WithSummary("Exchange email (or user name) + password for an access token (+ refresh cookie)")
+            .WithDescription("`email` takes the e-mail or the user name, whichever the user has. Accounts are created by invitation; there is no self-service signup. A wrong email or user name and a wrong password all return the same 401.");
 
         auth.MapPost("/refresh", RefreshAsync)
             .AllowAnonymous()
@@ -57,6 +66,12 @@ internal static class AuthEndpoints
         auth.MapGet("/me", Me)
             .RequireAuthorization()
             .WithSummary("The claims in the caller's access token");
+
+        auth.MapPost("/password", ChangePasswordAsync)
+            .RequireAuthorization()
+            .Validate<ChangePasswordRequest>()
+            .WithSummary("Change your own password: new password + confirmation")
+            .WithDescription("Owner 2026-10-10: just the new password typed twice; the caller's access token proves who they are. The old password stops working at once; this session stays signed in.");
 
         // POST, not GET /invitations/{token}: a bearer token in a URL ends up in
         // proxy logs, browser history and Referer headers.
@@ -90,7 +105,7 @@ internal static class AuthEndpoints
                     title: "Password change required", statusCode: StatusCodes.Status403Forbidden,
                     extensions: new Dictionary<string, object?> { ["code"] = "password_change_required" });
             default:
-                return TypedResults.Problem(title: "Invalid email or password.", statusCode: StatusCodes.Status401Unauthorized);
+                return TypedResults.Problem(title: "Invalid email, user name or password.", statusCode: StatusCodes.Status401Unauthorized);
         }
     }
 
@@ -139,6 +154,40 @@ internal static class AuthEndpoints
             default:
                 return TypedResults.Problem(title: "This invitation is invalid or has expired. Ask for a new one.", statusCode: StatusCodes.Status404NotFound);
         }
+    }
+
+    private static async Task<Results<NoContent, ValidationProblem>> ChangePasswordAsync(
+        ChangePasswordRequest request, IdentityDbContext db, PasswordHasher hasher, AuthEventWriter events, HttpContext http, CancellationToken ct)
+    {
+        if (request.NewPassword != request.ConfirmPassword)
+            return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["confirmPassword"] = ["The two passwords do not match."] });
+
+        var userId = Guid.Parse(http.User.FindFirst(GeckoClaimTypes.UserId)!.Value);
+        var tenantId = Guid.Parse(http.User.FindFirst(GeckoClaimTypes.TenantId)!.Value);
+        var fresh = hasher.Hash(request.NewPassword);
+
+        // The old credential is kept as history (is_current = 0), as the rehash on login does.
+        await using (var tx = await db.Database.BeginTransactionAsync(ct))
+        {
+            await db.Credentials
+                .Where(c => c.UserId == userId && c.IsCurrent)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.IsCurrent, false), ct);
+            db.Credentials.Add(new Credential
+            {
+                UserId = userId,
+                TenantId = tenantId,
+                PasswordHash = fresh.Hash,
+                Algorithm = fresh.Algorithm,
+                AlgorithmParams = fresh.Parameters,
+                IsCurrent = true,
+                MustChange = false,
+            });
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+        }
+
+        await events.RecordAsync(Client(http), "PASSWORD_CHANGED", null, tenantId, userId, ct: ct);
+        return TypedResults.NoContent();
     }
 
     private static MeResponse Me(HttpContext http)

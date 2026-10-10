@@ -13,6 +13,9 @@ public partial class User
 
     public string EmailNormalised { get; set; } = null!;
 
+    /// <summary>Optional sign-in name, unique across all tenants (26_user_name.sql); never contains '@'.</summary>
+    public string? UserName { get; set; }
+
     public DateTimeOffset? EmailVerifiedAt { get; set; }
 
     public string FullName { get; set; } = null!;

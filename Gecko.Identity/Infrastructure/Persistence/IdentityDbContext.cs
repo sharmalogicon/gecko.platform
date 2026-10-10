@@ -1021,6 +1021,10 @@ public partial class IdentityDbContext : DbContext
                 .IsUnique()
                 .HasFilter("([deleted_at] IS NULL)");
 
+            entity.HasIndex(e => e.UserName, "uq_user__user_name")
+                .IsUnique()
+                .HasFilter("([user_name] IS NOT NULL AND [deleted_at] IS NULL)");
+
             entity.Property(e => e.UserId)
                 .HasDefaultValueSql("(newsequentialid())")
                 .HasColumnName("user_id");
@@ -1038,6 +1042,9 @@ public partial class IdentityDbContext : DbContext
                 .HasMaxLength(256)
                 .HasColumnName("email_normalised");
             entity.Property(e => e.EmailVerifiedAt).HasColumnName("email_verified_at");
+            entity.Property(e => e.UserName)
+                .HasMaxLength(64)
+                .HasColumnName("user_name");
             entity.Property(e => e.FailedLoginCount).HasColumnName("failed_login_count");
             entity.Property(e => e.FullName)
                 .HasMaxLength(200)

@@ -9,12 +9,13 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 
 namespace Gecko.Identity.Endpoints.Admin;
 
 public sealed record UserSummary(
-    Guid UserId, string Email, string FullName, string? JobTitle, string UserType, string Status,
+    Guid UserId, string Email, string? UserName, string FullName, string? JobTitle, string UserType, string Status,
     bool IsLocked, DateTimeOffset? LastLoginAt, int BranchCount, IReadOnlyList<string> Roles);
 
 public sealed record UserBranchResponse(Guid BranchId, string BranchCode, string DisplayName);
@@ -22,7 +23,7 @@ public sealed record UserBranchResponse(Guid BranchId, string BranchCode, string
 public sealed record UserRoleResponse(Guid UserRoleId, Guid RoleId, string RoleCode, Guid? BranchId, string? BranchCode);
 
 public sealed record UserResponse(
-    Guid UserId, string Email, string FullName, string? Phone, string? JobTitle, string UserType, string Status,
+    Guid UserId, string Email, string? UserName, string FullName, string? Phone, string? JobTitle, string UserType, string Status,
     Guid? DefaultBranchId, string? Locale, string? Timezone, DateTimeOffset? EmailVerifiedAt, DateTimeOffset? LastLoginAt,
     int FailedLoginCount, DateTimeOffset? LockedUntil, IReadOnlyList<UserBranchResponse> Branches, IReadOnlyList<UserRoleResponse> Roles,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
@@ -34,6 +35,10 @@ public sealed record UpdateUserRequest(
     Guid? DefaultBranchId = null,
     [property: MaxLength(10)] string? Locale = null,
     [property: MaxLength(50)] string? Timezone = null);
+
+/// <param name="UserName">The name the user may sign in with instead of their e-mail; null or blank removes it.</param>
+public sealed record SetUserNameRequest(
+    [property: MaxLength(64), RegularExpression(@"^[^@]*$", ErrorMessage = "A user name cannot contain '@'.")] string? UserName);
 
 public sealed record SetUserBranchesRequest([property: Required] IReadOnlyList<Guid> BranchIds);
 
@@ -53,6 +58,9 @@ internal static class UserEndpoints
         users.MapGet("/", ListAsync).WithSummary("List users (to add one, create an invitation)");
         users.MapGet("/{userId:guid}", GetAsync).WithName("GetUser").WithSummary("Get a user with branches and roles");
         users.MapPut("/{userId:guid}", UpdateAsync).Validate<UpdateUserRequest>().WithSummary("Update profile fields");
+        users.MapPut("/{userId:guid}/user-name", SetUserNameAsync).Validate<SetUserNameRequest>()
+            .WithSummary("Set or clear the user name the user may sign in with instead of their e-mail")
+            .WithDescription("Unique across every tenant (sign-in has no tenant to narrow by) and case-insensitive; 409 when someone already holds it.");
         users.MapPost("/{userId:guid}/disable", DisableAsync).WithSummary("Disable sign-in and revoke sessions");
         users.MapPost("/{userId:guid}/enable", EnableAsync).WithSummary("Re-enable a disabled user");
         users.MapPost("/{userId:guid}/unlock", UnlockAsync).WithSummary("Clear a failed-login lockout");
@@ -73,12 +81,12 @@ internal static class UserEndpoints
         if (!string.IsNullOrWhiteSpace(status)) users = users.Where(u => u.Status == status.ToUpperInvariant());
         if (branchId is not null) users = users.Where(u => db.UserBranches.Any(ub => ub.UserId == u.UserId && ub.BranchId == branchId));
         if (!string.IsNullOrWhiteSpace(query.Search))
-            users = users.Where(u => u.EmailNormalised.Contains(query.Search.ToLower()) || u.FullName.Contains(query.Search));
+            users = users.Where(u => u.EmailNormalised.Contains(query.Search.ToLower()) || u.FullName.Contains(query.Search) || u.UserName!.Contains(query.Search));
 
         var page = await users
             .OrderBy(u => u.FullName)
             .Select(u => new UserSummary(
-                u.UserId, u.Email, u.FullName, u.JobTitle, u.UserType, u.Status,
+                u.UserId, u.Email, u.UserName, u.FullName, u.JobTitle, u.UserType, u.Status,
                 u.LockedUntil > now, u.LastLoginAt,
                 db.UserBranches.Count(ub => ub.UserId == u.UserId),
                 (from ur in db.UserRoles
@@ -112,6 +120,26 @@ internal static class UserEndpoints
 
         db.RecordChange(caller, "USER", userId, "UPDATE", before, new { user.FullName, user.Phone, user.JobTitle, user.DefaultBranchId, user.Locale, user.Timezone });
         await db.SaveChangesAsync(ct);
+
+        return TypedResults.Ok((await LoadAsync(db, userId, ct))!);
+    }
+
+    private static async Task<Results<Ok<UserResponse>, NotFound, ProblemHttpResult>> SetUserNameAsync(
+        Guid userId, SetUserNameRequest request, IdentityDbContext db, ITenantContext caller, CancellationToken ct)
+    {
+        var user = await db.Users.SingleOrDefaultAsync(u => u.UserId == userId, ct);
+        if (user is null) return TypedResults.NotFound();
+
+        var before = new { user.UserName };
+        user.UserName = string.IsNullOrWhiteSpace(request.UserName) ? null : request.UserName.Trim();
+        db.RecordChange(caller, "USER", userId, "UPDATE", before, new { user.UserName });
+
+        // Another tenant's user is invisible here (RLS), so uq_user__user_name is the check.
+        try { await db.SaveChangesAsync(ct); }
+        catch (DbUpdateException e) when (e.InnerException is SqlException { Number: 2601 or 2627 })
+        {
+            return AdminSupport.Conflict($"The user name '{user.UserName}' is already taken.");
+        }
 
         return TypedResults.Ok((await LoadAsync(db, userId, ct))!);
     }
@@ -275,7 +303,7 @@ internal static class UserEndpoints
         db.Users.AsNoTracking()
             .Where(u => u.UserId == userId)
             .Select(u => new UserResponse(
-                u.UserId, u.Email, u.FullName, u.Phone, u.JobTitle, u.UserType, u.Status,
+                u.UserId, u.Email, u.UserName, u.FullName, u.Phone, u.JobTitle, u.UserType, u.Status,
                 u.DefaultBranchId, u.Locale, u.Timezone, u.EmailVerifiedAt, u.LastLoginAt, u.FailedLoginCount, u.LockedUntil,
                 (from ub in db.UserBranches
                  join b in db.Branches on ub.BranchId equals b.BranchId

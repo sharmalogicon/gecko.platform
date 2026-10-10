@@ -42,6 +42,46 @@ public class UserApiTests(ApiFactory api)
     }
 
     [Fact]
+    public async Task A_user_signs_in_with_their_user_name_or_their_email()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var admin = await api.ClientForAsync(ApiFactory.SctAdmin);
+        var target = await FindUserAsync(admin, "gate2.lcb@sct.co.th", ct);
+        var other = await FindUserAsync(admin, ApiFactory.SctOpsLcb, ct);
+        using var anonymous = api.CreateClient();
+        var name = $"zz{Guid.NewGuid():N}"[..12];
+        Task<HttpResponseMessage> Login(string login, string password = ApiFactory.Password) =>
+            anonymous.PostAsJsonAsync("/auth/login", new { email = login, password }, ct);
+
+        try
+        {
+            var set = await admin.PutAsJsonAsync($"/api/users/{target.UserId}/user-name", new { userName = $"  {name}  " }, ct);
+            Assert.Equal(HttpStatusCode.OK, set.StatusCode);
+            Assert.Equal(name, (await set.Content.ReadFromJsonAsync<UserResponse>(ct))!.UserName);
+
+            // Either identifier works; a user name ignores letter case, and a wrong password is still the same 401.
+            Assert.Equal(HttpStatusCode.OK, (await Login(name)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await Login(name.ToUpperInvariant())).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await Login("gate2.lcb@sct.co.th")).StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, (await Login(name, "not-the-password")).StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, (await Login(name + "x")).StatusCode);
+
+            // A user name is one person's: nobody else may take it, and it never holds an '@'.
+            Assert.Equal(HttpStatusCode.Conflict,
+                (await admin.PutAsJsonAsync($"/api/users/{other.UserId}/user-name", new { userName = name.ToUpperInvariant() }, ct)).StatusCode);
+            Assert.Equal(HttpStatusCode.BadRequest,
+                (await admin.PutAsJsonAsync($"/api/users/{other.UserId}/user-name", new { userName = "a@b" }, ct)).StatusCode);
+        }
+        finally
+        {
+            Assert.Equal(HttpStatusCode.OK, (await admin.PutAsJsonAsync($"/api/users/{target.UserId}/user-name", new { userName = (string?)null }, ct)).StatusCode);
+        }
+
+        // Cleared: the name no longer signs anyone in.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await Login(name)).StatusCode);
+    }
+
+    [Fact]
     public async Task Disabled_user_cannot_log_in_until_enabled()
     {
         var ct = TestContext.Current.CancellationToken;

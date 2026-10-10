@@ -140,8 +140,10 @@ internal static class OperationChargeReports
     }
 
     /// <summary>A box's charge billed in the report's window: on an issued receipt dated in it, or an issued invoice.</summary>
+    /// <param name="Payer">The party the charge is billed to (Vector's InvoiceHeader.CustomerCode).</param>
     public sealed record BilledCharge(
-        Guid Box, Guid? BookingId, string ChargeCode, string? MovementCode, decimal Amount, string BilledNo, DateTimeOffset BilledAt);
+        Guid Box, Guid? BookingId, string ChargeCode, string? MovementCode, decimal Amount, string BilledNo, DateTimeOffset BilledAt,
+        string? ContainerNo = null, decimal UnitRate = 0, string? Payer = null);
 
     /// <summary>
     /// Vector's "invoice date in the window", owner 2026-10-10: the receipt's date for a cash charge, the invoice's for a
@@ -153,14 +155,17 @@ internal static class OperationChargeReports
                         join r in db.Receipts on x.ReceiptId equals r.ReceiptId
                         where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
                               && r.Status == "ISSUED" && r.ReceiptAt >= c.Start && r.ReceiptAt < c.End
-                        select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = r.ReceiptNo, At = r.ReceiptAt };
+                        select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = r.ReceiptNo, At = r.ReceiptAt,
+                                    x.ContainerNo, x.UnitRate, x.PayerPartyCode };
         var invoiced = from x in db.Charges.AsNoTracking()
                        join i in db.Invoices on x.InvoiceId equals i.InvoiceId
                        where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
                              && i.Status == "ISSUED" && i.IssuedAt >= c.Start && i.IssuedAt < c.End
-                       select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = i.InvoiceNo, At = i.IssuedAt };
+                       select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = i.InvoiceNo, At = i.IssuedAt,
+                                   x.ContainerNo, x.UnitRate, x.PayerPartyCode };
         return (await receipted.ToListAsync(ct)).Concat(await invoiced.ToListAsync(ct))
-            .Select(x => new BilledCharge(x.Box, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, x.BilledNo, x.At))
+            .Select(x => new BilledCharge(x.Box, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, x.BilledNo, x.At,
+                x.ContainerNo, x.UnitRate ?? 0m, x.PayerPartyCode))
             .ToList();
     }
 

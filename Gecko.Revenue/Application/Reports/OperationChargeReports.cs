@@ -139,6 +139,31 @@ internal static class OperationChargeReports
             PageLabel: null);
     }
 
+    /// <summary>A box's charge billed in the report's window: on an issued receipt dated in it, or an issued invoice.</summary>
+    public sealed record BilledCharge(
+        Guid Box, Guid? BookingId, string ChargeCode, string? MovementCode, decimal Amount, string BilledNo, DateTimeOffset BilledAt);
+
+    /// <summary>
+    /// Vector's "invoice date in the window", owner 2026-10-10: the receipt's date for a cash charge, the invoice's for a
+    /// credit one (KORAKIT bills cash). Charges on a box only; cancelled charges, receipts and invoices left out.
+    /// </summary>
+    public static async Task<List<BilledCharge>> BilledAsync(RevenueDbContext db, AccountingReportContext c, CancellationToken ct)
+    {
+        var receipted = from x in db.Charges.AsNoTracking()
+                        join r in db.Receipts on x.ReceiptId equals r.ReceiptId
+                        where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
+                              && r.Status == "ISSUED" && r.ReceiptAt >= c.Start && r.ReceiptAt < c.End
+                        select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = r.ReceiptNo, At = r.ReceiptAt };
+        var invoiced = from x in db.Charges.AsNoTracking()
+                       join i in db.Invoices on x.InvoiceId equals i.InvoiceId
+                       where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
+                             && i.Status == "ISSUED" && i.IssuedAt >= c.Start && i.IssuedAt < c.End
+                       select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = i.InvoiceNo, At = i.IssuedAt };
+        return (await receipted.ToListAsync(ct)).Concat(await invoiced.ToListAsync(ct))
+            .Select(x => new BilledCharge(x.Box, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, x.BilledNo, x.At))
+            .ToList();
+    }
+
     public const string StorageActivityKey = "STORAGE_ACTIVITY";
 
     /// <summary>TMS.Accounting.ContainerStorageActivityStandard's codes (the RDL's credit codes).</summary>
@@ -298,17 +323,7 @@ internal static class OperationChargeReports
         RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
         string? lineCode, string? vesselCode, string? voyage, string? carrierRef, CancellationToken ct)
     {
-        var receipted = from x in db.Charges.AsNoTracking()
-                        join r in db.Receipts on x.ReceiptId equals r.ReceiptId
-                        where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
-                              && r.Status == "ISSUED" && r.ReceiptAt >= c.Start && r.ReceiptAt < c.End
-                        select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = r.ReceiptNo };
-        var invoiced = from x in db.Charges.AsNoTracking()
-                       join i in db.Invoices on x.InvoiceId equals i.InvoiceId
-                       where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
-                             && i.Status == "ISSUED" && i.IssuedAt >= c.Start && i.IssuedAt < c.End
-                       select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = i.InvoiceNo };
-        var billed = (await receipted.ToListAsync(ct)).Concat(await invoiced.ToListAsync(ct)).ToList();
+        var billed = await BilledAsync(db, c, ct);
 
         var headers = await tos.HeadersAsync(billed.Select(b => b.BookingId).OfType<Guid>().Distinct().ToList(), ct);
         bool Wanted(Guid? bookingId) => bookingId is { } id && headers.TryGetValue(id, out var h) && h.BookingTypeCode == "IMPORT"
@@ -380,6 +395,106 @@ internal static class OperationChargeReports
             [
                 [new("CONT NO."), new("SIZE"), new("EMPTY\nIN"), new("EMPTY\nOUT"), new("LADEN\nIN"), new("LADEN\nOUT"), new("DAY"),
                  new("STORAGE\nAMOUNT"), new("LO/LO"), new("ค่าผ่าน\nประตู"), new("HAULAGE\nCD/ECT/PAT"), new("FAS"), new("STATUS"), new("SHIPPER")],
+            ],
+            Rows: rows);
+    }
+
+    public const string ExportFullOutKey = "EXPORT_FULL_OUT";
+
+    /// <summary>TMS.Accounting.ExportFullOut's code: the laden lift-on (the RDL's SL002-CR on FULL OUT).</summary>
+    public static readonly IReadOnlyDictionary<string, string> ExportFullOutCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SL002-CR"] = "LIFT_ON",
+    };
+
+    /// <summary>The RDL's two order types: CY/CY and CFS export.</summary>
+    private const string ExportCy = "EXP CY/CY", ExportCfs = "EXP CFS";
+
+    /// <summary>
+    /// TMS.Accounting.ExportFullOut (Report.usp_Accounting_ExportFullOut) — EXPORT FULL OUT (CY/CY): a row per invoice of
+    /// laden lift-on on EXPORT bookings' full gate-outs, its vessel &amp; voyage and date, the boxes counted by size for
+    /// CY+CFS, then count and amount by size for CY and for CFS, the TOTAL and the 80 % REFUND; then the grand total.
+    /// Owner 2026-10-10 defaults: an invoice is the receipt (cash) or invoice (credit) that billed it, by its date;
+    /// totals corrected — each line counted under its own size and order type at its own amount (the RDL put the whole
+    /// invoice under its first line's size at its rate, and its 20' CY total tested "EXP CY", so always printed 0).
+    /// </summary>
+    public static async Task<TabularReport> ExportFullOutAsync(
+        RevenueDbContext db, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        string? lineCode, string? vesselCode, string? voyage, CancellationToken ct)
+    {
+        var tenant = await TenantMapAsync(db, ExportFullOutKey, ct);
+        bool LiftOn(string code) => (tenant.GetValueOrDefault(code) ?? ExportFullOutCodes.GetValueOrDefault(code)) == "LIFT_ON";
+        var billed = (await BilledAsync(db, c, ct))
+            .Where(b => LiftOn(b.ChargeCode) && string.Equals(b.MovementCode, "FULL_OUT", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var boxes = await booked.BoxesByIdAsync(billed.Select(b => b.Box).Distinct().ToList(), ct);
+        bool Wanted(TosBookedBox b) => b.BookingTypeCode == "EXPORT"
+            && (lineCode is null || string.Equals(b.LineCode, lineCode, StringComparison.OrdinalIgnoreCase))
+            && (vesselCode is null || string.Equals(b.VesselCode, vesselCode, StringComparison.OrdinalIgnoreCase))
+            && (voyage is null || string.Equals(b.Voyage, voyage, StringComparison.OrdinalIgnoreCase));
+        var lines = billed.Where(b => boxes.TryGetValue(b.Box, out var box) && Wanted(box))
+            .Select(b => (Billed: b, Box: boxes[b.Box])).ToList();
+
+        var typeCodes = lines.Select(x => x.Box.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var vesselCodes = lines.Select(x => x.Box.VesselCode).OfType<string>().Distinct().ToList();
+        var vessels = vesselCodes.Count == 0 ? new Dictionary<string, VesselRef>() : await master.VesselsAsync(vesselCodes, ct);
+
+        string[] sizes = ["20", "40", "45"];
+        // Per invoice: [CY+CFS 20/40/45 counts] [CY 20 n, amt, 40 n, amt, 45 n, amt] [CFS the same] TOTAL REFUND.
+        decimal[] Figures(IEnumerable<(BilledCharge Billed, TosBookedBox Box)> set)
+        {
+            var list = set.Select(x => (Size: SizeType(types, x.Box.EquipmentTypeCode).Size, x.Box.OrderTypeCode, x.Billed.Amount)).ToList();
+            IEnumerable<decimal> Of(string orderType) => sizes.SelectMany(size =>
+            {
+                var hit = list.Where(x => x.Size == size && x.OrderTypeCode == orderType).ToList();
+                return new[] { (decimal)hit.Count, hit.Sum(x => x.Amount) };
+            });
+            var both = sizes.Select(size => (decimal)list.Count(x => x.Size == size && x.OrderTypeCode is ExportCy or ExportCfs));
+            var cy = Of(ExportCy).ToArray();
+            var cfs = Of(ExportCfs).ToArray();
+            var total = cy.Where((_, i) => i % 2 == 1).Sum() + cfs.Where((_, i) => i % 2 == 1).Sum();
+            return [.. both, .. cy, .. cfs, total, total * 0.8m];
+        }
+
+        var invoices = lines.GroupBy(x => x.Billed.BilledNo).OrderBy(g => g.Key, StringComparer.Ordinal).ToList();
+        var rows = invoices.Select(g =>
+        {
+            var box = g.First().Box;
+            var vessel = box.VesselCode is { } code ? vessels.GetValueOrDefault(code)?.VesselName ?? code : "";
+            return new TabularRow([g.Key, $"{vessel} {box.Voyage}".Trim(), c.Branch.LocalDate(g.Min(x => x.Billed.BilledAt)),
+                .. Figures(g).Select(v => (object?)v)]);
+        }).ToList();
+        rows.Add(new TabularRow([null, null, null, .. Figures(lines).Select(v => (object?)v)], RowKind.Total));
+
+        const string Count = "#,0;(#,0)";
+        const string Baht = "#,0;(#,0)";
+        const string Thb = "#,0.00;(#,0.00);\"-\"";
+        TabularColumn N() => new(1.0, Count, CellAlign.Center);
+        TabularColumn B() => new(1.5, Baht, CellAlign.Right);
+
+        return new TabularReport(
+            FileName: $"ExportFullOut_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading: [new(c.BranchName, 10, Bold: true)],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.6), new(3.2), new(1.6, "dd/MM/yy", CellAlign.Center), N(), N(), N(),
+                N(), B(), N(), B(), N(), B(), N(), B(), N(), B(), N(), B(),
+                new(2.2, Thb, CellAlign.Right), new(2.2, Thb, CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new("", ColSpan: 3), new("CY+CFS", ColSpan: 3), new("CY", ColSpan: 6), new("CFS", ColSpan: 6), new("TOTAL"), new("REFUND")],
+                [new("Invoice No"), new("VESSEL & VOY"), new("DATE"), new("20'"), new("40'"), new("45'"),
+                 new("20'"), new("B 500"), new("40'"), new("B 500"), new("45'"), new("B 1000"),
+                 new("20'"), new("B 400"), new("40'"), new("B 800"), new("45'"), new("B 800"),
+                 new("THB"), new("THB(80%)")],
             ],
             Rows: rows);
     }

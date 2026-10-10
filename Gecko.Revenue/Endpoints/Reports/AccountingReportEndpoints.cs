@@ -27,6 +27,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/lift-off-washing.{pdf|xlsx}          TMS.Accounting.LiftOffWashing
 ///   GET /reports/accounting/container-storage-activity.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityStandard
 ///   GET /reports/accounting/container-storage-activity-by-vessel.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityByVslVoy
+///   GET /reports/accounting/export-full-out.{pdf|xlsx}   TMS.Accounting.ExportFullOut
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -62,6 +63,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/container-storage-activity-by-vessel.{format}", StorageActivityByVesselAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Container Storage Activity by vessel/voyage (Vector ContainerStorageActivityByVslVoy), as PDF or Excel")
             .WithDescription("The IMPORT boxes billed in dateFrom..dateTo (receipt date for cash, invoice date for credit). agentCode = the shipping line; voyageNo; bookingBlNo = the carrier's B/L.");
+        reports.MapGet("/export-full-out.{format}", ExportFullOutAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Export Full Out (CY/CY) (Vector ExportFullOut), as PDF or Excel")
+            .WithDescription("Laden lift-on of EXPORT boxes' full gate-outs billed in dateFrom..dateTo (receipt date for cash, invoice date for credit), a row per receipt/invoice. agentCode = the shipping line; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -252,5 +256,19 @@ internal static class AccountingReportEndpoints
         static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
         return File(await OperationChargeReports.StorageActivityByVesselAsync(db, tos, booked, master, context!,
             Clean(agentCode), Clean(vesselCode), Clean(voyageNo), Clean(bookingBlNo), ct), format);
+    }
+
+    private static async Task<IResult> ExportFullOutAsync(
+        string format, RevenueDbContext db, ITosBookedBoxes booked, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        return File(await OperationChargeReports.ExportFullOutAsync(db, booked, master, context!,
+            Clean(agentCode), Clean(vesselCode), Clean(voyageNo), ct), format);
     }
 }

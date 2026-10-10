@@ -285,4 +285,102 @@ internal static class OperationChargeReports
                     agentBilled),
             ]);
     }
+
+    /// <summary>
+    /// TMS.Accounting.ContainerStorageActivityByVslVoy — CONTAINER STORAGE ACTIVITY for a vessel/voyage: the IMPORT boxes
+    /// billed in the window, a line each with its empty and laden gate dates, its storage and LO/LO, order type and shipper
+    /// (customer code); DAY, ค่าผ่านประตู, HAULAGE and FAS print blank as in the RDL. No totals, as in the RDL.
+    /// Owner 2026-10-10 defaults: "invoiced in the window" is billed in it — the receipt's date for a cash charge, the
+    /// invoice's for a credit one (KORAKIT bills cash); storage and LO/LO are the box's billed charges summed (the RDL showed
+    /// the first line's rate and counted cleaning as storage); columns by the Container Storage Activity mapping.
+    /// </summary>
+    public static async Task<TabularReport> StorageActivityByVesselAsync(
+        RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        string? lineCode, string? vesselCode, string? voyage, string? carrierRef, CancellationToken ct)
+    {
+        var receipted = from x in db.Charges.AsNoTracking()
+                        join r in db.Receipts on x.ReceiptId equals r.ReceiptId
+                        where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
+                              && r.Status == "ISSUED" && r.ReceiptAt >= c.Start && r.ReceiptAt < c.End
+                        select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = r.ReceiptNo };
+        var invoiced = from x in db.Charges.AsNoTracking()
+                       join i in db.Invoices on x.InvoiceId equals i.InvoiceId
+                       where x.BranchId == c.Branch.BranchId && x.BookingContainerId != null && x.Status != "CANCELLED"
+                             && i.Status == "ISSUED" && i.IssuedAt >= c.Start && i.IssuedAt < c.End
+                       select new { Box = x.BookingContainerId!.Value, x.BookingId, x.ChargeCode, x.MovementCode, x.Amount, BilledNo = i.InvoiceNo };
+        var billed = (await receipted.ToListAsync(ct)).Concat(await invoiced.ToListAsync(ct)).ToList();
+
+        var headers = await tos.HeadersAsync(billed.Select(b => b.BookingId).OfType<Guid>().Distinct().ToList(), ct);
+        bool Wanted(Guid? bookingId) => bookingId is { } id && headers.TryGetValue(id, out var h) && h.BookingTypeCode == "IMPORT"
+            && (lineCode is null || string.Equals(h.LineCode, lineCode, StringComparison.OrdinalIgnoreCase))
+            && (vesselCode is null || string.Equals(h.VesselCode, vesselCode, StringComparison.OrdinalIgnoreCase))
+            && (voyage is null || string.Equals(h.Voyage, voyage, StringComparison.OrdinalIgnoreCase))
+            && (carrierRef is null || string.Equals(h.CarrierRef, carrierRef, StringComparison.OrdinalIgnoreCase));
+        billed = billed.Where(b => Wanted(b.BookingId)).ToList();
+
+        var boxes = await booked.BoxesByIdAsync(billed.Select(b => b.Box).Distinct().ToList(), ct);
+        var tenant = await TenantMapAsync(db, StorageActivityKey, ct);
+        string? Column(string code) => (tenant.GetValueOrDefault(code) ?? StorageActivityCodes.GetValueOrDefault(code)) switch
+        {
+            "EMPTY_STORAGE" or "FULL_STORAGE" => "STORAGE",
+            "LOLO" or "LOLO_EMPTY" or "LOLO_LADEN" => "LOLO",
+            _ => null,
+        };
+        var customers = headers.Values.ToDictionary(h => h.BookingId, h => h.CustomerCode);
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var lines = billed
+            .Where(b => boxes.ContainsKey(b.Box))
+            .GroupBy(b => b.Box)
+            .Select(g =>
+            {
+                var box = boxes[g.Key];
+                var h = headers[g.First().BookingId!.Value];
+                return (Box: box, Order: h.OrderNo, h.CarrierRef, First: g.Min(x => x.BilledNo)!, Customer: customers.GetValueOrDefault(box.BookingId),
+                    Storage: g.Where(x => Column(x.ChargeCode) == "STORAGE").Sum(x => x.Amount),
+                    Lolo: g.Where(x => Column(x.ChargeCode) == "LOLO").Sum(x => x.Amount));
+            })
+            .OrderBy(x => x.Order, StringComparer.Ordinal).ThenBy(x => x.CarrierRef, StringComparer.Ordinal).ThenBy(x => x.First, StringComparer.Ordinal)
+            .ToList();
+
+        var rows = lines.Select(x => new TabularRow([
+            x.Box.ContainerNo, x.Box.EquipmentTypeCode, Day(x.Box.EmptyIn), Day(x.Box.EmptyOut), Day(x.Box.LadenIn), Day(x.Box.LadenOut),
+            null, x.Storage, x.Lolo, null, null, null, x.Box.OrderTypeCode, x.Customer])).ToList();
+
+        var first = lines.FirstOrDefault().Box;
+        var vesselName = first?.VesselCode is { } code
+            ? (await master.VesselsAsync([code], ct)).GetValueOrDefault(code)?.VesselName ?? code
+            : "";
+
+        return new TabularReport(
+            FileName: $"ContainerStorageActivityByVslVoy_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("CONTAINER STORAGE ACTIVITY", 10, Bold: true),
+                new($"VESSEL/VOY: {vesselName} {first?.Voyage}"),
+            ],
+            HeadingRight:
+            [
+                new($"Printed By: {c.PrintedBy}"),
+                new($"Printed On: {c.PrintedOn.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}"),
+            ],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.6), new(1.4, null, CellAlign.Center), new(1.6, "dd/MM/yy", CellAlign.Center), new(1.6, "dd/MM/yy", CellAlign.Center),
+                new(1.6, "dd/MM/yy", CellAlign.Center), new(1.6, "dd/MM/yy", CellAlign.Center), new(1.2),
+                new(2.2, "0.00;(0.00);\"-\"", CellAlign.Right), new(2.0, "0.00;(0.00)", CellAlign.Right),
+                new(1.6), new(2.2), new(1.2), new(2.4), new(2.6),
+            ],
+            HeaderRows:
+            [
+                [new("CONT NO."), new("SIZE"), new("EMPTY\nIN"), new("EMPTY\nOUT"), new("LADEN\nIN"), new("LADEN\nOUT"), new("DAY"),
+                 new("STORAGE\nAMOUNT"), new("LO/LO"), new("ค่าผ่าน\nประตู"), new("HAULAGE\nCD/ECT/PAT"), new("FAS"), new("STATUS"), new("SHIPPER")],
+            ],
+            Rows: rows);
+    }
 }

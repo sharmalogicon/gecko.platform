@@ -9,6 +9,9 @@ public interface ITosBookedBoxes
 {
     /// <summary>Boxes with a container number on bookings at <paramref name="branchId"/> (not cancelled), in [<paramref name="from"/>, <paramref name="to"/>).</summary>
     Task<IReadOnlyList<TosBookedBox>> BoxesAsync(Guid branchId, DateTimeOffset from, DateTimeOffset to, TosBookedBoxFilter filter, CancellationToken ct);
+
+    /// <summary>The same facts for given booked boxes (by booking_container_id), whatever their dates; unknown ids are absent.</summary>
+    Task<IReadOnlyDictionary<Guid, TosBookedBox>> BoxesByIdAsync(IReadOnlyCollection<Guid> bookingContainerIds, CancellationToken ct);
 }
 
 /// <param name="LineCode">Vector's AgentCode: the booking's shipping line.</param>

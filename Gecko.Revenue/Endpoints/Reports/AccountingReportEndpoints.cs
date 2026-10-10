@@ -44,6 +44,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/hyundai-lift-off-summary.{pdf|xlsx}   TMS.Accounting.HyundaiLiftOffSummary (also the "HYUNDAI Refund" menu)
 ///   GET /reports/accounting/hyundai-lift-on-summary.{pdf|xlsx}   TMS.Accounting.HyundaiLiftOnSummary
 ///   GET /reports/accounting/nyk.{pdf|xlsx}   TMS.Accounting.NYKReport
+///   GET /reports/accounting/hyundai-refund.{pdf|xlsx}   TMS.Accounting.HyundaiRefund (the RDL the desktop never showed)
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -130,6 +131,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/nyk.{format}", NykAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("NYK Report (Vector NYKReport): a line's charges in NYK's vendor-invoice upload format, as PDF or Excel")
             .WithDescription("The line's boxes moved in dateFrom..dateTo and their charges. agentCode = the shipping line (default NYK); vesselCode; voyageNo; bookingType; movementCode; bookingBlNo; orderType.");
+        reports.MapGet("/hyundai-refund.{format}", HyundaiRefundAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("HYUNDAI Refund (Vector HyundaiRefund.rdl): import boxes billed, by invoice, at the RDL's fixed refund rates, as PDF or Excel")
+            .WithDescription("IMPORT boxes whose vessel ETA is in dateFrom..dateTo, by the receipt/invoice that billed them. agentCode = the shipping line (the RDL's HYUNDAI); blank = every line.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -549,5 +553,17 @@ internal static class AccountingReportEndpoints
         var filter = new LineReports.NykFilter(Clean(agentCode) ?? "NYK", Clean(vesselCode), Clean(voyageNo), type, Clean(movementCode),
             Clean(bookingBlNo), Clean(orderType));
         return File(await LineReports.NykAsync(db, gate, booked, tos, context!, filter, ct), format);
+    }
+
+    private static async Task<IResult> HyundaiRefundAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var line = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
+        return File(await LiftChargeReports.HyundaiRefundAsync(db, tos, booked, master, context!, line, ct), format);
     }
 }

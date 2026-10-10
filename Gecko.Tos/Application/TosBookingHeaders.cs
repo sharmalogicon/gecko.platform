@@ -21,7 +21,7 @@ internal sealed class TosBookingHeaders(TosDbContext db) : ITosBookingHeaders
             select new
             {
                 b.BookingId, b.OrderNo, b.CarrierRef, b.SubBlNo, b.CreatedAt, b.Status, b.BookingTypeCode, b.OrderTypeCode,
-                b.LinePartyCode, b.AgentPartyCode, b.CustomerPartyCode, b.ForwarderPartyCode,
+                b.LinePartyCode, b.AgentPartyCode, b.CustomerPartyCode, b.ForwarderPartyCode, b.TotalVolumeCbm,
                 VesselCode = c == null ? null : c.VesselCode, CallRef = c == null ? null : c.CallRef,
                 TerminalCode = c == null ? null : c.TerminalCode,
                 Voyage = l == null ? null : (l.VoyageOut ?? l.VoyageIn),
@@ -40,7 +40,7 @@ internal sealed class TosBookingHeaders(TosDbContext db) : ITosBookingHeaders
             var completed = own.GroupBy(s => s.BookingContainerId).Where(g => g.All(s => s.Done)).Select(g => g.Key).ToList();
             return new TosBookingHeader(h.BookingId, h.OrderNo, h.CarrierRef, h.SubBlNo, h.CreatedAt, h.Status,
                 h.BookingTypeCode, h.OrderTypeCode, h.LinePartyCode, h.AgentPartyCode, h.CustomerPartyCode, h.ForwarderPartyCode,
-                h.VesselCode, h.CallRef, h.Voyage, h.TerminalCode, own.Count, own.Count(s => s.Done), completed);
+                h.VesselCode, h.CallRef, h.Voyage, h.TerminalCode, own.Count, own.Count(s => s.Done), completed, h.TotalVolumeCbm);
         });
     }
 

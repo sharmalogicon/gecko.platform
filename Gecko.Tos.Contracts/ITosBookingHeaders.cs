@@ -25,8 +25,9 @@ public interface ITosBookingHeaders
 /// <param name="StepsTotal">Every planned step of every box still on the booking (cancelled ones not counted).</param>
 /// <param name="StepsDone">Of those, the ones a gate move completed (DONE) or overtook (SKIPPED).</param>
 /// <param name="CompletedBoxes">The boxes with no step left to do.</param>
+/// <param name="TotalVolumeCbm">The booking's cargo volume in m³, when declared.</param>
 public sealed record TosBookingHeader(
     Guid BookingId, string OrderNo, string? CarrierRef, string? SubBlNo, DateTimeOffset BookedAt, string Status,
     string BookingTypeCode, string OrderTypeCode, string LineCode, string? AgentCode, string? CustomerCode, string? ForwarderCode,
     string? VesselCode, string? CallRef, string? Voyage, string? TerminalCode,
-    int StepsTotal, int StepsDone, IReadOnlyList<Guid> CompletedBoxes);
+    int StepsTotal, int StepsDone, IReadOnlyList<Guid> CompletedBoxes, decimal? TotalVolumeCbm = null);

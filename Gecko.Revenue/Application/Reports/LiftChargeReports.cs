@@ -3,6 +3,7 @@ using Gecko.Data.Documents;
 using Gecko.MasterData.Contracts;
 using Gecko.Revenue.Infrastructure.Persistence;
 using Gecko.Tos.Contracts;
+using Microsoft.EntityFrameworkCore;
 
 namespace Gecko.Revenue.Application.Reports;
 
@@ -253,6 +254,124 @@ internal static class LiftChargeReports
                  new("FCL (PER CONT.) ลากตู้", ColSpan: 3), new("DD (PER CONT.) ลากตู้", ColSpan: 3), new("REFUND 70%")],
                 [new(""), new(""), new(""), new(""), new(""), new("NO."), new("DATE"), new("1,550.-/20'"), new("2,650.-/40'"), new("3,100.-/45'"),
                  new("1,850.-/20'"), new("3,150.-/40'"), new("3,700.-/45'"), new("TOTAL")],
+            ],
+            Rows: rows);
+    }
+
+    /// <summary>Vector's order type → shipment type (Master.OrderType.ShipmentType in TMSKORAKIT): FCL, LCL-CYD, LCL-CFS.</summary>
+    private static readonly IReadOnlyDictionary<string, string> ShipmentTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["IMP CY/CY"] = "FCL", ["IMP CYD"] = "LCL-CYD", ["IMP CFS"] = "LCL-CFS",
+    };
+
+    /// <summary>The RDL's fixed refund bases: baht per box by size for FCL and LCL-CYD, baht per m³ for LCL-CFS.</summary>
+    private static readonly IReadOnlyDictionary<string, decimal> FclRates = new Dictionary<string, decimal> { ["20"] = 1550m, ["40"] = 2650m, ["45"] = 3100m };
+    private static readonly IReadOnlyDictionary<string, decimal> LclRates = new Dictionary<string, decimal> { ["20"] = 1850m, ["40"] = 3150m, ["45"] = 3700m };
+    private const decimal CfsPerCbm = 64m;
+    private const decimal BoxRefund = 0.8m;
+
+    /// <summary>
+    /// TMS.Accounting.HyundaiRefund (embedded query; the desktop's "HYUNDAI Refund" menu prints the Lift-Off Summary instead,
+    /// so this RDL was never shown) — &lt;&lt;REFUND&gt;&gt;: a row per receipt or invoice billing the agent's IMPORT boxes whose
+    /// vessel ETA is in the window — vessel &amp; voyage, ETA, boxes by size, then by shipment type FCL and LCL (CYD) at the
+    /// RDL's fixed baht per box, CFS at 64 baht per m³, TOTAL and REFUND; then the grand total.
+    /// Owner 2026-10-10 defaults: boxes counted once (the RDL counted invoice lines); M3 is the booking's cargo volume (the
+    /// RDL took weight ÷ 1000); REFUND is 80 % of FCL + LCL and 100 % of CFS, as the headers say (the RDL added CFS twice);
+    /// voided receipts, cancelled invoices and charges out; shipment type by TMSKORAKIT's own order-type list.
+    /// </summary>
+    public static async Task<TabularReport> HyundaiRefundAsync(
+        RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        string? lineCode, CancellationToken ct)
+    {
+        var boxes = (await booked.BoxesAsync(c.Branch.BranchId, c.Start, c.End, new TosBookedBoxFilter(LineCode: lineCode, BookingTypeCode: "IMPORT"), ct))
+            .Where(b => b.Eta is not null)
+            .ToDictionary(b => b.BookingContainerId);
+        var headers = await tos.HeadersAsync(boxes.Values.Select(b => b.BookingId).Distinct().ToList(), ct);
+        var typeCodes = boxes.Values.Select(b => b.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+
+        // The documents that billed each box: an issued receipt (cash) or an issued invoice (credit).
+        var billed = new List<(Guid Box, string No)>();
+        foreach (var slice in boxes.Keys.Chunk(2000))
+        {
+            var receipted = from x in db.Charges.AsNoTracking()
+                            join r in db.Receipts on x.ReceiptId equals r.ReceiptId
+                            where x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED" && r.Status == "ISSUED"
+                            select new { Box = x.BookingContainerId!.Value, No = r.ReceiptNo };
+            var invoiced = from x in db.Charges.AsNoTracking()
+                           join i in db.Invoices on x.InvoiceId equals i.InvoiceId
+                           where x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED" && i.Status == "ISSUED"
+                           select new { Box = x.BookingContainerId!.Value, No = i.InvoiceNo };
+            billed.AddRange((await receipted.Distinct().ToListAsync(ct)).Concat(await invoiced.Distinct().ToListAsync(ct)).Select(x => (x.Box, x.No)));
+        }
+
+        decimal[] Figures(IReadOnlyCollection<TosBookedBox> set)
+        {
+            string? Size(TosBookedBox b) => OperationChargeReports.SizeType(types, b.EquipmentTypeCode).Size;
+            string? Shipment(TosBookedBox b) => ShipmentTypes.GetValueOrDefault(b.OrderTypeCode);
+            decimal Count(string? size, string? shipment) => set.Count(b => (size is null || Size(b) == size) && (shipment is null || Shipment(b) == shipment));
+            var fcl = FclRates.Keys.Select(size => (Count: Count(size, "FCL"), Amount: Count(size, "FCL") * FclRates[size])).ToList();
+            var lcl = LclRates.Keys.Select(size => (Count: Count(size, "LCL-CYD"), Amount: Count(size, "LCL-CYD") * LclRates[size])).ToList();
+            var cbm = set.Where(b => Shipment(b) == "LCL-CFS").Select(b => b.BookingId).Distinct()
+                .Sum(id => headers.GetValueOrDefault(id)?.TotalVolumeCbm ?? 0m);
+            var boxesAmount = fcl.Sum(x => x.Amount) + lcl.Sum(x => x.Amount);
+            var cfs = cbm * CfsPerCbm;
+            return
+            [
+                Count("20", null), Count("40", null), Count("45", null),
+                .. fcl.SelectMany(x => new[] { x.Count, x.Amount }), .. lcl.SelectMany(x => new[] { x.Count, x.Amount }),
+                Count("20", "LCL-CFS"), Count("40", "LCL-CFS"), Count("45", "LCL-CFS"), cbm, cfs,
+                boxesAmount + cfs, boxesAmount * BoxRefund + cfs,
+            ];
+        }
+
+        var invoices = billed
+            .Where(x => headers.TryGetValue(boxes[x.Box].BookingId, out var h) && h.Status != "CANCELLED")
+            .GroupBy(x => x.No).OrderBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => (No: g.Key, Boxes: g.Select(x => boxes[x.Box]).Distinct().ToList()))
+            .ToList();
+        var rows = invoices.Select(x =>
+        {
+            var first = x.Boxes[0];
+            return new TabularRow([x.No, $"{first.VesselCode} {first.Voyage}".Trim(), c.Branch.LocalDate(first.Eta!.Value),
+                .. Figures(x.Boxes).Select(v => (object?)v)]);
+        }).ToList();
+        var totals = invoices.Select(x => Figures(x.Boxes)).ToList();
+        rows.Add(new TabularRow([null, null, null, .. Enumerable.Range(0, 22).Select(i => (object?)totals.Sum(t => t[i]))], RowKind.Total));
+
+        string D(DateOnly d) => d.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+        const string Whole = "#,0;(#,0);\"\"";
+        const string Bath = "#,0.00;(#,0.00)";
+        TabularColumn N() => new(1.0, Whole, CellAlign.Center);
+        TabularColumn B() => new(1.5, Whole, CellAlign.Center);
+        return new TabularReport(
+            FileName: $"HyundaiRefund_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2.0,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("<<REFUND>>", 10, Bold: true),
+                new($"ETA DATE FROM: {D(c.From)}ETA DATE TO:{D(c.To)}"),
+                new($"AGENT:{lineCode}"),
+            ],
+            HeadingRight: [new($"Print Date: {c.PrintedOn.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.6, null, CellAlign.Center), new(3.0, null, CellAlign.Center), new(2.0, "dd/MM/yyyy", CellAlign.Center), N(), N(), N(),
+                N(), B(), N(), B(), N(), B(), N(), B(), N(), B(), N(), B(), N(), N(), N(),
+                new(1.6, Bath, CellAlign.Center), new(1.8, Bath, CellAlign.Center), new(2.2, Bath, CellAlign.Center), new(2.2, Bath, CellAlign.Center),
+            ],
+            HeaderRows:
+            [
+                [new("", ColSpan: 6), new("FCL (80%)", ColSpan: 6), new("LCL (80%)", ColSpan: 6), new("CFS = 64/M3 (100%)", ColSpan: 5),
+                 new("TOTAL"), new("REFUND")],
+                [new("INV.No."), new("VESSEL&VOY"), new("DATE"), new("20'"), new("40'"), new("45'"),
+                 new("20'"), new("B.1550"), new("40'"), new("B.2650"), new("45'"), new("B.3100"),
+                 new("20'"), new("B.1850"), new("40'"), new("B.3150"), new("45'"), new("B.3700"),
+                 new("20'"), new("40'"), new("45'"), new("M3"), new("Amt"), new("THB"), new("THB")],
             ],
             Rows: rows);
     }

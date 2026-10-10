@@ -37,6 +37,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/electricity-standard-3.{pdf|xlsx}   TMS.Accounting.ElectricStandard3
 ///   GET /reports/accounting/reefer-service-charge.{pdf|xlsx}   TMS.Accounting.ReeferServiceCharge
 ///   GET /reports/accounting/gate-oocl.{pdf|xlsx}   TMS.Accounting.GateOOCL
+///   GET /reports/accounting/paper.{pdf|xlsx}   TMS.Accounting.Paper
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -102,6 +103,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/gate-oocl.{format}", GateOoclAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Gate OOCL (Vector GateOOCL): an agent's gate charge list, a line per container, as PDF or Excel")
             .WithDescription("Containers moved through the gate in dateFrom..dateTo (the RDL's FromETD/ToETD are gate dates). agentCode = the shipping line (the RDL's default OOCL); blank = every line.");
+        reports.MapGet("/paper.{format}", PaperAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Paper (Vector Paper): paper flooring and lashing of export empties released, as PDF or Excel")
+            .WithDescription("EXPORT boxes gated out empty in dateFrom..dateTo (the RDL's FromMTD/EndMTD). agentCode = the gate move's line; vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -421,5 +425,19 @@ internal static class AccountingReportEndpoints
 
         var line = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
         return File(await OperationChargeReports.GateOoclAsync(db, gate, master, context!, line, ct), format);
+    }
+
+    private static async Task<IResult> PaperAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        return File(await OperationChargeReports.PaperAsync(db, gate, booked, master, context!,
+            Clean(agentCode), Clean(vesselCode), Clean(voyageNo), ct), format);
     }
 }

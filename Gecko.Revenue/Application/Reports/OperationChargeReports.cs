@@ -696,4 +696,88 @@ internal static class OperationChargeReports
                     summary),
             ]);
     }
+
+    public const string PaperKey = "PAPER";
+
+    /// <summary>TMS.Accounting.Paper's codes: SL006-CR lashing net, SP001-CR paper flooring, SL007-CR lashing wood.</summary>
+    public static readonly IReadOnlyDictionary<string, string> PaperCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SL006-CR"] = "L_NET", ["SP001-CR"] = "PAPER", ["SL007-CR"] = "L_WOOD",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.Paper (Report.usp_Accounting_Paper) — รายงานค่าปูกระดาษและค่ารัดเชือก: a line per container released
+    /// empty on an EXPORT booking in the window, its size, vessel and voyage, its lashing-net, paper-flooring and
+    /// lashing-wood charges and their sum (any movement of the box on that booking, as the RDL); then the grand total.
+    /// Owner 2026-10-10 defaults: the agent is the gate move's line, as Vector's movement AgentCode; amounts are the
+    /// charges' (rate × quantity — the RDL summed the unit price); cancelled charges left out.
+    /// </summary>
+    public static async Task<TabularReport> PaperAsync(
+        RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        string? lineCode, string? vesselCode, string? voyage, CancellationToken ct)
+    {
+        var moves = (await gate.MovesAsync(c.Branch.BranchId, c.Start, c.End, new TosGateMoveFilter(LineCode: lineCode, BookingTypeCode: "EXPORT"), ct))
+            .Where(m => m.Direction == "OUT" && m.FullEmpty == "EMPTY")
+            .ToList();
+        var boxes = await booked.BoxesByIdAsync(moves.Select(m => m.BookingContainerId).Distinct().ToList(), ct);
+        moves = moves.Where(m => boxes.TryGetValue(m.BookingContainerId, out var b)
+                                 && (vesselCode is null || string.Equals(b.VesselCode, vesselCode, StringComparison.OrdinalIgnoreCase))
+                                 && (voyage is null || string.Equals(b.Voyage, voyage, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        var tenant = await TenantMapAsync(db, PaperKey, ct);
+        string? Column(string code) => tenant.GetValueOrDefault(code) ?? PaperCodes.GetValueOrDefault(code);
+        var ids = moves.Select(m => m.BookingContainerId).Distinct().ToList();
+        var charges = new List<(Guid Box, string? Column, decimal Amount)>();
+        foreach (var slice in ids.Chunk(2000))
+            charges.AddRange((await db.Charges.AsNoTracking()
+                    .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.Amount })
+                    .ToListAsync(ct))
+                .Select(x => (x.Box, Column(x.ChargeCode), x.Amount)));
+        var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
+        var vesselCodes = boxes.Values.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
+        var vessels = vesselCodes.Count == 0 ? new Dictionary<string, VesselRef>() : await master.VesselsAsync(vesselCodes, ct);
+
+        // One line per container, its boxes' charges summed; only containers with a paper or lashing charge, as the RDL.
+        var lines = moves
+            .GroupBy(m => m.ContainerNo)
+            .Select(g =>
+            {
+                var box = boxes[g.First().BookingContainerId];
+                var mine = g.Select(m => m.BookingContainerId).Distinct().SelectMany(b => byBox[b]).ToList();
+                decimal Sum(string column) => mine.Where(x => x.Column == column).Sum(x => x.Amount);
+                return (Box: box, Any: mine.Count > 0, Net: Sum("L_NET"), Paper: Sum("PAPER"), Wood: Sum("L_WOOD"),
+                    Vessel: box.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName ?? v : null);
+            })
+            .Where(x => x.Any)
+            .OrderBy(x => x.Box.ContainerNo, StringComparer.Ordinal)
+            .ToList();
+
+        var rows = lines.Select((x, n) => new TabularRow([
+            n + 1, x.Box.ContainerNo, x.Box.EquipmentTypeCode, x.Vessel, x.Box.Voyage, x.Net, x.Paper, x.Wood, x.Net + x.Paper + x.Wood])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null, lines.Sum(x => x.Net), lines.Sum(x => x.Paper), lines.Sum(x => x.Wood),
+            lines.Sum(x => x.Net + x.Paper + x.Wood)], RowKind.Total));
+
+        var month = c.From.ToString("MMMM", CultureInfo.InvariantCulture);
+        return new TabularReport(
+            FileName: $"Paper_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Portrait,
+            MarginCm: 1.0,
+            Heading: [new(c.BranchName, 10, Bold: true), new($"รายงานค่าปูกระดาษและค่ารัดเชือกประจำ เดือน {month} {c.From.Year}", 10, Bold: true)],
+            HeadingRight: [new($"Print Date: {c.PrintedOn.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.2, null, CellAlign.Center), new(2.8), new(1.4, null, CellAlign.Center), new(3.6), new(1.8),
+                new(2.0, Money, CellAlign.Right), new(2.0, Money, CellAlign.Right), new(2.0, Money, CellAlign.Right), new(2.2, Money, CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new("ITEM"), new("Container No"), new("Size"), new("Vessel Name"), new("VOY"), new("L.NET"), new("PP."), new("L.WOOD"), new("AMOUNT")],
+            ],
+            Rows: rows);
+    }
 }

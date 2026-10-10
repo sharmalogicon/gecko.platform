@@ -177,4 +177,83 @@ internal static class LiftChargeReports
             ],
             Rows: rows);
     }
+
+    public const string LiftOnRefundKey = "LIFT_ON_REFUND";
+
+    /// <summary>TMS.Accounting.LiftOnChargeRefundSummary's code: SL004-CA, the cash LIFT ON CHARGE.</summary>
+    public static readonly IReadOnlyDictionary<string, string> LiftOnRefundCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SL004-CA"] = "LIFT_ON",
+    };
+
+    private static readonly IReadOnlySet<string> RefundOrderTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "IMP CY/CY", "IMP CYD" };
+
+    /// <summary>The RDL's refund to T.S LINE.</summary>
+    private const decimal LiftOnRefund = 0.7m;
+
+    /// <summary>
+    /// TMS.Accounting.LiftOnChargeRefundSummary (Report.usp_Accounting_LiftOnChargeRefundSummary) — SUMMARY OF LIFT ON
+    /// CHARGE REFUND TO T.S LINE CO.,LTD.: a row per import lift-on line paid in the window — vessel, voyage, ETA, B/L,
+    /// receipt no and date, the box counted in its band (FCL = IMP CY/CY, DD = IMP CYD, by 20'/40'/45') and 70 % of its
+    /// amount refunded; then the total row. The addressee, ATTN line, band captions and 70 % are the RDL's.
+    /// Owner 2026-10-10 defaults: every band refunds (the RDL's typo left CYD 20'/40' out), only lift-on lines print (the
+    /// RDL printed every line of the invoice as dashes), voided receipts are out, the refund is 70 % of the line's amount.
+    /// </summary>
+    public static async Task<TabularReport> LiftOnRefundAsync(
+        RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, IMasterDataReferences master, AccountingReportContext c,
+        Filter f, CancellationToken ct)
+    {
+        var lines = (await LinesAsync(db, tos, master, c, LiftOnRefundKey, LiftOnRefundCodes, "LIFT_ON", RefundOrderTypes,
+                f with { BookingType = "IMPORT" }, ct))
+            .OrderBy(x => x.Booking.OrderNo, StringComparer.Ordinal).ThenBy(x => x.Booking.CarrierRef, StringComparer.Ordinal)
+            .ThenBy(x => x.Billed.BilledNo, StringComparer.Ordinal)
+            .ToList();
+        var boxes = await booked.BoxesByIdAsync(lines.Select(x => x.Billed.Box).Distinct().ToList(), ct);
+
+        string[] sizes = ["20", "40", "45"];
+        object?[] Bands(Line x) =>
+        [
+            .. sizes.Select(size => (object?)(x.Booking.OrderTypeCode == "IMP CY/CY" && x.Size == size ? 1 : 0)),
+            .. sizes.Select(size => (object?)(x.Booking.OrderTypeCode == "IMP CYD" && x.Size == size ? 1 : 0)),
+        ];
+        bool Banded(Line x) => x.Size is "20" or "40" or "45";
+        var rows = lines.Select((x, n) => new TabularRow([
+            n + 1, x.Booking.VesselCode, x.Booking.Voyage,
+            boxes.GetValueOrDefault(x.Billed.Box)?.Eta is { } eta ? c.Branch.LocalDate(eta) : null,
+            x.Booking.CarrierRef, x.Billed.BilledNo, c.Branch.LocalDate(x.Billed.BilledAt), .. Bands(x),
+            Banded(x) ? x.Billed.Amount * LiftOnRefund : 0m])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null, null, null,
+            .. Enumerable.Range(0, 6).Select(i => (object?)lines.Sum(x => (int)Bands(x)[i]!)),
+            lines.Where(Banded).Sum(x => x.Billed.Amount) * LiftOnRefund], RowKind.Total));
+
+        const string Count = "0;(0);\"-\"";
+        TabularColumn N() => new(1.7, Count, CellAlign.Center);
+        return new TabularReport(
+            FileName: $"LiftOnChargeRefundSummary_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("ATTN :\u00a0 K .\u00a0 SUNAN\u00a0 \u00a0 \u00a0 JINUNARUG"),
+                new("SUMMARY  OF  LIFT  ON  CHARGE  REFUND  TO  T.S LINE  CO.,LTD.", 9, Bold: true),
+            ],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.0, null, CellAlign.Center), new(2.0), new(1.6), new(1.6, "dd/MM/yy", CellAlign.Center), new(3.0), new(2.6),
+                new(1.6, "dd/MM/yy", CellAlign.Center), N(), N(), N(), N(), N(), N(), new(2.4, Money, CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new("ITEM"), new("VESSEL"), new("VOYAGE"), new("ETA"), new("B/L NO."), new("RECEIPT", ColSpan: 2),
+                 new("FCL (PER CONT.) ลากตู้", ColSpan: 3), new("DD (PER CONT.) ลากตู้", ColSpan: 3), new("REFUND 70%")],
+                [new(""), new(""), new(""), new(""), new(""), new("NO."), new("DATE"), new("1,550.-/20'"), new("2,650.-/40'"), new("3,100.-/45'"),
+                 new("1,850.-/20'"), new("3,150.-/40'"), new("3,700.-/45'"), new("TOTAL")],
+            ],
+            Rows: rows);
+    }
 }

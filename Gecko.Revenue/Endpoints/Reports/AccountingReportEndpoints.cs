@@ -40,6 +40,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/paper.{pdf|xlsx}   TMS.Accounting.Paper
 ///   GET /reports/accounting/inbound-sct.{pdf|xlsx}   TMS.Accounting.InboundSCT
 ///   GET /reports/accounting/inbound-sct1.{pdf|xlsx}   TMS.Accounting.InboundSCT1
+///   GET /reports/accounting/lift-on-refund-summary.{pdf|xlsx}   TMS.Accounting.LiftOnChargeRefundSummary
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -114,6 +115,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/inbound-sct1.{format}", InboundSct1Async).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("InBound SCT1 (Vector InboundSCT1): รายงานค่าภาระผ่านท่า, export lift-off for cargo with the 90% refund, as PDF or Excel")
             .WithDescription("Lift-off for cargo billed in dateFrom..dateTo on EXP CY/CY and EXP CY/CY-IN bookings. agentCode; customerCode = the payer; bookingBlNo; vesselCode; voyageNo; bookingType.");
+        reports.MapGet("/lift-on-refund-summary.{format}", LiftOnRefundAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Lift-On Refund Summary (Vector LiftOnChargeRefundSummary): import lift-on refunded 70% to the line, as PDF or Excel")
+            .WithDescription("Import lift-on (SL004-CA, or the tenant's codes) billed in dateFrom..dateTo on IMP CY/CY and IMP CYD bookings. agentCode = the shipping line; customerCode = the payer; bookingBlNo; vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -483,4 +487,13 @@ internal static class AccountingReportEndpoints
         var filter = new LiftChargeReports.Filter(Clean(agentCode), Clean(customerCode), Clean(bookingBlNo), Clean(vesselCode), Clean(voyageNo), type);
         return File(await build(db, tos, master, context!, filter, ct), format);
     }
+
+    private static Task<IResult> LiftOnRefundAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, ITosBookedBoxes booked, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? customerCode = null,
+        string? bookingBlNo = null, string? vesselCode = null, string? voyageNo = null) =>
+        LiftListAsync(format, db, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            agentCode, customerCode, bookingBlNo, vesselCode, voyageNo, null,
+            (d, t, m, c, f, token) => LiftChargeReports.LiftOnRefundAsync(d, t, booked, m, c, f, token));
 }

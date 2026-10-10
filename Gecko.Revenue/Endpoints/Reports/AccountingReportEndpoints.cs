@@ -46,6 +46,9 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/nyk.{pdf|xlsx}   TMS.Accounting.NYKReport
 ///   GET /reports/accounting/hyundai-refund.{pdf|xlsx}   TMS.Accounting.HyundaiRefund (the RDL the desktop never showed)
 ///   GET /reports/accounting/apl-container-storage-activity.{pdf|xlsx}   TMS.Accounting.APLContainerStorageActivity (never launched)
+///   GET /reports/accounting/pti-standard.{pdf|xlsx}   TMS.Accounting.StandardPTI
+///   GET /reports/accounting/unstuffing-activity.{pdf|xlsx}   TMS.Accounting.UnstuffingActivity (no lines until unstuffing is recorded)
+///   GET /reports/accounting/inbound-container.{pdf|xlsx}   TMS.Accounting.InBoundContainer "UNSTUFFING" (likewise)
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -138,6 +141,15 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/apl-container-storage-activity.{format}", AplStorageActivityAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("APL Container Storage Activity (Vector APLContainerStorageActivity): the export cut of Container Storage Activity, as PDF or Excel")
             .WithDescription("EXPORT boxes whose vessel ETA is in dateFrom..dateTo. agentCode = the shipping line; vesselCode; voyageNo.");
+        reports.MapGet("/pti-standard.{format}", PtiStandardAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("PTI - STD (Vector StandardPTI): empties gated out with storage, lift-on, PTI and pre-cool, as PDF or Excel")
+            .WithDescription("Empty gate-outs in dateFrom..dateTo (the RDL's FromMTD/EndMTD). agentCode = the shipping line; size (\"40\"); type (\"RH\"); vesselCode; voyageNo.");
+        reports.MapGet("/unstuffing-activity.{format}", UnstuffingActivityAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("UnStuffing Activity (Vector UnstuffingActivity), as PDF or Excel")
+            .WithDescription("Import CFS/CYD boxes unstuffed in dateFrom..dateTo. Gecko records no unstuffing yet, so it prints no lines. agentCode; vesselCode; voyageNo.");
+        reports.MapGet("/inbound-container.{format}", InboundContainerAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("UNSTUFFING / Container Inbound Report (Vector InBoundContainer), as PDF or Excel")
+            .WithDescription("Import CFS/CYD boxes unstuffed in dateFrom..dateTo with LO/LO, unstuffing and FSC. Gecko records no unstuffing yet, so it prints no lines. agentCode; vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -583,5 +595,40 @@ internal static class AccountingReportEndpoints
         static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim().ToUpperInvariant();
         var filter = new TosBookedBoxFilter(Clean(agentCode), Clean(vesselCode), Clean(voyageNo));
         return File(await OperationChargeReports.AplStorageActivityAsync(db, booked, master, context!, filter, ct), format);
+    }
+
+    private static async Task<IResult> PtiStandardAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? size = null,
+        string? type = null, string? vesselCode = null, string? voyageNo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        return File(await ReeferReports.PtiStandardAsync(db, gate, booked, tos, master, context!, Clean(agentCode), Clean(size), Clean(type),
+            Clean(vesselCode), Clean(voyageNo), ct), format);
+    }
+
+    private static async Task<IResult> UnstuffingActivityAsync(
+        string format, BranchCalendar calendar, IMasterDataReferences master, IUserDirectory users, ITenantContext caller,
+        ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        return refused ?? File(UnstuffingReports.Activity(context!), format);
+    }
+
+    private static async Task<IResult> InboundContainerAsync(
+        string format, BranchCalendar calendar, IMasterDataReferences master, IUserDirectory users, ITenantContext caller,
+        ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        return refused ?? File(UnstuffingReports.Inbound(context!, Clean(agentCode), Clean(vesselCode), Clean(voyageNo)), format);
     }
 }

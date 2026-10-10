@@ -562,4 +562,111 @@ internal static class ReeferReports
             ],
             Rows: rows);
     }
+
+    public const string PtiStandardKey = "PTI_STD";
+
+    /// <summary>TMS.Accounting.StandardPTI's codes: SC006-CR empty storage, SL001-CR lift-on, SE003-CR PTI, SE002-CR pre-cool.</summary>
+    public static readonly IReadOnlyDictionary<string, string> PtiStandardCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SC006-CR"] = "STORAGE", ["SL001-CR"] = "LIFT_ON", ["SE003-CR"] = "PTI", ["SE002-CR"] = "PRECOOL",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.StandardPTI (Report.usp_Accounting_StandardPTI) — "Container gate out :&lt;month year&gt;", Lift on / Storage
+    /// / Electric PTI &amp; P-cool: a line per box gated out empty in the window — order type, size, empty in/out, storage days
+    /// and amount, lift-on, the PTI dates (blank: no work orders, D8) and amount, pre-cool dates and amount, the total —
+    /// by equipment type (sorted by size), then the grand total.
+    /// Owner 2026-10-10 defaults: the box's own charges summed (the RDL showed the largest storage line but added them all
+    /// in TOTAL, and summed lift-on unit prices); PTI amount printed whatever the dates (the RDL dropped it without a work
+    /// order); the grand total is the sum of the printed lines; cancelled charges and bookings out; INT IN / INT OUT out.
+    /// </summary>
+    public static async Task<TabularReport> PtiStandardAsync(
+        RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, IMasterDataReferences master,
+        AccountingReportContext c, string? lineCode, string? size, string? type, string? vesselCode, string? voyage, CancellationToken ct)
+    {
+        var moves = (await gate.MovesAsync(c.Branch.BranchId, c.Start, c.End, new TosGateMoveFilter(LineCode: lineCode), ct))
+            .Where(m => m.Direction == "OUT" && m.FullEmpty == "EMPTY" && m.OrderTypeCode is not ("INT IN" or "INT OUT"))
+            .ToList();
+        var boxes = await booked.BoxesByIdAsync(moves.Select(m => m.BookingContainerId).Distinct().ToList(), ct);
+        var headers = await tos.HeadersAsync(boxes.Values.Select(b => b.BookingId).Distinct().ToList(), ct);
+        var typeCodes = boxes.Values.Select(b => b.EquipmentTypeCode).Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        bool Wanted(TosBookedBox b)
+        {
+            var (s, t) = OperationChargeReports.SizeType(types, b.EquipmentTypeCode);
+            return headers.TryGetValue(b.BookingId, out var h) && h.Status != "CANCELLED"
+                && (size is null || s == size) && (type is null || string.Equals(t, type, StringComparison.OrdinalIgnoreCase))
+                && (vesselCode is null || string.Equals(b.VesselCode, vesselCode, StringComparison.OrdinalIgnoreCase))
+                && (voyage is null || string.Equals(b.Voyage, voyage, StringComparison.OrdinalIgnoreCase));
+        }
+        var wanted = moves.Select(m => boxes.GetValueOrDefault(m.BookingContainerId)).OfType<TosBookedBox>().Distinct().Where(Wanted).ToList();
+
+        var tenant = await OperationChargeReports.TenantMapAsync(db, PtiStandardKey, ct);
+        string? Column(string code) => tenant.GetValueOrDefault(code) ?? PtiStandardCodes.GetValueOrDefault(code);
+        var charges = new List<(Guid Box, string? Column, decimal Days, decimal Amount)>();
+        foreach (var slice in wanted.Select(b => b.BookingContainerId).Chunk(2000))
+            charges.AddRange((await db.Charges.AsNoTracking()
+                    .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
+                    .ToListAsync(ct))
+                .Select(x => (x.Box, Column(x.ChargeCode), x.Days, x.Amount)));
+        var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var lines = wanted
+            .Select(b =>
+            {
+                var mine = byBox[b.BookingContainerId].ToList();
+                decimal Sum(string column) => mine.Where(x => x.Column == column).Sum(x => x.Amount);
+                var (s, t) = OperationChargeReports.SizeType(types, b.EquipmentTypeCode);
+                return (Box: b, Size: s ?? "", Type: t ?? "", Reefer: types.GetValueOrDefault(b.EquipmentTypeCode)?.IsReefer ?? false,
+                    Days: mine.Where(x => x.Column == "STORAGE").Sum(x => x.Days), Storage: Sum("STORAGE"), Lift: Sum("LIFT_ON"),
+                    Pti: Sum("PTI"), PreCool: Sum("PRECOOL"), HasPreCool: mine.Any(x => x.Column == "PRECOOL"));
+            })
+            .GroupBy(x => x.Type).OrderBy(g => g.Min(x => x.Size), StringComparer.Ordinal).ThenBy(g => g.Key, StringComparer.Ordinal)
+            .SelectMany(g => g.OrderBy(x => x.Box.ContainerNo, StringComparer.Ordinal))
+            .ToList();
+
+        var rows = lines.Select((x, n) => new TabularRow([
+            n + 1, x.Box.ContainerNo, x.Box.OrderTypeCode, $"{x.Size} {x.Type}".Trim(), Day(x.Box.EmptyIn), Day(x.Box.EmptyOut),
+            x.Days, x.Storage, x.Lift, null, null, null, null, x.Pti,
+            x.Reefer ? Day(x.Box.EmptyIn) : null, x.HasPreCool ? Day(x.Box.EmptyOut) : null, x.PreCool,
+            x.Storage + x.Lift + x.Pti + x.PreCool])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, null, null, lines.Sum(x => x.Days), lines.Sum(x => x.Storage), lines.Sum(x => x.Lift), null, null, null, null,
+            lines.Sum(x => x.Pti), null, null, lines.Sum(x => x.PreCool), lines.Sum(x => x.Storage + x.Lift + x.Pti + x.PreCool)], RowKind.Total));
+
+        const string Date = "dd/MM/yy";
+        TabularColumn Dt() => new(1.6, Date, CellAlign.Center);
+        TabularColumn M() => new(2.0, Money, CellAlign.Right);
+        var month = c.From.ToString("MMMM", CultureInfo.InvariantCulture);
+        return new TabularReport(
+            FileName: $"StandardPTI_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 0.5,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new($"Container gate out :{month} {c.From.Year}", 10, Bold: true),
+                new("Lift on / Storage / Electric PTI & P-cool", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {c.PrintedOn.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.0, null, CellAlign.Center), new(2.8), new(2.4), new(1.4, null, CellAlign.Center), Dt(), Dt(),
+                new(1.2, "0;(0)", CellAlign.Right), M(), new(2.0, "#,0.00;(#,0.00)", CellAlign.Right),
+                Dt(), Dt(), Dt(), Dt(), M(), Dt(), Dt(), M(), M(),
+            ],
+            HeaderRows:
+            [
+                [new(""), new(""), new(""), new(""), new("DATE "), new("DATE "), new("FREE Time  30 days", ColSpan: 2), new("LIFT ON"),
+                 new("ELECTRIC", ColSpan: 8), new("TOTAL")],
+                [new("ITEM"), new("CONTAINER NO."), new("Order Type"), new("Size"), new("IN"), new("OUT"), new("DAYS"), new("STORAGE"),
+                 new("CHARGE"), new("PTI", ColSpan: 5), new("PRE-COOL", ColSpan: 3), new("AMT")],
+            ],
+            Rows: rows,
+            PageLabel: "Page");
+    }
 }

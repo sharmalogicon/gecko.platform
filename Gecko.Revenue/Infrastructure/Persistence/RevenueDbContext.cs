@@ -26,6 +26,8 @@ public partial class RevenueDbContext : DbContext
 
     public virtual DbSet<InvoiceLine> InvoiceLines { get; set; }
 
+    public virtual DbSet<ReportChargeColumn> ReportChargeColumns { get; set; }
+
     public virtual DbSet<ContainerStay> ContainerStays { get; set; }
 
     public virtual DbSet<Currency> Currencies { get; set; }
@@ -496,6 +498,19 @@ public partial class RevenueDbContext : DbContext
                 .HasColumnName("waive_reason_code");
             entity.Property(e => e.WaivedAt).HasColumnName("waived_at");
             entity.Property(e => e.WaivedBy).HasColumnName("waived_by");
+        });
+
+        modelBuilder.Entity<ReportChargeColumn>(entity =>
+        {
+            entity.HasKey(e => new { e.TenantId, e.ReportKey, e.ChargeCode }).HasName("pk_report_charge_column");
+
+            entity.ToTable("report_charge_column", "billing");
+
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.ReportKey).HasMaxLength(40).IsUnicode(false).HasColumnName("report_key");
+            entity.Property(e => e.ChargeCode).HasMaxLength(30).HasColumnName("charge_code");
+            entity.Property(e => e.ColumnKey).HasMaxLength(40).IsUnicode(false).HasColumnName("column_key");
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(sysutcdatetime() AT TIME ZONE 'UTC')").HasColumnName("created_at");
         });
 
         modelBuilder.Entity<Invoice>(entity =>

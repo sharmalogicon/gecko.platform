@@ -44,6 +44,16 @@ internal sealed class TosBookingHeaders(TosDbContext db) : ITosBookingHeaders
         });
     }
 
+    public async Task<IReadOnlyDictionary<Guid, string>> ContainerTypesAsync(IReadOnlyCollection<Guid> bookingContainerIds, CancellationToken ct)
+    {
+        var ids = bookingContainerIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<Guid, string>();
+        return await (
+            from x in db.BookingContainers.AsNoTracking().Where(x => ids.Contains(x.BookingContainerId))
+            join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+            select new { x.BookingContainerId, r.EquipmentTypeCode }).ToDictionaryAsync(x => x.BookingContainerId, x => x.EquipmentTypeCode, ct);
+    }
+
     public async Task<IReadOnlyList<TosBookingHeader>> SearchAsync(string text, IReadOnlyCollection<Guid>? branchIds, int take, CancellationToken ct)
     {
         var q = text.Trim().ToUpperInvariant();

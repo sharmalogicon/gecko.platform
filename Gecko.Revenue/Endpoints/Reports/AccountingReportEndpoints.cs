@@ -20,6 +20,12 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///
 ///   GET /reports/accounting/sales-tax.{pdf|xlsx}         TMS.Accounting.SalesTax
 ///   GET /reports/accounting/withholding-tax.{pdf|xlsx}   TMS.Accounting.WithholdingTax
+///   GET /reports/accounting/cash-receipt-by-user.{pdf|xlsx}      TMS.Accounting.CashReceiptByUser
+///   GET /reports/accounting/cash-receipt-by-liner.{pdf|xlsx}     Tms.Accounting.CashReceiptByLiner
+///   GET /reports/accounting/cash-receipt-by-company.{pdf|xlsx}   TMS.Accounting.CashReceiptByCompany
+///
+/// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
+/// inclusive); a dateTo with no time means the whole of that day.
 ///
 /// Vector's BranchID is the depot (branchId), DateFrom/DateTo the depot's days (dateFrom/dateTo, both
 /// inclusive). Read by revenue.charge.view at that depot, as /reports/receipts is.
@@ -35,6 +41,14 @@ internal static class AccountingReportEndpoints
             .WithDescription("bookingType (IMPORT, EXPORT, REPO, INTERNAL) keeps the receipts with a line for a booking of that type.");
         reports.MapGet("/withholding-tax.{format}", WithholdingTaxAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Withholding Tax report (Vector TMS.Accounting.WithholdingTax): receipts with tax withheld, as PDF or Excel");
+        reports.MapGet("/cash-receipt-by-user.{format}", ByUserAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Cash Receipt Listing by user (Vector TMS.Accounting.CashReceiptByUser), as PDF or Excel")
+            .WithDescription("dateFrom/dateTo are depot date-times (yyyy-MM-ddTHH:mm). cashierUserId keeps one cashier's receipts; bookingType as for sales-tax.");
+        reports.MapGet("/cash-receipt-by-liner.{format}", ByLinerAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Cash Receipt Listing by shipping line (Vector CashReceiptByLiner), as PDF or Excel")
+            .WithDescription("dateFrom/dateTo are depot date-times (yyyy-MM-ddTHH:mm). agentCode keeps one shipping line's receipts.");
+        reports.MapGet("/cash-receipt-by-company.{format}", ByCompanyAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Cash Receipt Detail List by company (Vector CashReceiptByCompany), as PDF or Excel");
 
         return revenue;
     }
@@ -70,6 +84,27 @@ internal static class AccountingReportEndpoints
             by, branch.Local(calendar.Now), AccountingReports.LetterheadOf(seller)), null);
     }
 
+    /// <summary>
+    /// The User/Liner listings' window: from <paramref name="from"/> to <paramref name="to"/> inclusive, depot time;
+    /// a <paramref name="to"/> at midnight means that whole day.
+    /// </summary>
+    private static async Task<(AccountingReportContext? Context, DateTime To, IResult? Refused)> TimedContextAsync(
+        string format, Guid? branchId, DateTime? from, DateTime? to, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
+    {
+        if (from is null) return (null, default, RevenueSupport.Invalid("dateFrom", "When the report starts (depot date and time)."));
+        if (to is null) return (null, default, RevenueSupport.Invalid("dateTo", "When the report ends (depot date and time)."));
+        var end = to.Value.TimeOfDay == TimeSpan.Zero ? to.Value.Date.AddDays(1).AddTicks(-1) : to.Value;
+        if (end < from) return (null, default, RevenueSupport.Invalid("dateTo", "The end is before the start."));
+
+        var (context, refused) = await ContextAsync(format, branchId, DateOnly.FromDateTime(from.Value), DateOnly.FromDateTime(end),
+            calendar, master, users, caller, scope, ct);
+        if (refused is not null) return (null, default, refused);
+        var zone = context!.Branch.Zone;
+        DateTimeOffset At(DateTime local) => new DateTimeOffset(DateTime.SpecifyKind(local, DateTimeKind.Unspecified), zone.GetUtcOffset(local)).ToUniversalTime();
+        return (context with { Start = At(from.Value), End = At(end).AddTicks(1) }, end, null);
+    }
+
     private static IResult File(TabularReport report, string format) => format == "pdf"
         ? TypedResults.File(report.Pdf(), TabularReport.PdfType, report.FileName + ".pdf")
         : TypedResults.File(report.Xlsx(), TabularReport.XlsxType, report.FileName + ".xlsx");
@@ -97,5 +132,42 @@ internal static class AccountingReportEndpoints
         if (refused is not null) return refused;
 
         return File(await AccountingReports.WithholdingTaxAsync(db, context!, ct), format);
+    }
+
+    private static async Task<IResult> ByUserAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateTime? dateFrom = null, DateTime? dateTo = null, string? bookingType = null, Guid? cashierUserId = null)
+    {
+        var type = string.IsNullOrWhiteSpace(bookingType) ? null : bookingType.Trim().ToUpperInvariant();
+        if (type is not null && !BookingTypes.Contains(type))
+            return RevenueSupport.Invalid("bookingType", "Use IMPORT, EXPORT, REPO or INTERNAL, or leave it out for all.");
+        var (context, to, refused) = await TimedContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        return File(await CashReceiptReports.ByUserAsync(db, tos, master, users, context!, dateFrom!.Value, to, type, cashierUserId, ct), format);
+    }
+
+    private static async Task<IResult> ByLinerAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, BranchCalendar calendar, IMasterDataReferences master,
+        IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateTime? dateFrom = null, DateTime? dateTo = null, string? agentCode = null)
+    {
+        var (context, to, refused) = await TimedContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var agent = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
+        return File(await CashReceiptReports.ByLinerAsync(db, tos, master, context!, dateFrom!.Value, to, agent, ct), format);
+    }
+
+    private static async Task<IResult> ByCompanyAsync(
+        string format, RevenueDbContext db, ITosBookingHeaders tos, ITosTruckVisits trucks, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        return File(await CashReceiptReports.ByCompanyAsync(db, tos, trucks, master, context!, ct), format);
     }
 }

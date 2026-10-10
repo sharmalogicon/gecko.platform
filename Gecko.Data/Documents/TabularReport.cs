@@ -40,6 +40,16 @@ public sealed record TabularRow(IReadOnlyList<object?> Cells, RowKind Kind = Row
     public static TabularRow Banner(string text) => new([text], RowKind.Banner);
 }
 
+/// <summary>
+/// A table under the main grid, as an RDL places a second tablix below the first (e.g. the Company listing's
+/// "Summary by Charge Code"): an optional caption above it, its own columns and header rows.
+/// </summary>
+public sealed record TabularBlock(
+    string? Caption,
+    IReadOnlyList<TabularColumn> Columns,
+    IReadOnlyList<IReadOnlyList<HeaderCell>> HeaderRows,
+    IReadOnlyList<TabularRow> Rows);
+
 public enum ReportPage { A4Portrait, A4Landscape, A3Landscape }
 
 /// <summary>
@@ -48,7 +58,8 @@ public enum ReportPage { A4Portrait, A4Landscape, A3Landscape }
 /// scaled down only if the columns do not fit) and as an Excel sheet carrying the same cells.
 ///
 /// <c>Heading</c>/<c>HeadingRight</c> repeat on every page (the RDL page header); <c>Preamble</c>/<c>PreambleRight</c>
-/// print once above the grid (body textboxes); the column headers repeat on every page.
+/// print once above the grid (body textboxes); the column headers repeat on every page. <c>After</c> holds the
+/// tables printed once below the grid.
 /// </summary>
 public sealed record TabularReport(
     string FileName,
@@ -61,7 +72,8 @@ public sealed record TabularReport(
     IReadOnlyList<TabularColumn> Columns,
     IReadOnlyList<IReadOnlyList<HeaderCell>> HeaderRows,
     IReadOnlyList<TabularRow> Rows,
-    string PageLabel = "Page No#")
+    string PageLabel = "Page No#",
+    IReadOnlyList<TabularBlock>? After = null)
 {
     public const string PdfType = "application/pdf";
     public const string XlsxType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -69,6 +81,10 @@ public sealed record TabularReport(
     private const float BaseSize = 8f;
     private const string HeaderFill = "#D3D3D3";
     private const string TotalFill = "#F2F2F2";
+
+    private TabularBlock Main => new(null, Columns, HeaderRows, Rows);
+
+    private IEnumerable<TabularBlock> Blocks => After is null ? [Main] : [Main, .. After];
 
     /// <summary>A cell as the RDL prints it: the column's format applied, invariant culture, null as blank.</summary>
     public static string Text(object? value, string? format) => value switch
@@ -82,19 +98,20 @@ public sealed record TabularReport(
     };
 
     /// <summary>Where each header cell lands (row, first column), spans honoured — the same layout for PDF and Excel.</summary>
-    public IReadOnlyList<(int Row, int Column, HeaderCell Cell)> HeaderLayout()
+    public static IReadOnlyList<(int Row, int Column, HeaderCell Cell)> HeaderLayout(TabularBlock block)
     {
-        var taken = new bool[HeaderRows.Count, Columns.Count];
+        var width = block.Columns.Count;
+        var taken = new bool[block.HeaderRows.Count, width];
         var placed = new List<(int, int, HeaderCell)>();
-        for (var r = 0; r < HeaderRows.Count; r++)
+        for (var r = 0; r < block.HeaderRows.Count; r++)
         {
             var c = 0;
-            foreach (var cell in HeaderRows[r])
+            foreach (var cell in block.HeaderRows[r])
             {
-                while (c < Columns.Count && taken[r, c]) c++;
-                if (c >= Columns.Count) throw new InvalidOperationException($"Header row {r} is wider than the {Columns.Count} columns.");
-                for (var rr = r; rr < Math.Min(HeaderRows.Count, r + cell.RowSpan); rr++)
-                    for (var cc = c; cc < Math.Min(Columns.Count, c + cell.ColSpan); cc++) taken[rr, cc] = true;
+                while (c < width && taken[r, c]) c++;
+                if (c >= width) throw new InvalidOperationException($"Header row {r} is wider than the {width} columns.");
+                for (var rr = r; rr < Math.Min(block.HeaderRows.Count, r + cell.RowSpan); rr++)
+                    for (var cc = c; cc < Math.Min(width, c + cell.ColSpan); cc++) taken[rr, cc] = true;
                 placed.Add((r, c, cell));
                 c += cell.ColSpan;
             }
@@ -117,6 +134,7 @@ public sealed record TabularReport(
         var available = (page.Width - 2 * margin) / 72.0 * 2.54;   // cm
         var scale = (float)Math.Min(1.0, available / Columns.Sum(c => c.WidthCm));
         var size = BaseSize * scale;
+        var pointsPerCm = (float)((page.Width - 2 * margin) / Math.Max(available, Columns.Sum(c => c.WidthCm)));
 
         return Document.Create(doc => doc.Page(p =>
         {
@@ -141,7 +159,14 @@ public sealed record TabularReport(
                     });
                     c.Item().Height(6);
                 }
-                c.Item().Element(Grid);
+                c.Item().Element(x => Grid(x, Main));
+                foreach (var block in After ?? [])
+                {
+                    c.Item().Height(10);
+                    if (block.Caption is { } caption) c.Item().PaddingBottom(2).Text(caption).Bold();
+                    // A later table keeps its own width (cm), on the same scale as the grid.
+                    c.Item().AlignLeft().Width((float)block.Columns.Sum(x => x.WidthCm) * pointsPerCm).Element(x => Grid(x, block));
+                }
             });
 
             p.Footer().AlignRight().Text(t =>
@@ -162,38 +187,40 @@ public sealed record TabularReport(
             });
     }
 
-    private void Grid(IContainer container) => container.Table(table =>
+    private static void Grid(IContainer container, TabularBlock block) => container.Table(table =>
     {
+        var columns = block.Columns;
         table.ColumnsDefinition(cols =>
         {
-            foreach (var c in Columns) cols.RelativeColumn((float)c.WidthCm);
+            foreach (var c in columns) cols.RelativeColumn((float)c.WidthCm);
         });
-        table.Header(h =>
-        {
-            foreach (var (row, column, cell) in HeaderLayout())
-                h.Cell().Row((uint)row + 1).Column((uint)column + 1).RowSpan((uint)cell.RowSpan).ColumnSpan((uint)cell.ColSpan)
-                    .Border(0.5f).Background(HeaderFill).Padding(2).AlignCenter().AlignMiddle()
-                    .Text(cell.Text).Bold();
-        });
-        foreach (var row in Rows)
+        if (block.HeaderRows.Count > 0)
+            table.Header(h =>
+            {
+                foreach (var (row, column, cell) in HeaderLayout(block))
+                    h.Cell().Row((uint)row + 1).Column((uint)column + 1).RowSpan((uint)cell.RowSpan).ColumnSpan((uint)cell.ColSpan)
+                        .Border(0.5f).Background(HeaderFill).Padding(2).AlignCenter().AlignMiddle()
+                        .Text(cell.Text).Bold();
+            });
+        foreach (var row in block.Rows)
         {
             if (row.Kind == RowKind.Banner)
             {
-                table.Cell().ColumnSpan((uint)Columns.Count).Border(0.5f).Padding(2)
+                table.Cell().ColumnSpan((uint)columns.Count).Border(0.5f).Padding(2)
                     .Text(Text(row.Cells.FirstOrDefault(), null)).Bold();
                 continue;
             }
-            for (var i = 0; i < Columns.Count; i++)
+            for (var i = 0; i < columns.Count; i++)
             {
                 var cell = table.Cell().Border(0.5f);
                 if (row.Kind == RowKind.Total) cell = cell.Background(TotalFill);
-                cell = Columns[i].Align switch
+                cell = columns[i].Align switch
                 {
                     CellAlign.Right => cell.Padding(2).AlignRight(),
                     CellAlign.Center => cell.Padding(2).AlignCenter(),
                     _ => cell.Padding(2),
                 };
-                var text = cell.Text(Text(i < row.Cells.Count ? row.Cells[i] : null, Columns[i].Format));
+                var text = cell.Text(Text(i < row.Cells.Count ? row.Cells[i] : null, columns[i].Format));
                 if (row.Kind is RowKind.Subtotal or RowKind.Total) text.Bold();
             }
         }
@@ -231,23 +258,54 @@ public sealed record TabularReport(
         Block(Preamble, PreambleRight);
         r++;
 
-        var headerTop = r;
-        foreach (var (row, column, cell) in HeaderLayout())
+        for (var i = 0; i < last; i++) sheet.Column(i + 1).Width = Math.Max(6, Columns[i].WidthCm * 4.4);
+        var headerBottom = Write(sheet, Main, ref r);
+        sheet.SheetView.FreezeRows(headerBottom);
+
+        foreach (var block in After ?? [])
         {
-            var range = sheet.Range(headerTop + row, column + 1, headerTop + row + cell.RowSpan - 1, column + cell.ColSpan);
+            r++;
+            if (block.Caption is { } caption)
+            {
+                sheet.Cell(r, 1).Value = caption;
+                sheet.Cell(r, 1).Style.Font.Bold = true;
+                r++;
+            }
+            Write(sheet, block, ref r);
+        }
+
+        sheet.PageSetup.PageOrientation = Page == ReportPage.A4Portrait ? XLPageOrientation.Portrait : XLPageOrientation.Landscape;
+        sheet.PageSetup.PaperSize = Page == ReportPage.A3Landscape ? XLPaperSize.A3Paper : XLPaperSize.A4Paper;
+        sheet.PageSetup.FitToPages(1, 0);
+        using var stream = new MemoryStream();
+        book.SaveAs(stream);
+        return stream.ToArray();
+    }
+
+    /// <summary>Writes one table from row <paramref name="r"/> on (left at column 1); returns its last header row.</summary>
+    private static int Write(IXLWorksheet sheet, TabularBlock block, ref int r)
+    {
+        var last = block.Columns.Count;
+        var top = r;
+        foreach (var (row, column, cell) in HeaderLayout(block))
+        {
+            var range = sheet.Range(top + row, column + 1, top + row + cell.RowSpan - 1, column + cell.ColSpan);
             if (cell.RowSpan > 1 || cell.ColSpan > 1) range.Merge();
             range.FirstCell().Value = cell.Text;
         }
-        var header = sheet.Range(headerTop, 1, headerTop + HeaderRows.Count - 1, last);
-        header.Style.Font.Bold = true;
-        header.Style.Fill.BackgroundColor = XLColor.FromHtml(HeaderFill);
-        header.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
-        header.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
-        header.Style.Alignment.WrapText = true;
-        for (var i = 0; i < last; i++) sheet.Column(i + 1).Width = Math.Max(6, Columns[i].WidthCm * 4.4);
-        r = headerTop + HeaderRows.Count;
+        if (block.HeaderRows.Count > 0)
+        {
+            var header = sheet.Range(top, 1, top + block.HeaderRows.Count - 1, last);
+            header.Style.Font.Bold = true;
+            header.Style.Fill.BackgroundColor = XLColor.FromHtml(HeaderFill);
+            header.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+            header.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
+            header.Style.Alignment.WrapText = true;
+        }
+        r = top + block.HeaderRows.Count;
+        var headerBottom = r - 1;
 
-        foreach (var row in Rows)
+        foreach (var row in block.Rows)
         {
             if (row.Kind == RowKind.Banner)
             {
@@ -260,7 +318,7 @@ public sealed record TabularReport(
             for (var i = 0; i < last; i++)
             {
                 var cell = sheet.Cell(r, i + 1);
-                var format = Columns[i].Format;
+                var format = block.Columns[i].Format;
                 switch (i < row.Cells.Count ? row.Cells[i] : null)
                 {
                     case null: break;
@@ -271,7 +329,7 @@ public sealed record TabularReport(
                     case decimal m: cell.Value = m; if (format is not null) cell.Style.NumberFormat.Format = format; break;
                     case var other: cell.Value = Text(other, format); break;
                 }
-                cell.Style.Alignment.Horizontal = Columns[i].Align switch
+                cell.Style.Alignment.Horizontal = block.Columns[i].Align switch
                 {
                     CellAlign.Right => XLAlignmentHorizontalValues.Right,
                     CellAlign.Center => XLAlignmentHorizontalValues.Center,
@@ -283,16 +341,9 @@ public sealed record TabularReport(
             r++;
         }
 
-        var grid = sheet.Range(headerTop, 1, Math.Max(headerTop + HeaderRows.Count - 1, r - 1), last);
+        var grid = sheet.Range(top, 1, Math.Max(top, r - 1), last);
         grid.Style.Border.InsideBorder = XLBorderStyleValues.Thin;
         grid.Style.Border.OutsideBorder = XLBorderStyleValues.Thin;
-        sheet.SheetView.FreezeRows(headerTop + HeaderRows.Count - 1);
-
-        sheet.PageSetup.PageOrientation = Page == ReportPage.A4Portrait ? XLPageOrientation.Portrait : XLPageOrientation.Landscape;
-        sheet.PageSetup.PaperSize = Page == ReportPage.A3Landscape ? XLPaperSize.A3Paper : XLPaperSize.A4Paper;
-        sheet.PageSetup.FitToPages(1, 0);
-        using var stream = new MemoryStream();
-        book.SaveAs(stream);
-        return stream.ToArray();
+        return headerBottom;
     }
 }

@@ -14,6 +14,12 @@ public interface ITosBookingHeaders
     /// <paramref name="branchIds"/> (null = any branch of the tenant), newest first: exact matches before the rest.
     /// </summary>
     Task<IReadOnlyList<TosBookingHeader>> SearchAsync(string text, IReadOnlyCollection<Guid>? branchIds, int take, CancellationToken ct);
+
+    /// <summary>
+    /// The equipment type code each booked box was booked as (its equipment requirement's, e.g. "20GP"), by
+    /// booking_container_id — what Vector's cash receipt listings print as Size/Type. Unknown ids are absent.
+    /// </summary>
+    Task<IReadOnlyDictionary<Guid, string>> ContainerTypesAsync(IReadOnlyCollection<Guid> bookingContainerIds, CancellationToken ct);
 }
 
 /// <param name="StepsTotal">Every planned step of every box still on the booking (cancelled ones not counted).</param>

@@ -23,7 +23,7 @@ internal static class OperationChargeReports
     /// move (gate_transaction_id) or earned by it (earned_gate_transaction_id), else one on the same box for the same
     /// movement. A charge counts for one move only. Cancelled charges are left out.
     /// </summary>
-    public static async Task<ILookup<Guid, (string Code, decimal Amount)>> ChargesOfAsync(
+    public static async Task<ILookup<Guid, (string Code, decimal Amount, string BillTo, decimal Rate)>> ChargesOfAsync(
         RevenueDbContext db, IReadOnlyList<TosGateMove> moves, CancellationToken ct)
     {
         var ids = moves.Select(m => m.GateTransactionId).ToList();
@@ -33,11 +33,11 @@ internal static class OperationChargeReports
                         && ((c.GateTransactionId != null && ids.Contains(c.GateTransactionId.Value))
                             || (c.EarnedGateTransactionId != null && ids.Contains(c.EarnedGateTransactionId.Value))
                             || (c.BookingContainerId != null && boxes.Contains(c.BookingContainerId.Value))))
-            .Select(c => new { c.ChargeCode, c.Amount, c.GateTransactionId, c.EarnedGateTransactionId, c.BookingContainerId, c.MovementCode })
+            .Select(c => new { c.ChargeCode, c.Amount, c.BillTo, c.UnitRate, c.GateTransactionId, c.EarnedGateTransactionId, c.BookingContainerId, c.MovementCode })
             .ToListAsync(ct);
 
         var byId = moves.ToDictionary(m => m.GateTransactionId);
-        var owned = new List<(Guid Move, string Code, decimal Amount)>();
+        var owned = new List<(Guid Move, string Code, decimal Amount, string BillTo, decimal Rate)>();
         foreach (var c in charges)
         {
             Guid? move = c.GateTransactionId is { } g && byId.ContainsKey(g) ? g
@@ -45,9 +45,9 @@ internal static class OperationChargeReports
                 : c.GateTransactionId is null && c.EarnedGateTransactionId is null
                     ? moves.FirstOrDefault(m => m.BookingContainerId == c.BookingContainerId && m.MovementCode == c.MovementCode)?.GateTransactionId
                     : null;
-            if (move is { } owner) owned.Add((owner, c.ChargeCode, c.Amount));
+            if (move is { } owner) owned.Add((owner, c.ChargeCode, c.Amount, c.BillTo, c.UnitRate ?? 0m));
         }
-        return owned.ToLookup(o => o.Move, o => (o.Code, o.Amount));
+        return owned.ToLookup(o => o.Move, o => (o.Code, o.Amount, o.BillTo, o.Rate));
     }
 
     /// <summary>The tenant's own codes for a report (gecko_revenue 31/32), read under its RLS.</summary>
@@ -784,5 +784,89 @@ internal static class OperationChargeReports
                 [new("ITEM"), new("Container No"), new("Size"), new("Vessel Name"), new("VOY"), new("L.NET"), new("PP."), new("L.WOOD"), new("AMOUNT")],
             ],
             Rows: rows);
+    }
+
+    public const string LiftOffSummaryKey = "LIFT_OFF_SUMMARY";
+
+    /// <summary>TMS.Accounting.HyundaiLiftOffSummary's codes: SL001-CR lift-off empty, SC001-CR-C/H/S/W cleaning.</summary>
+    public static readonly IReadOnlyDictionary<string, string> LiftOffSummaryCodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SL001-CR"] = "LIFT_OFF",
+        ["SC001-CR-C"] = "CLEANING", ["SC001-CR-H"] = "CLEANING", ["SC001-CR-S"] = "CLEANING", ["SC001-CR-W"] = "CLEANING",
+    };
+
+    /// <summary>
+    /// TMS.Accounting.HyundaiLiftOffSummary (Report.usp_Accounting_LiftOffSummary) — &lt;&lt;SUMMARY LIFT OFF REPORT&gt;&gt; for an
+    /// agent: the empties it brought in during the window by size/type — boxes in, lift-offs billed to the line (HMM
+    /// RETURN), the rest (CONE RETURN), the lift-off rate and total, boxes cleaned and the cleaning total, and the total;
+    /// then the Total row; the INV. / DATE: / AP: sign-off lines. The desktop's "HYUNDAI Refund" menu prints this report.
+    /// Owner 2026-10-10 defaults: HMM RETURN is a lift-off billed to the line (Vector's "priced from a line quotation" has
+    /// no Gecko field), CONE RETURN = boxes in − HMM RETURN; money is the charges' (no whole-baht rounding); cleaning
+    /// TOTAL is the cleaning charged (the RDL printed the highest single price); rows by type, then size.
+    /// </summary>
+    public static async Task<TabularReport> LiftOffSummaryAsync(
+        RevenueDbContext db, ITosGateMoves gate, IMasterDataReferences master, AccountingReportContext c, string? lineCode, CancellationToken ct)
+    {
+        var moves = (await gate.MovesAsync(c.Branch.BranchId, c.Start, c.End, new TosGateMoveFilter(LineCode: lineCode), ct))
+            .Where(m => m.Direction == "IN" && m.FullEmpty == "EMPTY")
+            .ToList();
+        var typeCodes = moves.Select(m => m.EquipmentTypeCode).OfType<string>().Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var charges = await ChargesOfAsync(db, moves, ct);
+        var tenant = await TenantMapAsync(db, LiftOffSummaryKey, ct);
+        string? Column(string code) => tenant.GetValueOrDefault(code) ?? LiftOffSummaryCodes.GetValueOrDefault(code);
+
+        object?[] Figures(IReadOnlyCollection<TosGateMove> set)
+        {
+            var all = set.Select(m => (m.ContainerNo, Charges: charges[m.GateTransactionId].ToList())).ToList();
+            var boxesIn = all.Select(x => x.ContainerNo).Distinct().Count();
+            var lifts = all.SelectMany(x => x.Charges.Where(y => Column(y.Code) == "LIFT_OFF" && y.BillTo != "CUSTOMER").Select(y => (x.ContainerNo, y.Amount, y.Rate))).ToList();
+            var cleans = all.SelectMany(x => x.Charges.Where(y => Column(y.Code) == "CLEANING").Select(y => (x.ContainerNo, y.Amount))).ToList();
+            var hmm = lifts.Select(x => x.ContainerNo).Distinct().Count();
+            var lift = lifts.Sum(x => x.Amount);
+            var clean = cleans.Sum(x => x.Amount);
+            return [boxesIn, hmm, boxesIn - hmm, lifts.Count == 0 ? null : lifts.Max(x => x.Rate), lift,
+                cleans.Select(x => x.ContainerNo).Distinct().Count(), clean, lift + clean];
+        }
+
+        var groups = moves.GroupBy(m => SizeType(types, m.EquipmentTypeCode))
+            .OrderBy(g => g.Key.Type, StringComparer.Ordinal).ThenBy(g => g.Key.Size, StringComparer.Ordinal)
+            .ToList();
+        var rows = groups.Select(g => new TabularRow([$"{g.Key.Size} {g.Key.Type}".Trim(), .. Figures(g.ToList())])).ToList();
+        var total = Figures(moves);
+        total[3] = null;   // no rate on the Total row, as the RDL
+        rows.Add(new TabularRow(["Total", .. total], RowKind.Total));
+
+        string D(DateOnly d) => d.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+        const string Dots = "..................................";
+        const string Bath = "#,0.00;(#,0.00)";
+        return new TabularReport(
+            FileName: $"HyundaiLiftOffSummary_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 2.0,
+            Heading:
+            [
+                new(c.BranchName, 10, Bold: true),
+                new("<<SUMMARY LIFT OFF REPORT>>", 10, Bold: true),
+                new($"EMPTY IN DATE FROM: {D(c.From)}EMPTY IN DATE TO: {D(c.To)}"),
+                new($"AGENT:{lineCode}"),
+            ],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [new($"INV. {Dots}"), new($"DATE: {Dots}"), new($"AP: {Dots}")],
+            Columns:
+            [
+                new(2.5), new(2.5, null, CellAlign.Center), new(2.5, null, CellAlign.Center), new(2.5, null, CellAlign.Center),
+                new(2.5, Bath, CellAlign.Right), new(2.5, Bath, CellAlign.Right), new(2.5, null, CellAlign.Center),
+                new(2.5, Bath, CellAlign.Right), new(2.5, Bath, CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new(""), new("LIFT OFF CHARGE = 531101", ColSpan: 5), new("CLEANING", ColSpan: 2), new("")],
+                [new("TY/SZ"), new("TOTAL"), new("HMM"), new("CONE"), new("RATE"), new("TOTAL"), new(""), new("TOTAL"), new("TOTAL")],
+                [new(""), new("IN"), new("RETURN"), new("RETURN"), new("BTH"), new("BTH"), new("UNIT"), new("BTH"), new("BTH")],
+            ],
+            Rows: rows,
+            PageLabel: null);
     }
 }

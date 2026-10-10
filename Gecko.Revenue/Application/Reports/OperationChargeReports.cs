@@ -593,4 +593,107 @@ internal static class OperationChargeReports
             ],
             Rows: rows);
     }
+
+    /// <summary>
+    /// TMS.Accounting.GateOOCL (Report.usp_Accounting_GateOOCL) — OOCL GATE CHARGE LIST: a line per container the agent moved
+    /// through the gate in the window — its import gate in/out, unstuffing, order type, empty in/out with storage days and
+    /// amount, export full in/out with storage days and amount, and the gate (LO/LO) charged to the line; then the count
+    /// by order type and size, 20' at the RDL's flat 240.
+    /// Owner 2026-10-10 defaults: the moves are read by booking type and direction (IMPORT full in/out, any empty in, an
+    /// EXPORT or REPO empty out, EXPORT full in/out) rather than Vector's order-type list, which KORAKIT's types never
+    /// matched; storage and LO/LO by the Container Storage Activity codes and mapping, at their billed amounts (no 30-day
+    /// re-cut from the 20th); Un Stuffing blank (no unstuffing records, D9 — and the RDL only ever filled one debug box);
+    /// the summary counts containers, not rows.
+    /// </summary>
+    public static async Task<TabularReport> GateOoclAsync(
+        RevenueDbContext db, ITosGateMoves gate, IMasterDataReferences master, AccountingReportContext c, string? lineCode, CancellationToken ct)
+    {
+        var moves = await gate.MovesAsync(c.Branch.BranchId, c.Start, c.End, new TosGateMoveFilter(LineCode: lineCode), ct);
+        var typeCodes = moves.Select(m => m.EquipmentTypeCode).OfType<string>().Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+
+        var ids = moves.Select(m => m.BookingContainerId).Distinct().ToList();
+        var tenant = await TenantMapAsync(db, StorageActivityKey, ct);
+        string? Column(string code) => (tenant.GetValueOrDefault(code) ?? StorageActivityCodes.GetValueOrDefault(code)) switch
+        {
+            "LOLO" or "LOLO_EMPTY" or "LOLO_LADEN" => "LOLO",
+            var other => other,
+        };
+        var charges = new List<(Guid Box, string? Column, string BillTo, decimal Days, decimal Amount)>();
+        foreach (var slice in ids.Chunk(2000))
+            charges.AddRange((await db.Charges.AsNoTracking()
+                    .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.BillTo, Days = x.ChargeableQuantity ?? x.Quantity, x.Amount })
+                    .ToListAsync(ct))
+                .Select(x => (x.Box, Column(x.ChargeCode), x.BillTo, x.Days, x.Amount)));
+        var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
+
+        DateOnly? Day(DateTimeOffset? at) => at is { } a ? c.Branch.LocalDate(a) : null;
+        var lines = moves
+            .GroupBy(m => m.ContainerNo)
+            .OrderBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g =>
+            {
+                var all = g.OrderBy(m => m.TransactionAt).ToList();
+                DateTimeOffset? First(Func<TosGateMove, bool> which) => all.Where(which).Select(m => (DateTimeOffset?)m.TransactionAt).FirstOrDefault();
+                DateTimeOffset? Last(Func<TosGateMove, bool> which) => all.Where(which).Select(m => (DateTimeOffset?)m.TransactionAt).LastOrDefault();
+                var mine = g.Select(m => m.BookingContainerId).Distinct().SelectMany(b => byBox[b]).ToList();
+                decimal Days(string column) => mine.Where(x => x.Column == column).Sum(x => x.Days);
+                decimal Amount(string column) => mine.Where(x => x.Column == column).Sum(x => x.Amount);
+                var (size, type) = SizeType(types, all[0].EquipmentTypeCode);
+                return (ContainerNo: g.Key, Size: size ?? "", Type: type ?? "", all[0].OrderTypeCode,
+                    GateIn: First(m => m.BookingTypeCode == "IMPORT" && m.Direction == "IN" && m.FullEmpty == "FULL"),
+                    GateOut: Last(m => m.BookingTypeCode == "IMPORT" && m.Direction == "OUT" && m.FullEmpty == "FULL"),
+                    EmptyIn: First(m => m.Direction == "IN" && m.FullEmpty == "EMPTY"),
+                    EmptyOut: Last(m => m.BookingTypeCode is "EXPORT" or "REPO" && m.Direction == "OUT" && m.FullEmpty == "EMPTY"),
+                    EmptyDays: Days("EMPTY_STORAGE"), EmptyStorage: Amount("EMPTY_STORAGE"),
+                    FullIn: First(m => m.BookingTypeCode == "EXPORT" && m.Direction == "IN" && m.FullEmpty == "FULL"),
+                    FullOut: Last(m => m.BookingTypeCode == "EXPORT" && m.Direction == "OUT" && m.FullEmpty == "FULL"),
+                    FullDays: Days("FULL_STORAGE"), FullStorage: Amount("FULL_STORAGE"),
+                    Gate: mine.Where(x => x.Column == "LOLO" && x.BillTo != "CUSTOMER").Sum(x => x.Amount));
+            })
+            .ToList();
+
+        var rows = lines.Select((x, n) => new TabularRow([
+            n + 1, x.ContainerNo, x.Size, x.Type, Day(x.GateIn), Day(x.GateOut), null, x.OrderTypeCode, Day(x.EmptyIn), Day(x.EmptyOut),
+            x.EmptyDays, x.EmptyStorage, Day(x.FullIn), Day(x.FullOut), x.FullDays, x.FullStorage, x.Gate])).ToList();
+
+        var summary = lines.GroupBy(x => (x.OrderTypeCode, x.Size))
+            .OrderBy(g => g.Key.OrderTypeCode, StringComparer.Ordinal).ThenBy(g => g.Key.Size, StringComparer.Ordinal)
+            .Select(g => new TabularRow([$"{g.Key.OrderTypeCode} {g.Key.Size}", g.Count(), g.Key.Size == "20" ? g.Count() * 240m : 0m]))
+            .ToList();
+
+        const string Date = "dd-MM-yyyy";
+        const string Days = "#,0;(#,0);\"\"";
+        const string Amount = "#,0.00;(#,0.00);\"\"";
+        return new TabularReport(
+            FileName: $"GateOOCL_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading: [new(c.BranchName, 10, Bold: true), new("OOCL GATE CHARGE LIST", 10, Bold: true)],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(0.9, null, CellAlign.Center), new(2.6), new(1.0, null, CellAlign.Center), new(1.0, null, CellAlign.Center),
+                new(1.9, Date, CellAlign.Center), new(1.9, Date, CellAlign.Center), new(1.9, Date, CellAlign.Center), new(2.4),
+                new(1.9, Date, CellAlign.Center), new(1.9, Date, CellAlign.Center), new(1.1, Days, CellAlign.Right), new(1.8, Amount, CellAlign.Right),
+                new(1.9, Date, CellAlign.Center), new(1.9, Date, CellAlign.Center), new(1.1, Days, CellAlign.Right), new(1.8, Amount, CellAlign.Right),
+                new(1.6, "#,0.00;(#,0.00)", CellAlign.Right),
+            ],
+            HeaderRows:
+            [
+                [new(""), new("Container No"), new("Size"), new("Type"), new("Gate In"), new("Gate Out"), new("Un Stuffing"), new("Order Type"),
+                 new("Empty In"), new("Empty Out"), new("Days"), new("Storage"), new("Full In"), new("Full Out"), new("Days"), new("Storage"), new("Gate")],
+            ],
+            Rows: rows,
+            After:
+            [
+                new TabularBlock(null,
+                    [new(3.6), new(2.2, null, CellAlign.Right), new(2.2, "#,0", CellAlign.Right)],
+                    [[new(lines.FirstOrDefault().OrderTypeCode ?? ""), new("Container No"), new("")]],
+                    summary),
+            ]);
+    }
 }

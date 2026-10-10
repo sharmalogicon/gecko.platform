@@ -36,6 +36,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/electricity-standard.{pdf|xlsx}   TMS.Accounting.ElectricStandard
 ///   GET /reports/accounting/electricity-standard-3.{pdf|xlsx}   TMS.Accounting.ElectricStandard3
 ///   GET /reports/accounting/reefer-service-charge.{pdf|xlsx}   TMS.Accounting.ReeferServiceCharge
+///   GET /reports/accounting/gate-oocl.{pdf|xlsx}   TMS.Accounting.GateOOCL
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -98,6 +99,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/reefer-service-charge.{format}", ReeferServiceChargeAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Reefer Service Charge (Vector ReeferServiceCharge): the agent's reefer PTI and power bill, as PDF or Excel")
             .WithDescription("Reefer boxes on bookings whose vessel ETA is in dateFrom..dateTo. agentCode = the shipping line; vesselCode; voyageNo; bookingBlNo = the carrier's B/L; bookingType; orderType.");
+        reports.MapGet("/gate-oocl.{format}", GateOoclAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Gate OOCL (Vector GateOOCL): an agent's gate charge list, a line per container, as PDF or Excel")
+            .WithDescription("Containers moved through the gate in dateFrom..dateTo (the RDL's FromETD/ToETD are gate dates). agentCode = the shipping line (the RDL's default OOCL); blank = every line.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -405,5 +409,17 @@ internal static class AccountingReportEndpoints
 
         var filter = new TosBookedBoxFilter(Clean(agentCode), Clean(vesselCode), Clean(voyageNo), type, Clean(orderType), Clean(bookingBlNo));
         return File(await ReeferReports.ServiceChargeAsync(db, booked, tos, master, context!, filter, ct), format);
+    }
+
+    private static async Task<IResult> GateOoclAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null)
+    {
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var line = string.IsNullOrWhiteSpace(agentCode) ? null : agentCode.Trim();
+        return File(await OperationChargeReports.GateOoclAsync(db, gate, master, context!, line, ct), format);
     }
 }

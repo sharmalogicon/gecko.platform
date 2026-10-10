@@ -37,6 +37,8 @@ internal static class ReeferReports
         FullOut,
         /// <summary>PRE-COOL: an EXPORT box's empty gate-out, any other box's full gate-in, in the window.</summary>
         PreCool,
+        /// <summary>Electricity STD: a full gate-out in the window.</summary>
+        AnyFullOut,
     }
 
     /// <param name="BookingType">Gecko's booking type code; null = every type (the RDLs' blank).</param>
@@ -48,7 +50,8 @@ internal static class ReeferReports
         Charges Pti, Charges PreCool, Charges Electricity, int LoadedDays);
 
     /// <param name="Rate">The highest unit rate charged (the matrices' SELLING RATE).</param>
-    public sealed record Charges(int Lines, decimal Rate, decimal Amount);
+    /// <param name="Tax">The charges' own VAT.</param>
+    public sealed record Charges(int Lines, decimal Rate, decimal Amount, decimal Tax);
 
     public static async Task<List<ReeferLine>> LinesAsync(
         RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, IMasterDataReferences master,
@@ -58,7 +61,7 @@ internal static class ReeferReports
             .Where(m => driver switch
             {
                 Driver.GateOut => m.Direction == "OUT",
-                Driver.FullOut => m.Direction == "OUT" && m.FullEmpty == "FULL",
+                Driver.FullOut or Driver.AnyFullOut => m.Direction == "OUT" && m.FullEmpty == "FULL",
                 _ => m.BookingTypeCode == "EXPORT" ? m.Direction == "OUT" && m.FullEmpty == "EMPTY" : m.Direction == "IN" && m.FullEmpty == "FULL",
             })
             .ToList();
@@ -80,13 +83,13 @@ internal static class ReeferReports
         var tenant = await OperationChargeReports.TenantMapAsync(db, ElectricityKey, ct);
         string? Column(string code) => tenant.GetValueOrDefault(code) ?? ElectricityCodes.GetValueOrDefault(code);
         var ids = wanted.Select(b => b.BookingContainerId).ToList();
-        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount)>();
+        var charges = new List<(Guid Box, string? Column, decimal Rate, decimal Amount, decimal Tax)>();
         foreach (var slice in ids.Chunk(2000))
             charges.AddRange((await db.Charges.AsNoTracking()
                     .Where(x => x.BookingContainerId != null && slice.Contains(x.BookingContainerId.Value) && x.Status != "CANCELLED")
-                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount })
+                    .Select(x => new { Box = x.BookingContainerId!.Value, x.ChargeCode, x.UnitRate, x.Amount, x.TaxAmount })
                     .ToListAsync(ct))
-                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount)));
+                .Select(x => (x.Box, Column(x.ChargeCode), x.UnitRate ?? 0m, x.Amount, x.TaxAmount)));
         var byBox = charges.Where(x => x.Column is not null).ToLookup(x => x.Box);
 
         var vesselCodes = wanted.Select(b => b.VesselCode).OfType<string>().Distinct().ToList();
@@ -99,7 +102,7 @@ internal static class ReeferReports
                 Charges Of(string column)
                 {
                     var hit = mine.Where(x => x.Column == column).ToList();
-                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount));
+                    return new Charges(hit.Count, hit.Select(x => x.Rate).DefaultIfEmpty().Max(), hit.Sum(x => x.Amount), hit.Sum(x => x.Tax));
                 }
                 var (size, type) = OperationChargeReports.SizeType(types, b.EquipmentTypeCode);
                 var days = b.LadenIn is { } on && b.LadenOut is { } off
@@ -323,5 +326,77 @@ internal static class ReeferReports
             Rows: rows,
             PageLabel: null,
             After: [Matrix("PTI", lines, x => x.Pti, _ => 1)]);
+    }
+
+    /// <summary>
+    /// TMS.Accounting.ElectricStandard (Report.usp_Accounting_ElectricSTD) — REEFER CONTAINERS MOVEMENT: a line per EXPORT
+    /// reefer box gated out full in the window, its PTI (day, amount), PRECOOL (plug on/off, days, amount) and LADEN (plug
+    /// on/off as the laden gate dates, days, amount); the total row; then by size/type the boxes, days and amounts of each,
+    /// and the electricity charge's grand total with VAT.
+    /// Owner 2026-10-10 defaults: PTI date and pre-cool plug times print blank (they were work orders, gap D8); LADEN TOTAL
+    /// is the box's electricity charges (the RDL showed its PTI/pre-cool amount, and totalled 700 baht a day); the grand
+    /// total adds the charges' own VAT (not 7 % on top); the Total row is the sum of the size rows.
+    /// </summary>
+    public static TabularReport ElectricStandard(AccountingReportContext c, IReadOnlyList<ReeferLine> all)
+    {
+        const string Date = "dd/MM/yy";
+        var lines = all.Where(x => x.BookingType == "EXPORT").ToList();
+        var rows = lines.Select(x => new TabularRow([
+            x.Box.ContainerNo, x.Label, null, x.Pti.Lines > 0 ? 1 : 0, x.Pti.Amount, null, null, 0, x.PreCool.Amount,
+            Day(c, x.Box.LadenIn), Day(c, x.Box.LadenOut), x.LoadedDays, x.Electricity.Amount])).ToList();
+        rows.Add(new TabularRow([
+            null, null, null, null, lines.Sum(x => x.Pti.Amount), null, null, null, lines.Sum(x => x.PreCool.Amount),
+            null, null, null, lines.Sum(x => x.Electricity.Amount)], RowKind.Total));
+
+        object?[] Summary(string label, IReadOnlyCollection<ReeferLine> set) =>
+        [
+            label,
+            set.Count(x => x.Pti.Lines > 0), 0, set.Sum(x => x.Pti.Amount),
+            set.Count(x => x.PreCool.Lines > 0), 0, set.Sum(x => x.PreCool.Amount),
+            set.Count(x => x.LoadedDays > 0), set.Sum(x => x.LoadedDays), set.Sum(x => x.Electricity.Amount),
+            set.Sum(x => x.Pti.Amount + x.Pti.Tax + x.PreCool.Amount + x.PreCool.Tax + x.Electricity.Amount + x.Electricity.Tax),
+        ];
+        var summary = lines.GroupBy(x => x.Label).OrderBy(g => g.First().Size, StringComparer.Ordinal).ThenBy(g => g.First().Type, StringComparer.Ordinal)
+            .Select(g => new TabularRow(Summary(g.Key, g.ToList()))).ToList();
+        summary.Add(new TabularRow(Summary("Total", lines), RowKind.Total));
+
+        var between = $"DATE  BETWEEN {c.From.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)} TO {c.To.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}";
+        TabularColumn N() => new(1.6, Count, CellAlign.Right);
+        TabularColumn M() => new(2.0, Money, CellAlign.Right);
+        return new TabularReport(
+            FileName: $"ElectricStandard_{c.Branch.BranchCode}_{c.From:yyyyMMdd}-{c.To:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading: [new(c.BranchName, 10, Bold: true), new("REEFER CONTAINERS MOVEMENT", 10, Bold: true), new(between)],
+            HeadingRight: [],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.8), new(1.4, null, CellAlign.Center), new(1.8, Date, CellAlign.Center), N(), M(),
+                new(1.8, Date, CellAlign.Center), new(1.8, Date, CellAlign.Center), N(), M(),
+                new(1.8, Date, CellAlign.Center), new(1.8, Date, CellAlign.Center), N(), M(),
+            ],
+            HeaderRows:
+            [
+                [new(""), new(""), new("PTI", ColSpan: 3), new("PRECOOL", ColSpan: 4), new("LADEN", ColSpan: 4)],
+                [new("CONTAINER NO."), new("SIZE"), new("DAY PTI"), new("DAY"), new("TOTAL"), new("PLUG ON"), new("PLUG OFF"), new("DAY"),
+                 new("TOTAL"), new("PLUG ON"), new("PLUG OFF"), new("DAY"), new("TOTAL")],
+            ],
+            Rows: rows,
+            PageLabel: null,
+            After:
+            [
+                new TabularBlock(null,
+                    [new(2.4), N(), N(), M(), N(), N(), M(), N(), N(), M(), new(3.4, Money, CellAlign.Right)],
+                    [
+                        [new("PTI", ColSpan: 4), new("PRECOOL", ColSpan: 3), new("LADEN", ColSpan: 3), new("ELECTRICITY CHARGE")],
+                        [new("Size Type"), new("Total no."), new("Total Storage"), new("Total Amount"), new("Total no."), new("Total Storage"),
+                         new("Total Amount"), new("Total no."), new("Total Storage"), new("Total Amount"), new("Grand TOTAL for PTI,")],
+                        [new(""), new("Container"), new("Day"), new(""), new("Container"), new("Day"), new(""), new("Container"), new("Day"),
+                         new(""), new("PRECOOL,LADEN")],
+                    ],
+                    summary),
+            ]);
     }
 }

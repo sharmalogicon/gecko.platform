@@ -33,6 +33,7 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/electricity-day-elc.{pdf|xlsx}   TMS.Accounting.ElectricDay_ELC
 ///   GET /reports/accounting/electricity-day-precool.{pdf|xlsx}   TMS.Accounting.ElectricDay_PRECOOL
 ///   GET /reports/accounting/electricity-day-pti.{pdf|xlsx}   TMS.Accounting.ElectricDay_PTI
+///   GET /reports/accounting/electricity-standard.{pdf|xlsx}   TMS.Accounting.ElectricStandard
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -86,6 +87,9 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/electricity-day-pti.{format}", ElectricDayPtiAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Electricity Day (PTI) (Vector ElectricDay_PTI): PTI charges of reefer boxes gated out, as PDF or Excel")
             .WithDescription("Reefer boxes gated out (empty or full) in dateFrom..dateTo. agentCode; vesselCode; voyageNo.");
+        reports.MapGet("/electricity-standard.{format}", ElectricStandardAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Electricity STD (Vector ElectricStandard): REEFER CONTAINERS MOVEMENT, as PDF or Excel")
+            .WithDescription("EXPORT reefer boxes gated out full in dateFrom..dateTo (the RDL's FromETD/ToETD are the gate dates). vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -362,4 +366,11 @@ internal static class AccountingReportEndpoints
         string? voyageNo = null) =>
         ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
             agentCode, vesselCode, voyageNo, null, null, ReeferReports.Driver.GateOut, ReeferReports.ElectricDayPti);
+
+    private static Task<IResult> ElectricStandardAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? vesselCode = null, string? voyageNo = null) =>
+        ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            null, vesselCode, voyageNo, "EXPORT", null, ReeferReports.Driver.AnyFullOut, ReeferReports.ElectricStandard);
 }

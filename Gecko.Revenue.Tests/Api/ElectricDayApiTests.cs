@@ -126,6 +126,11 @@ public sealed class ElectricDayApiTests(RevenueApiFactory api)
             var elc = Rows(await client.GetByteArrayAsync($"/api/revenue/reports/accounting/electricity-day-elc.xlsx?branchId={SctLcb01}&{Window}", ct), 8);
             Assert.DoesNotContain(elc, r => r[1] == empty.ContainerNo);
 
+            // Electricity STD is EXPORT boxes only: the IMPORT reefer gated out full is not on it.
+            var std = Rows(await client.GetByteArrayAsync($"/api/revenue/reports/accounting/electricity-standard.xlsx?branchId={SctLcb01}&{Window}", ct), 13);
+            Assert.Contains(std, r => r[0] == "REEFER CONTAINERS MOVEMENT");
+            Assert.DoesNotContain(std, r => r[0] == full.ContainerNo);
+
             var pdf = await client.GetAsync($"/api/revenue/reports/accounting/electricity-day-precool.pdf?branchId={SctLcb01}&{Window}", ct);
             Assert.Equal("application/pdf", pdf.Content.Headers.ContentType?.MediaType);
             var bad = await client.GetAsync($"/api/revenue/reports/accounting/electricity-day.pdf?branchId={SctLcb01}&{Window}&bookingType=NOPE", ct);

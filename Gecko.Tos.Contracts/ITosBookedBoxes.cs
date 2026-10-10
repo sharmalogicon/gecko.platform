@@ -24,7 +24,8 @@ public sealed record TosBookedBoxFilter(
 /// <param name="Eta">The booking's vessel ETA; null without a vessel call.</param>
 /// <param name="EmptyIn">First completed empty gate-in of the box on this booking; <paramref name="EmptyOut"/> the last empty
 /// gate-out, <paramref name="LadenIn"/>/<paramref name="LadenOut"/> the same for full moves.</param>
+/// <param name="RequiredDate">The box's required date (Vector's RequiredDate, printed as the pre-cool date).</param>
 public sealed record TosBookedBox(
     Guid BookingContainerId, Guid BookingId, string ContainerNo, string EquipmentTypeCode, string OrderTypeCode,
     string BookingTypeCode, string LineCode, string? VesselCode, string? Voyage, DateTimeOffset? Eta,
-    DateTimeOffset? EmptyIn, DateTimeOffset? EmptyOut, DateTimeOffset? LadenIn, DateTimeOffset? LadenOut);
+    DateTimeOffset? EmptyIn, DateTimeOffset? EmptyOut, DateTimeOffset? LadenIn, DateTimeOffset? LadenOut, DateOnly? RequiredDate = null);

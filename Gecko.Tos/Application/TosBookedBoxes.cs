@@ -32,6 +32,7 @@ internal sealed class TosBookedBoxes(TosDbContext db) : ITosBookedBoxes
         public DateTimeOffset? Eta { get; init; }
         public string? VoyageIn { get; init; }
         public string? VoyageOut { get; init; }
+        public DateOnly? RequiredDate { get; init; }
     }
 
     private IQueryable<Row> Rows(IQueryable<Infrastructure.Persistence.Entities.Booking> bookings,
@@ -51,6 +52,7 @@ internal sealed class TosBookedBoxes(TosDbContext db) : ITosBookedBoxes
             LinePartyCode = b.LinePartyCode, VesselCode = c == null ? null : c.VesselCode, Eta = c == null ? (DateTimeOffset?)null : c.Eta,
             VoyageIn = l != null && l.VoyageIn != null ? l.VoyageIn : c == null ? null : c.OperatorVoyageIn,
             VoyageOut = l != null && l.VoyageOut != null ? l.VoyageOut : c == null ? null : c.OperatorVoyageOut,
+            RequiredDate = x.RequiredDate,
         };
 
     /// <summary>The boxes' gate dates (first empty/laden in, last empty/laden out), fetched in slices SQL Server accepts.</summary>
@@ -71,7 +73,7 @@ internal sealed class TosBookedBoxes(TosDbContext db) : ITosBookedBoxes
         return rows.Select(r => new TosBookedBox(r.BookingContainerId, r.BookingId, r.ContainerNo, r.EquipmentTypeCode, r.OrderTypeCode,
                 r.BookingTypeCode, r.LinePartyCode, r.VesselCode, r.VoyageOut ?? r.VoyageIn, r.Eta,
                 First(r.BookingContainerId, "IN", "EMPTY"), Last(r.BookingContainerId, "OUT", "EMPTY"),
-                First(r.BookingContainerId, "IN", "FULL"), Last(r.BookingContainerId, "OUT", "FULL")))
+                First(r.BookingContainerId, "IN", "FULL"), Last(r.BookingContainerId, "OUT", "FULL"), r.RequiredDate))
             .ToList();
     }
 

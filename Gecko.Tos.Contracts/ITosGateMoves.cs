@@ -16,8 +16,9 @@ public interface ITosGateMoves
 public sealed record TosGateMoveFilter(
     string? MovementCode = null, string? LineCode = null, string? BookingTypeCode = null, string? OrderTypeCode = null);
 
+/// <param name="Direction">IN or OUT — with FullEmpty, the move whatever the tenant's movement codes (MTY_OUT, GOE …).</param>
 /// <param name="EquipmentTypeCode">As the gate recorded the box ("20GP"); null when it was not recorded.</param>
 public sealed record TosGateMove(
     Guid GateTransactionId, string EirNo, DateTimeOffset TransactionAt, string MovementCode, string FullEmpty,
     string ContainerNo, string? EquipmentTypeCode, Guid BookingId, Guid BookingContainerId, string LineCode,
-    string BookingTypeCode, string OrderTypeCode, Guid TruckVisitId);
+    string BookingTypeCode, string OrderTypeCode, Guid TruckVisitId, string Direction);

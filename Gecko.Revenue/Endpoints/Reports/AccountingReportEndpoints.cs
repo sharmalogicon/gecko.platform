@@ -29,6 +29,10 @@ namespace Gecko.Revenue.Endpoints.Reports;
 ///   GET /reports/accounting/container-storage-activity-by-vessel.{pdf|xlsx}   TMS.Accounting.ContainerStorageActivityByVslVoy
 ///   GET /reports/accounting/export-full-out.{pdf|xlsx}   TMS.Accounting.ExportFullOut
 ///   GET /reports/accounting/monitoring-day.{pdf|xlsx}   TMS.Accounting.MonitoringDay
+///   GET /reports/accounting/electricity-day.{pdf|xlsx}   TMS.Accounting.ElectricDay
+///   GET /reports/accounting/electricity-day-elc.{pdf|xlsx}   TMS.Accounting.ElectricDay_ELC
+///   GET /reports/accounting/electricity-day-precool.{pdf|xlsx}   TMS.Accounting.ElectricDay_PRECOOL
+///   GET /reports/accounting/electricity-day-pti.{pdf|xlsx}   TMS.Accounting.ElectricDay_PTI
 ///
 /// The User and Liner listings take Vector's date AND time range (dateFrom/dateTo as local date-times, both
 /// inclusive); a dateTo with no time means the whole of that day.
@@ -70,6 +74,18 @@ internal static class AccountingReportEndpoints
         reports.MapGet("/monitoring-day.{format}", MonitoringDayAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Monitoring (Day) (Vector MonitoringDay): monitoring charges for reefer containers, as PDF or Excel")
             .WithDescription("No dates: all of the depot's history, as the RDL. agentCode = the shipping line; bookingType IMPORT/EXPORT/REPO/INTERNAL; vesselCode; voyageNo.");
+        reports.MapGet("/electricity-day.{format}", ElectricDayAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Electricity Day (Vector ElectricDay): PTI, pre-cool and electricity of reefer boxes gated out, as PDF or Excel")
+            .WithDescription("Reefer boxes gated out (empty or full) in dateFrom..dateTo. agentCode = the shipping line; vesselCode; voyageNo; bookingType; orderType.");
+        reports.MapGet("/electricity-day-elc.{format}", ElectricDayElcAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Electricity Day (ELEC) (Vector ElectricDay_ELC): electricity of reefer boxes gated out full, as PDF or Excel")
+            .WithDescription("Reefer boxes gated out full in dateFrom..dateTo that came in full. agentCode; vesselCode; voyageNo; bookingType; orderType.");
+        reports.MapGet("/electricity-day-precool.{format}", ElectricDayPreCoolAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Electricity Day (PRE-COOL) (Vector ElectricDay_PRECOOL): pre-cool charges of reefer boxes, as PDF or Excel")
+            .WithDescription("An EXPORT box's empty gate-out, or any other box's full gate-in, in dateFrom..dateTo; boxes charged pre-cool. agentCode; vesselCode; voyageNo.");
+        reports.MapGet("/electricity-day-pti.{format}", ElectricDayPtiAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("Electricity Day (PTI) (Vector ElectricDay_PTI): PTI charges of reefer boxes gated out, as PDF or Excel")
+            .WithDescription("Reefer boxes gated out (empty or full) in dateFrom..dateTo. agentCode; vesselCode; voyageNo.");
         reports.MapGet("/lift-off-washing.{format}", LiftOffWashingAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("Lift Off - Washing (Vector TMS.Accounting.LiftOffWashing): each container moved and its lift-off and washing charges, as PDF or Excel")
             .WithDescription("movementCode defaults to MTY_IN (Vector's MTY IN); agentCode = the shipping line; size/type as \"20\"/\"GP\".");
@@ -294,4 +310,56 @@ internal static class AccountingReportEndpoints
         return File(await OperationChargeReports.MonitoringDayAsync(db, tos, booked, master, context!,
             Clean(agentCode), type, Clean(vesselCode), Clean(voyageNo), ct), format);
     }
+
+    /// <summary>The four ElectricDay reports: the shared checks, the reefer lines, then the report's own layout.</summary>
+    private static async Task<IResult> ReeferAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId, DateOnly? dateFrom, DateOnly? dateTo, string? agentCode, string? vesselCode, string? voyageNo,
+        string? bookingType, string? orderType, ReeferReports.Driver driver,
+        Func<AccountingReportContext, IReadOnlyList<ReeferReports.ReeferLine>, TabularReport> layout)
+    {
+        static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        var type = Clean(bookingType)?.ToUpperInvariant();
+        if (type is not null && !BookingTypes.Contains(type))
+            return RevenueSupport.Invalid("bookingType", "IMPORT, EXPORT, REPO or INTERNAL.");
+        var (context, refused) = await ContextAsync(format, branchId, dateFrom, dateTo, calendar, master, users, caller, scope, ct);
+        if (refused is not null) return refused;
+
+        var lines = await ReeferReports.LinesAsync(db, gate, booked, tos, master, context!, driver,
+            new ReeferReports.Filter(Clean(agentCode), Clean(vesselCode), Clean(voyageNo), type, Clean(orderType)), ct);
+        return File(layout(context!, lines), format);
+    }
+
+    private static Task<IResult> ElectricDayAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null, string? bookingType = null, string? orderType = null) =>
+        ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            agentCode, vesselCode, voyageNo, bookingType, orderType, ReeferReports.Driver.GateOut, ReeferReports.ElectricDay);
+
+    private static Task<IResult> ElectricDayElcAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null, string? bookingType = null, string? orderType = null) =>
+        ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            agentCode, vesselCode, voyageNo, bookingType, orderType, ReeferReports.Driver.FullOut, ReeferReports.ElectricDayElc);
+
+    private static Task<IResult> ElectricDayPreCoolAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null) =>
+        ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            agentCode, vesselCode, voyageNo, null, null, ReeferReports.Driver.PreCool, ReeferReports.ElectricDayPreCool);
+
+    private static Task<IResult> ElectricDayPtiAsync(
+        string format, RevenueDbContext db, ITosGateMoves gate, ITosBookedBoxes booked, ITosBookingHeaders tos, BranchCalendar calendar,
+        IMasterDataReferences master, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null) =>
+        ReeferAsync(format, db, gate, booked, tos, calendar, master, users, caller, scope, ct, branchId, dateFrom, dateTo,
+            agentCode, vesselCode, voyageNo, null, null, ReeferReports.Driver.GateOut, ReeferReports.ElectricDayPti);
 }

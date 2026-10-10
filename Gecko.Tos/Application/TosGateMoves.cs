@@ -25,7 +25,7 @@ internal sealed class TosGateMoves(TosDbContext db) : ITosGateMoves
             .OrderBy(r => r.g.TransactionAt)
             .Select(r => new TosGateMove(r.g.GateTransactionId, r.g.EirNo, r.g.TransactionAt, r.g.MovementCode, r.g.FullEmpty,
                 r.g.ContainerNo, r.g.EquipmentTypeCode, r.g.BookingId, r.g.BookingContainerId, r.g.LinePartyCode,
-                r.BookingTypeCode, r.OrderTypeCode, r.g.TruckVisitId))
+                r.BookingTypeCode, r.OrderTypeCode, r.g.TruckVisitId, r.g.Direction))
             .ToListAsync(ct);
     }
 }

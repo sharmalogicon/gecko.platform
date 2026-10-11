@@ -365,4 +365,20 @@ public sealed class OperationReportApiTests(TosApiFactory api)
         Assert.Equal("Invoice No", rows[^1][9]);
         await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
     }
+
+    [Theory]
+    [InlineData("pti", "PTI REPORT", "Item", "Damage Code", 8)]
+    [InlineData("container-repair-summary", "ContainerRepairSummaryList", "TOTAL", "0.00", 8)]
+    public async Task Mr_reports_print_their_heading_and_columns_until_gecko_keeps_work_orders(
+        string report, string title, string lastRowFirst, string lastRowCell, int cell)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var url = $"{Reports}/{report}.xlsx?branchId={SctLcb01}&dateFrom=2026-10-01&dateTo=2026-10-10";
+
+        var rows = await SheetAsync(client, url, ct);
+        Assert.Contains(rows, r => r[0] == title);
+        Assert.Equal((lastRowFirst, lastRowCell), (rows[^1][0], rows[^1][cell]));
+        await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+    }
 }

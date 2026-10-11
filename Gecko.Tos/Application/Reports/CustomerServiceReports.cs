@@ -399,8 +399,8 @@ internal static class CustomerServiceReports
     /// The desktop's "Pending Booking Summary" (Report.usp_CustomerService_PendingBookingSummary): the depot's EXPORT bookings
     /// whose vessel's ETA falls on the days asked for (Vector's "ETD" is the ETA everywhere — labels, parameters, filter), a
     /// block per agent (the booking's agent, else its line) / vessel / ETA with C/T YARD and C/T PORT (the call's effective
-    /// YARD_DRY / PORT_DRY cut-offs for the booking's line at this depot, printed unformatted as Vector's en-US
-    /// M/d/yyyy h:mm:ss tt), then a row per customer (whatever its roles) + booking — customers ascending — and the block's
+    /// YARD_DRY / PORT_DRY cut-offs for the booking's line at this depot, printed dd/MM/yyyy HH:mm — the RDL left them unformatted (Vector's en-US
+    /// M/d/yyyy h:mm:ss tt), as the other reports print their cut-offs), then a row per customer (whatever its roles) + booking — customers ascending — and the block's
     /// Total row; no grand total, as on the RDL. The counts are the boxes' planned steps (Gecko's movement plans, Vector's
     /// BookingMovement): Booking Empty = the empty gate-out steps, Pending Empty Out = those still pending, Booking Full =
     /// the full gate-in steps, PENDING FULL IN = those pending, Pending Full Out = full gate-ins done less full gate-outs done
@@ -495,7 +495,7 @@ internal static class CustomerServiceReports
         }
 
         string Cutoff(IReadOnlyList<EffectiveCutoff> list, string kind) =>
-            list.FirstOrDefault(c => c.Kind == kind) is { } c ? Stamp(Local(h.Branch, c.At), "M/d/yyyy h:mm:ss tt") : "";
+            list.FirstOrDefault(c => c.Kind == kind) is { } c ? Stamp(Local(h.Branch, c.At), "dd/MM/yyyy HH:mm") : "";
         string? Customer(string? code) => code is null ? null : parties.GetValueOrDefault(code)?.Name;
 
         string[] sizes = ["20'", "40'", "45'", "20'R", "40'R", "40'RH"];

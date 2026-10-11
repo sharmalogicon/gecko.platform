@@ -24,6 +24,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/outbound-container-storage-activity.{pdf|xlsx}   TMS.Operation.OutBound.ContainerStorageActivity
 ///   GET /reports/daily-import-full-in.{pdf|xlsx}   TMS.Operation.InBound.DailyImportFullIn
 ///   GET /reports/empty-out.{pdf|xlsx}   TMS.Operation.InBound.EmptyOut ("EMPTY OUT" and "INBOUND Empty Out")
+///   GET /reports/import-export-summary.{pdf|xlsx}   TMS.Operation.InBound.ImportExportSummary
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -50,6 +51,13 @@ internal static class ListReportEndpoints
         reports.MapOperation("/empty-out.{format}",
                 r => InboundReports.EmptyOutAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
             .WithSummary("INBOUND EMPTY OUT REPORT (Vector InBound.EmptyOut): every empty gate-out in the days asked for, and its size count");
+        reports.MapOperation("/import-export-summary.{format}",
+                r => InboundReports.ImportExportSummaryAsync(r.Db, r.Master, r.Heading, r.Q.Year!.Value, r.Q.MovementCode, r.Q.BookingType, r.Ct),
+                range: false, check: q =>
+                    q.Year is not (>= 2000 and <= 2100) ? TosSupport.Invalid("year", "Which year?")
+                    : q.MovementCode is { Length: > 0 } m && OperationReportKit.Movement(m) is null
+                        ? TosSupport.Invalid("movementCode", "FULL IN, MTY IN, FULL OUT or MTY OUT.") : null)
+            .WithSummary("SUMMARY (IMPORT - EXPORT) (Vector InBound.ImportExportSummary): a year's moves per agent and month, CONT and TEU");
 
         return tos;
     }
@@ -110,13 +118,14 @@ internal static class ListReportEndpoints
     /// required and checked unless <paramref name="range"/> is false, then <paramref name="build"/>'s report as PDF or Excel.
     /// </summary>
     private static RouteHandlerBuilder MapOperation(this RouteGroupBuilder reports, string pattern,
-        Func<OperationReportCall, Task<TabularReport>> build, bool range = true) =>
+        Func<OperationReportCall, Task<TabularReport>> build, bool range = true, Func<OperationReportQuery, IResult?>? check = null) =>
         reports.MapGet(pattern, async (string format, [AsParameters] OperationReportQuery q, TosDbContext db, IMasterDataReferences master,
             BranchClock clock, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct) =>
         {
             var (context, refused) = await ContextAsync(q.BranchId, format, clock, users, caller, scope, ct);
             if (refused is not null) return refused;
             if (range && InvalidRange(q.DateFrom, q.DateTo) is { } bad) return bad;
+            if (check?.Invoke(q) is { } wrong) return wrong;
             return File(await build(new OperationReportCall(db, master, context!.Heading, q, q.DateFrom ?? default, q.DateTo ?? default, ct)), format);
         }).RequireBranchPermission(TosPermissions.GateView);
 

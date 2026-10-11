@@ -239,4 +239,54 @@ internal static class InboundReports
             PageLabel: null,
             After: [summary]);
     }
+
+    // ── TMS.Operation.InBound.ImportExportSummary ──
+
+    /// <summary>
+    /// SUMMARY (IMPORT - EXPORT) (Report.usp_InBound_ImportExportSummary): one year's moves of one kind (Vector's movement
+    /// name, FULL IN by default) at the depot, optionally of one booking type, as an agent × month matrix of CONT (moves) and
+    /// TEU (20' = 1, every other size 2 — the RDL's rule, not master data's 2.25 for 45'), with TOTAL column and Total row.
+    /// The title stays "SUMMARY GATE IN CONTAINER" whatever is asked, as on Vector; zero prints blank in the agent rows.
+    /// </summary>
+    public static async Task<TabularReport> ImportExportSummaryAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, int year, string? movement, string? bookingType, CancellationToken ct)
+    {
+        var (direction, load) = Movement(movement ?? "FULL IN") ?? ("IN", "FULL");
+        var query = Moves(db, h.Branch, new DateOnly(year, 1, 1), new DateOnly(year, 12, 31))
+            .Where(m => m.Direction == direction && m.FullEmpty == load);
+        if (Clean(bookingType) is { } type) query = query.Where(m => m.BookingTypeCode == type);
+        var moves = await query.ToListAsync(ct);
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        int Teu(Move m) => SizeType(types, m.EquipmentTypeCode).Size == "20" ? 1 : 2;
+        int Month(Move m) => Local(h.Branch, m.At).Month;
+        object?[] Cells(IReadOnlyCollection<Move> set) =>
+        [
+            .. Enumerable.Range(1, 12).SelectMany(month => new object?[] { set.Count(m => Month(m) == month), set.Where(m => Month(m) == month).Sum(Teu) }),
+            set.Count, set.Sum(Teu),
+        ];
+
+        var rows = moves.GroupBy(m => m.LineCode).OrderBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => new TabularRow([g.Key, .. Cells(g.ToList())])).ToList();
+        // The RDL's Total row has no format: its zeros print.
+        rows.Add(new TabularRow(["Total", .. Cells(moves).Select(c => (object?)c?.ToString())], RowKind.Subtotal));
+
+        double[] widths = [1.19944, 1.16828, 1.17709, 1.12417, 1.0977, 1.24354, 1.12417, 1.11187, 1.15063, 1.15063, 1.12417, 1.09771,
+            1.15125, 1.17709, 1.12416, 1.07125, 1.60042, 1.12479, 1.15063, 1.09771, 1.12416, 1.04479, 1.41521, 1.09771, 1.0977, 1.15063];
+        return new TabularReport(
+            FileName: $"ImportExportSummary_{year}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading: [new(h.BranchName, 10, Bold: true), new("<< SUMMARY GATE IN CONTAINER >>", 10, Bold: true), new($"Year:{year}", 10, Bold: true)],
+            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: [new(1.94438), .. widths.Select(w => new TabularColumn(w, "0;(0);\"\"", CellAlign.Center))],
+            HeaderRows:
+            [
+                [new("AGENT", RowSpan: 2), .. Months.Append("TOTAL").Select(m => new HeaderCell(m, ColSpan: 2))],
+                [.. Enumerable.Range(0, 13).SelectMany(_ => new[] { new HeaderCell("CONT"), new HeaderCell("TEU") })],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#");
+    }
 }

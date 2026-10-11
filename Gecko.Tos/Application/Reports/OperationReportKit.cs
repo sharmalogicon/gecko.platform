@@ -47,6 +47,22 @@ internal static class OperationReportKit
     /// </summary>
     public static string ShipmentType(string orderTypeCode) => NotFcl.GetValueOrDefault(orderTypeCode) ?? Fcl;
 
+    /// <summary>
+    /// Vector's four movement names (the Movement combo: FULL IN, MTY IN, FULL OUT, MTY OUT; underscores accepted) as Gecko's
+    /// direction and full/empty — what selects a move here, since movement codes differ by tenant. Null for anything else.
+    /// </summary>
+    public static (string Direction, string FullEmpty)? Movement(string? name) =>
+        name?.Trim().Replace('_', ' ').ToUpperInvariant() switch
+        {
+            "FULL IN" => ("IN", "FULL"),
+            "MTY IN" => ("IN", "EMPTY"),
+            "FULL OUT" => ("OUT", "FULL"),
+            "MTY OUT" => ("OUT", "EMPTY"),
+            _ => null,
+        };
+
+    public static readonly string[] Months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
     public static string Day(DateOnly? day, string format = "dd-MM-yyyy") => day?.ToString(format, CultureInfo.InvariantCulture) ?? "";
 
     /// <summary>A depot-local day, or null.</summary>

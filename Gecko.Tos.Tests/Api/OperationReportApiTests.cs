@@ -255,4 +255,38 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Import_export_summary_counts_a_full_gate_in_under_its_agent_and_month()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/import-export-summary.xlsx?branchId={SctLcb01}&year={day.Year}&bookingType=IMPORT";
+        int Cell(string[]? row, int i) => row is null || row[i].Length == 0 ? 0 : int.Parse(row[i]);
+        var (cont, teu) = (1 + (day.Month - 1) * 2, 2 + (day.Month - 1) * 2);
+        try
+        {
+            var before = (await SheetAsync(client, url, ct)).FirstOrDefault(r => r[0] == "MAEU");
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< SUMMARY GATE IN CONTAINER >>");
+            Assert.Contains(rows, r => r[0] == "AGENT" && r[1] == "JAN" && r[25] == "TOTAL");
+            Assert.Contains(rows, r => r[1] == "CONT" && r[2] == "TEU");
+            var after = rows.Single(r => r[0] == "MAEU");
+            Assert.Equal((1, 1, 1, 1), (Cell(after, cont) - Cell(before, cont), Cell(after, teu) - Cell(before, teu),
+                Cell(after, 25) - Cell(before, 25), Cell(after, 26) - Cell(before, 26)));
+            Assert.Contains(rows, r => r[0] == "Total");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+            Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync($"{url}&movementCode=SOMETIMES", ct)).StatusCode);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

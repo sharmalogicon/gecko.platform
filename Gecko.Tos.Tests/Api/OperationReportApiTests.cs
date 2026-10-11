@@ -456,4 +456,33 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Stuffing_unstuffing_lists_the_full_gate_in_with_its_booking_dates()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/stuffing-unstuffing.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&bookingBlNo={carrierRef}&bookingType=IMPORT";
+        try
+        {
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "เปลียนชื่อ (IMP UNSTUFFING)");
+            Assert.Contains(rows, r => r[0] == "Item" && r[4] == "Empty" && r[6] == "Full" && r[15] == "Remarks");
+            var row = Assert.Single(rows, r => r[1] == box);
+            Assert.Equal(["1", box, "20GP", "FCL", "", "", day.ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture), ""], row[..8]);
+            Assert.Equal([$"ZZ-{box[^4..]}", carrierRef, day.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), "/"], row[8..12]);
+            Assert.Equal(["Total", "1", "1"], rows.Single(r => r[0] == "Total")[..3]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

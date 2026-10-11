@@ -32,6 +32,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
 ///   GET /reports/stock-report.{pdf|xlsx}   TMS.Operation.OutBound.StockReport
+///   GET /reports/stuffing-unstuffing.{pdf|xlsx}   TMS.Operation.OutBound.StuffingUnstuffing
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -83,6 +84,10 @@ internal static class ListReportEndpoints
         reports.MapOperation("/stock-report.{format}",
                 r => OutboundReports.StockReportAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
             .WithSummary("STOCK REPORT (Vector OutBound.StockReport): empty releases to export bookings with the box's in/out dates");
+        reports.MapOperation("/stuffing-unstuffing.{format}",
+                r => OutboundReports.StuffingUnstuffingAsync(r.Db, r.Master, r.Heading, r.From, r.To,
+                    new StuffingFilter(r.Q.AgentCode, r.Q.CustomerCode, r.Q.BookingBlNo, r.Q.VesselCode, r.Q.VoyageNo, r.Q.BookingType, r.Q.OrderType), r.Ct))
+            .WithSummary("Stuffing - UnStuffing (Vector OutBound.StuffingUnstuffing): full gate-ins of booked boxes with their booking dates");
 
         return tos;
     }

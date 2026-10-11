@@ -212,4 +212,119 @@ internal static class OutboundReports
             Rows: rows,
             PageLabel: "Page No#");
     }
+
+    // ── TMS.Operation.OutBound.StuffingUnstuffing ──
+
+    /// <summary>
+    /// The desktop's "Stuffing - UnStuffing" (Report.usp_OubBound_ContainerInOut): a line per full gate-in of a booked box on
+    /// the depot days asked for, numbered in container order, with the shipment type as Status (Vector's per order type), the
+    /// booked box's empty / full in and out, its agent seal (declared, else the one on this gate-in), the stuff/unstuff date
+    /// (its first full in), vessel/voyage, ETA, loading port, the customer and, as Remarks, this gate-in's remark (Vector's
+    /// CY-direct remark, which Gecko does not keep). The summary prints its Total row only, as the RDL hid the agent rows;
+    /// its columns run by size then type.
+    /// </summary>
+    public static async Task<TabularReport> StuffingUnstuffingAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to, StuffingFilter f, CancellationToken ct)
+    {
+        var query = InboundReports.Moves(db, h.Branch, from, to).Where(m => m.Direction == GateRules.In && m.FullEmpty == GateRules.Full);
+        if (Clean(f.AgentCode) is { } agent) query = query.Where(m => m.LineCode == agent);
+        if (Clean(f.CustomerCode) is { } customer) query = query.Where(m => m.CustomerCode == customer);
+        if (f.BookingBlNo?.Trim() is { Length: > 0 } bl) query = query.Where(m => m.CarrierRef == bl || m.CustomerRef == bl);
+        if (Clean(f.VesselCode) is { } vessel) query = query.Where(m => m.VesselCode == vessel);
+        if (Clean(f.VoyageNo) is { } voyage) query = query.Where(m => m.VoyageIn == voyage || m.VoyageOut == voyage);
+        if (Clean(f.BookingType) is { } type) query = query.Where(m => m.BookingTypeCode == type);
+        if (Clean(f.OrderType) is { } order) query = query.Where(m => m.OrderTypeCode == order);
+        var moves = (await query.ToListAsync(ct)).OrderBy(m => m.ContainerNo, StringComparer.Ordinal).ThenBy(m => m.At).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(moves.Select(m => m.CustomerCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(moves.Select(m => m.VesselCode).OfType<string>().Distinct(), ct);
+
+        var boxes = moves.Select(m => m.BookingContainerId).Distinct().ToList();
+        var declared = new Dictionary<Guid, string?>();
+        var others = new List<(Guid Box, string Direction, string FullEmpty, DateTimeOffset At)>();
+        foreach (var slice in boxes.Chunk(2000))
+        {
+            foreach (var x in await db.BookingContainers.AsNoTracking().Where(b => slice.Contains(b.BookingContainerId))
+                         .Select(b => new { b.BookingContainerId, b.DeclaredSealNo }).ToListAsync(ct))
+                declared[x.BookingContainerId] = x.DeclaredSealNo;
+            others.AddRange((await db.GateTransactions.AsNoTracking()
+                    .Where(g => slice.Contains(g.BookingContainerId) && g.Status == "COMPLETED" && g.DeletedAt == null)
+                    .Select(g => new { g.BookingContainerId, g.Direction, g.FullEmpty, g.TransactionAt }).ToListAsync(ct))
+                .Select(g => (g.BookingContainerId, g.Direction, g.FullEmpty, g.TransactionAt)));
+        }
+        var byBox = others.ToLookup(o => o.Box);
+        DateOnly? When(Guid box, string direction, string load, bool first)
+        {
+            var set = byBox[box].Where(o => o.Direction == direction && o.FullEmpty == load).Select(o => o.At).ToList();
+            return set.Count == 0 ? null : LocalDay(h.Branch, first ? set.Min() : set.Max());
+        }
+        var seals = new List<(Guid Move, DateTimeOffset At, string SealNo, string SealType)>();
+        foreach (var slice in moves.Select(m => m.GateTransactionId).Chunk(2000))
+            seals.AddRange((await db.GateTransactionSeals.AsNoTracking().Where(s => slice.Contains(s.GateTransactionId) && s.DeletedAt == null)
+                    .Select(s => new { s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType }).ToListAsync(ct))
+                .Select(s => (s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType)));
+        var sealsByMove = seals.Where(s => IsAgentSeal(s.SealType)).OrderBy(s => s.At).ToLookup(s => s.Move, s => s.SealNo);
+        string SizeOf(InboundReports.Move m)
+        {
+            var (size, kind) = SizeType(types, m.EquipmentTypeCode);
+            return $"{size}{kind}";
+        }
+
+        var rows = moves.Select((m, i) =>
+        {
+            var party = m.CustomerCode is { } c ? parties.GetValueOrDefault(c) : null;
+            var vesselName = m.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName ?? v : "";
+            var fullIn = When(m.BookingContainerId, GateRules.In, GateRules.Full, true);
+            return new TabularRow([i + 1, m.ContainerNo, SizeOf(m), ShipmentType(m.OrderTypeCode),
+                When(m.BookingContainerId, GateRules.In, GateRules.Empty, true), When(m.BookingContainerId, GateRules.Out, GateRules.Empty, false),
+                fullIn, When(m.BookingContainerId, GateRules.Out, GateRules.Full, false),
+                declared.GetValueOrDefault(m.BookingContainerId) ?? sealsByMove[m.GateTransactionId].FirstOrDefault(), m.BookingBlNo,
+                Day(fullIn, "yyyy-MM-dd"), $"{vesselName}/{m.Voyage}", Day(LocalDay(h.Branch, m.Eta), "yyyy-MM-dd"), m.PolPortCode,
+                party is { IsCustomer: true } ? party.Name : "", m.Remarks]);
+        }).ToList();
+
+        var sizes = moves.Select(SizeOf).Distinct().Select(s => (Label: s, Order: SizeType(types, moves.First(m => SizeOf(m) == s).EquipmentTypeCode)))
+            .OrderBy(s => s.Order.Size, StringComparer.Ordinal).ThenBy(s => s.Order.Type, StringComparer.Ordinal).Select(s => s.Label).ToList();
+        var summary = new TabularBlock("Summary",
+            [new TabularColumn(2.5), .. sizes.Select(_ => new TabularColumn(1.653, null, CellAlign.Center)), new TabularColumn(2.5, null, CellAlign.Center)],
+            [[new HeaderCell("Container"), .. sizes.Select(s => new HeaderCell(s)), new HeaderCell("Total")]],
+            [new TabularRow(["Total", .. sizes.Select(s => (object?)moves.Count(m => SizeOf(m) == s)), moves.Count], RowKind.Total)]);
+
+        TabularColumn Col(double mm, string? format = null, CellAlign align = CellAlign.Left) => new(mm / 10, format, align);
+        TabularColumn Date(double mm) => Col(mm, "dd-MM-yyyy", CellAlign.Center);
+        return new TabularReport(
+            FileName: $"StuffingUnstuffing_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 1.27,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true),
+                new(Clean(f.BookingType) == "IMPORT" ? "เปลียนชื่อ (IMP UNSTUFFING)" : "(STUFFING EXP CY/CY-IN  และ CY-IN (NON-NOMINATING)", 10, Bold: true),
+                new($"Gate In date from: {Day(from, "dd/MM/yyyy")} To:{Day(to, "dd/MM/yyyy")}"), new($"Agent: {Clean(f.AgentCode)}"),
+            ],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {h.PrintedAt:dd/MM/yyyy HH.mm}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                Col(11.72987, null, CellAlign.Center), Col(25), Col(11.41805, null, CellAlign.Center), Col(17.32708, null, CellAlign.Center),
+                Date(22.35417), Date(20.76667), Date(22.35417), Date(22.88333), Col(25.4), Col(32.40833),
+                Col(25.52917, null, CellAlign.Center), Col(35.05417), Col(25.26458, null, CellAlign.Center), Col(25), Col(37.85125), Col(30.04473),
+            ],
+            HeaderRows:
+            [
+                [new("Item", RowSpan: 2), new("Container No", RowSpan: 2), new("Size", RowSpan: 2), new("Status", RowSpan: 2),
+                 new("Empty", ColSpan: 2), new("Full", ColSpan: 2), new("Agent Seal", RowSpan: 2), new("Booking BLNo", RowSpan: 2),
+                 new("Stuff/UnStuff Date", RowSpan: 2), new("Vessel/Voyage", RowSpan: 2), new("ETA/ETD", RowSpan: 2),
+                 new("Loading Port", RowSpan: 2), new("Shipper Consignee", RowSpan: 2), new("Remarks", RowSpan: 2)],
+                [new("In Date"), new("Out Date"), new("In Date"), new("Out Date")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#",
+            After: [summary]);
+    }
 }
+
+/// <summary>Stuffing - UnStuffing's filters, Vector's (BookingBLNo matches the carrier or customer reference).</summary>
+internal sealed record StuffingFilter(
+    string? AgentCode, string? CustomerCode, string? BookingBlNo, string? VesselCode, string? VoyageNo, string? BookingType, string? OrderType);

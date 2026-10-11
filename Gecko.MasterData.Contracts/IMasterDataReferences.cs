@@ -266,7 +266,9 @@ public sealed record HoldRef(
     string BlockingScope, string ReleaseAuthority, byte Priority, string? DisplayColorHex, bool IsActive,
     string? AutoApplyOnEvent);
 
-public sealed record CommodityRef(Guid CommodityId, string CommodityCode, bool IsDangerous, bool IsTemperatureControlled, bool IsActive);
+/// <param name="Description">The commodity's English description (what Vector's shore-pass forms printed as the goods).</param>
+public sealed record CommodityRef(Guid CommodityId, string CommodityCode, bool IsDangerous, bool IsTemperatureControlled, bool IsActive,
+    string? Description = null);
 
 /// <summary>Setting keys owned by other modules but stored in master data.</summary>
 public static class RevenueSettingKeys

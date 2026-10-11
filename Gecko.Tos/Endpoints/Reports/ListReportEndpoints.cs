@@ -34,6 +34,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/stock-report.{pdf|xlsx}   TMS.Operation.OutBound.StockReport
 ///   GET /reports/stuffing-unstuffing.{pdf|xlsx}   TMS.Operation.OutBound.StuffingUnstuffing
 ///   GET /reports/shore-pass-ect.{pdf|xlsx}   TMS.Operation.OutBound.ShorePassECT
+///   GET /reports/shore-pass-1.{pdf|xlsx}, -2, -3   TMS.Operation.OutBound.ShorePass1 / 2 / 3 (Evergreen B.2, LCMT, Kerry Siam)
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -93,6 +94,15 @@ internal static class ListReportEndpoints
                 r => OutboundReports.ShorePassEctAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.LoadingPort, r.Ct))
             .WithSummary("Shore Pass ECT (Vector OutBound.ShorePassECT): booked boxes by required date, with weight and destination")
             .WithDescription("dateFrom/dateTo: the boxes' required dates. loadingPort: the booking's port of loading.");
+        reports.MapOperation("/shore-pass-1.{format}",
+                r => ShorePassReports.EvergreenAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("Shore Pass #1 (Vector OutBound.ShorePass1): the full gate-ins on Evergreen's B.2 request form");
+        reports.MapOperation("/shore-pass-2.{format}",
+                r => ShorePassReports.LcmtAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("Shore Pass #2 (Vector OutBound.ShorePass2): the full gate-ins on LCMT's request form");
+        reports.MapOperation("/shore-pass-3.{format}",
+                r => ShorePassReports.KerryAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("Shore Pass #3 (Vector OutBound.ShorePass3): the full gate-ins on Kerry Siam Seaport's request form");
 
         return tos;
     }

@@ -252,7 +252,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(commodityCodes);
         return await db.Commodities.AsNoTracking()
             .Where(c => codes.Contains(c.CommodityCode))
-            .Select(c => new CommodityRef(c.CommodityId, c.CommodityCode, c.IsDangerous, c.IsTemperatureControlled, c.IsActive))
+            .Select(c => new CommodityRef(c.CommodityId, c.CommodityCode, c.IsDangerous, c.IsTemperatureControlled, c.IsActive, c.DescriptionEn))
             .ToDictionaryAsync(c => c.CommodityCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 

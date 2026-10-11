@@ -515,4 +515,45 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Shore_passes_1_2_3_list_the_full_gate_in_on_each_terminals_form()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        string Url(int form) => $"{Reports}/shore-pass-{form}.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU";
+        try
+        {
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var evergreen = await SheetAsync(client, Url(1), ct);
+            Assert.Contains(evergreen, r => r[0].StartsWith("บริษัท เอเวอร์กรีน", StringComparison.Ordinal));
+            var one = Assert.Single(evergreen, r => r[1] == box);
+            Assert.Equal(["20", "GP"], one[2..4]);
+            Assert.Equal($"ZZ-{box[^4..]}", one[5]);
+            Assert.Equal(carrierRef, one[12]);
+
+            var lcmt = await SheetAsync(client, Url(2), ct);
+            Assert.Contains(lcmt, r => r[0] == "LCMT  Company  Limited");
+            var two = Assert.Single(lcmt, r => r[1] == box);
+            Assert.Equal([carrierRef, "20", "GP"], two[2..5]);
+            Assert.Equal("CREDIT", two[9]);
+
+            var kerry = await SheetAsync(client, Url(3), ct);
+            Assert.Contains(kerry, r => r[0] == "KERRY SIAM SEAPORT LIMITED");
+            var three = Assert.Single(kerry, r => r[1] == box);
+            Assert.Equal(["20", "GP", "E"], three[2..5]);
+            Assert.Equal([carrierRef, $"ZZ-{box[^4..]}"], three[7..9]);
+
+            foreach (var form in new[] { 1, 2, 3 }) await PdfAsync(client, Url(form).Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using ClosedXML.Excel;
 using Gecko.Revenue.Endpoints.Charges;
 using Gecko.SharedKernel;
 using Gecko.Tos.Endpoints.Bookings;
@@ -102,6 +103,24 @@ public sealed class UnbilledOrdersApiTests(TosApiFactory api)
             var xlsx = await client.GetAsync($"{Unbilled}/orders.xlsx?branchId={SctLcb01}&carrierRef={carrierRef}", ct);
             Assert.Equal(HttpStatusCode.OK, xlsx.StatusCode);
             Assert.Equal("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx.Content.Headers.ContentType?.MediaType);
+
+            // Vector's UNBILLED ORDER CHARGES REPORT: a row per unbilled line, the RDL's 18 columns.
+            var report = await client.GetAsync($"{Unbilled}/charges.xlsx?branchId={SctLcb01}&carrierRef={carrierRef}", ct);
+            Assert.True(report.StatusCode == HttpStatusCode.OK, await report.Content.ReadAsStringAsync(ct));
+            using (var book = new XLWorkbook(new MemoryStream(await report.Content.ReadAsByteArrayAsync(ct))))
+            {
+                var sheet = book.Worksheet(1);
+                var rows = Enumerable.Range(1, sheet.LastRowUsed()!.RowNumber())
+                    .Select(r => Enumerable.Range(1, 18).Select(c => sheet.Cell(r, c).GetFormattedString()).ToArray()).ToList();
+                Assert.Contains(rows, r => r[0] == "<< UNBILLED ORDER CHARGES REPORT >>");
+                Assert.Contains(rows, r => r[0] == "Booking BLNo" && r[17] == "Payment To");
+                var row = Assert.Single(rows, r => r[8] == box && r[9] == "LIFTCR");
+                Assert.Equal([carrierRef, "GATE TEST", "FULL_OUT", "300.00", "1", "20", "GP", "CREDIT", "SHIPPER/CONSIGNEE"],
+                    [row[0], row[3], row[10], row[12], row[13], row[14], row[15], row[16], row[17]]);
+            }
+            var pdf = await client.GetAsync($"{Unbilled}/charges.pdf?branchId={SctLcb01}&carrierRef={carrierRef}", ct);
+            Assert.Equal("application/pdf", pdf.Content.Headers.ContentType?.MediaType);
+            Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($"{Unbilled}/charges.csv?branchId={SctLcb01}", ct)).StatusCode);
         }
         finally
         {

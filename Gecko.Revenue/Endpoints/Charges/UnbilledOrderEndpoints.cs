@@ -1,5 +1,8 @@
+using System.Globalization;
 using ClosedXML.Excel;
 using Gecko.Data;
+using Gecko.Data.Documents;
+using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.Revenue.Application;
 using Gecko.Revenue.Infrastructure.Persistence;
@@ -21,7 +24,8 @@ namespace Gecko.Revenue.Endpoints.Charges;
 /// the gate priced when the box moved (and cash lines a haulier's term put on credit). Cash is collected
 /// before the barrier, so a moved box owes no unpaid cash.
 ///
-/// Three reads, one filter set: the orders (top grid), their lines (bottom grid), and the printout (xlsx).
+/// Three reads, one filter set: the orders (top grid), their lines (bottom grid), and the printouts — the screen's
+/// workbook (orders.xlsx) and Vector's TMS.Billing.UnBilled.UnBilledOrderCharges report (charges.pdf / charges.xlsx).
 /// The booking's B/L, vessel, voyage and progress come from TOS (<see cref="ITosBookingHeaders"/>), its owner.
 /// </summary>
 internal static class UnbilledOrderEndpoints
@@ -38,7 +42,10 @@ internal static class UnbilledOrderEndpoints
         unbilled.MapGet("/lines", LinesAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("The unbilled lines of one or more orders (orderNo repeats), with the same filters");
         unbilled.MapGet("/orders.xlsx", ExportAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
-            .WithSummary("The unbilled orders and their lines as a workbook (Vector's Unbilled Order Charges report)");
+            .WithSummary("The unbilled orders and their lines as a workbook");
+        unbilled.MapGet("/charges.{format}", ChargesReportAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("UNBILLED ORDER CHARGES REPORT (Vector TMS.Billing.UnBilled.UnBilledOrderCharges): a row per unbilled line, as PDF or Excel")
+            .WithDescription("The same filters as /orders (Vector's Filter = progress).");
         return revenue;
     }
 
@@ -110,6 +117,71 @@ internal static class UnbilledOrderEndpoints
         book.SaveAs(stream);
         return TypedResults.File(stream.ToArray(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             $"unbilled-orders-{clock.GetUtcNow():yyyyMMdd-HHmm}.xlsx");
+    }
+
+    /// <summary>Vector's LookupCategory 'PaymentTo' descriptions, by Gecko's bill-to role.</summary>
+    private static readonly IReadOnlyDictionary<string, string> PaymentTo = new Dictionary<string, string>
+    {
+        ["AGENT"] = "AGENT", ["CUSTOMER"] = "SHIPPER/CONSIGNEE", ["FORWARDER"] = "FORWARDING AGENT", ["HAULIER"] = "HAULIER", ["LINE"] = "SHIPPING",
+    };
+
+    /// <summary>
+    /// TMS.Billing.UnBilled.UnBilledOrderCharges (Report.usp_UnbilledOrdersCharges): the branch, "&lt;&lt; UNBILLED ORDER CHARGES
+    /// REPORT &gt;&gt;", Print Date; a row per unbilled line in order-no order with the RDL's 18 columns; Page No. — A4 landscape.
+    /// Size/Type are the box's booked equipment type, Billing Unit lookup.billing_unit's name, Payment To Vector's words for the role.
+    /// </summary>
+    private static async Task<Results<FileContentHttpResult, ValidationProblem, ForbidHttpResult, NotFound>> ChargesReportAsync(
+        string format, [AsParameters] UnbilledFilter filter, RevenueDbContext db, ITosBookingHeaders tos, IMasterDataReferences master,
+        IUserDirectory users, BranchCalendar calendar, ICallerPermissions scope, CancellationToken ct)
+    {
+        if (format is not ("pdf" or "xlsx")) return TypedResults.NotFound();
+        var (found, problem) = await FindAsync(filter with { IncludeSettled = false }, db, tos, scope, ct);
+        if (problem is not null) return problem.Result is ValidationProblem v ? v : TypedResults.Forbid();
+
+        var lines = found!.Lines.OrderBy(l => found.Headers[l.BookingId!.Value].OrderNo, StringComparer.Ordinal)
+            .ThenBy(l => l.ContainerNo).ThenBy(l => l.ChargeCode).ToList();
+        var boxIds = lines.Select(l => l.BookingContainerId).OfType<Guid>().Distinct().ToList();
+        var boxTypes = await db.BookingPlanContainers.AsNoTracking().Where(b => boxIds.Contains(b.BookingContainerId))
+            .ToDictionaryAsync(b => b.BookingContainerId, b => b.EquipmentTypeCode, ct);
+        var typeCodes = boxTypes.Values.OfType<string>().Distinct().ToList();
+        var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
+        var units = await db.BillingUnits.AsNoTracking().ToDictionaryAsync(u => u.Code, u => u.DescriptionEn, ct);
+        var branchId = filter.BranchId!.Value;
+        var branchName = (await users.BranchNamesAsync([branchId], ct)).GetValueOrDefault(branchId)
+                         ?? (await calendar.BranchAsync(branchId, ct))?.BranchCode ?? "";
+        var printed = (await calendar.BranchAsync(branchId, ct)) is { } clock ? clock.Local(calendar.Now) : calendar.Now;
+
+        var rows = lines.Select(l =>
+        {
+            var h = found.Headers[l.BookingId!.Value];
+            var (size, type) = Application.Reports.OperationChargeReports.SizeType(types,
+                l.BookingContainerId is { } box ? boxTypes.GetValueOrDefault(box) : null);
+            return new TabularRow([h.CarrierRef, h.SubBlNo, h.BookingTypeCode, h.OrderTypeCode, h.AgentCode, h.CustomerCode, h.VesselCode,
+                h.Voyage, l.ContainerNo, l.ChargeCode, l.MovementCode,
+                l.BillingUnitCode is { } u ? units.GetValueOrDefault(u) ?? u : null,
+                l.UnitRate, l.Quantity / 1.000000000000000000000000000000000m, size, type, l.PaymentTermCode, PaymentTo.GetValueOrDefault(l.BillTo) ?? l.BillTo]);
+        }).ToList();
+
+        string[] headers = ["Booking BLNo", "Sub Booking BLNo", "Booking Type", "Order Type", "Agent Code", "Customer Code", "Vessel",
+            "Voyage No", "Container No", "Charge Code", "Movement Code", "Billing Unit", "Price", "Qty", "Size", "Type", "Payment Term", "Payment To"];
+        double[] widthsIn = [1.16667, 1, 0.73041, 0.84375, 0.63542, 0.92708, 0.46875, 0.56944, 0.79167, 1.30208, 0.80717, 0.63542, 0.51042,
+            0.32292, 0.34375, 0.36458, 0.625, 0.75];
+        var report = new TabularReport(
+            FileName: $"UnbilledOrderCharges_{branchName.Replace(' ', '_')}_{printed:yyyyMMdd-HHmm}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 1.0,
+            Heading: [new(branchName, 10, Bold: true), new("<< UNBILLED ORDER CHARGES REPORT >>", 10, Bold: true)],
+            HeadingRight: [new($"Print Date: {printed.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture)}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: widthsIn.Select((w, i) => new TabularColumn(w * 2.54, i == 12 ? "0.00" : null,
+                i is 12 or 13 ? CellAlign.Right : CellAlign.Left)).ToList(),
+            HeaderRows: [headers.Select(x => new HeaderCell(x)).ToList()],
+            Rows: rows,
+            PageLabel: "Page No.");
+        return format == "pdf"
+            ? TypedResults.File(report.Pdf(), TabularReport.PdfType, report.FileName + ".pdf")
+            : TypedResults.File(report.Xlsx(), TabularReport.XlsxType, report.FileName + ".xlsx");
     }
 
     // ── the one filter ─────────────────────────────────────────────────────
@@ -269,7 +341,7 @@ internal static class UnbilledOrderEndpoints
 /// Vector), COMPLETED (only boxes with no movement left), HALF_COMPLETED (orders with at least half their
 /// movements done). <see cref="From"/> / <see cref="To"/>: the day the charge was priced for (the move's date).
 /// </summary>
-public sealed class UnbilledFilter
+public sealed record UnbilledFilter
 {
     public Guid? BranchId { get; init; }
     public string? AgentCode { get; init; }

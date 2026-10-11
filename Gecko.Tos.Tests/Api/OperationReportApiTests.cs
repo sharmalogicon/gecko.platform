@@ -703,4 +703,37 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Truck_control_counts_the_full_gate_in_under_its_vessel_and_loading_port()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        try
+        {
+            var call = await ExportGatedInAsync(client, carrierRef, box, ct);
+            var etd = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(call.Etd, TimeZoneInfo.FindSystemTimeZoneById("Asia/Bangkok")).DateTime);
+            var url = $"{Reports}/truck-control.xlsx?branchId={SctLcb01}&dateFrom={etd:yyyy-MM-dd}&dateTo={etd:yyyy-MM-dd}&agentCode=ONEY";
+            int Cell(string[]? row, int i) => row is null || row[i].Length == 0 ? 0 : int.Parse(row[i]);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< Truck Control Report >>");
+            Assert.Contains(rows, r => r[0] == "Loading Port" && r[4] == "Dry" && r[10] == "Reefer" && r[18] == "QTY" && r[19] == "Full Gate In" && r[26] == "Full Gate Out");
+            var vesselRow = Assert.Single(rows, r => r[1] == "ONEY" && r[2] == "EASTERN PIONEER");
+            Assert.Equal("THLCH", vesselRow[0]);
+            Assert.True(Cell(vesselRow, 18) >= 1 && Cell(vesselRow, 19) >= 1, "QTY and Full Gate In 20' count the box");
+            Assert.Equal(Enumerable.Range(19, 6).Sum(i => Cell(vesselRow, i)), Cell(vesselRow, 25));   // In: the six sizes add up to Total
+            var total = rows.Single(r => r[1] == "Total");
+            Assert.Equal(vesselRow[18..33], total[18..33]);
+            Assert.Contains(rows, r => r[0] == "GrandTotal");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

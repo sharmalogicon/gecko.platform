@@ -399,6 +399,126 @@ internal static class OutboundReports
             Rows: rows,
             PageLabel: "Page No #");
     }
+
+    // ── TMS.Operation.OutBound.TruckControl ──
+
+    /// <summary>
+    /// &lt;&lt; Truck Control Report &gt;&gt; (Report.usp_OutBound_TruckControl): the EXPORT vessel calls whose ETD falls on the depot
+    /// days asked for (the screen's "ETD"; Vector filtered the schedule's ETA), a row per loading port + call + line: the
+    /// line's dry and reefer CFS / CY / port closings, terminal, ETD, QTY (boxes gated in full) and the full gate-ins and
+    /// gate-outs by 20' / 40' / 45' dry and 20'RF / 40'RH / 45'RH; each loading port's Total and the GrandTotal. Owner
+    /// 2026-10-11: the reefer columns count every reefer of the size, on rows and totals alike (the RDL's rows counted only RF
+    /// at 20' and RH at 40'), so the totals add up. Completed moves only; the gated box's own type. Terminal prints the code.
+    /// </summary>
+    public static async Task<TabularReport> TruckControlAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? vesselCode, string? voyageNo, CancellationToken ct)
+    {
+        var start = BranchClock.StartOf(h.Branch, from);
+        var end = BranchClock.StartOf(h.Branch, to.AddDays(1));
+        var query =
+            from b in db.Bookings.AsNoTracking()
+            where b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "EXPORT" && b.Status != "CANCELLED" && b.DeletedAt == null
+            join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId
+            where !c.IsCancelled && c.DeletedAt == null && c.Etd >= start && c.Etd < end
+            join l in db.VesselCallLines on b.VesselCallLineId equals l.VesselCallLineId into lines
+            from l in lines.DefaultIfEmpty()
+            select new
+            {
+                b.BookingId, b.PolPortCode, b.LinePartyCode, b.LinePartyId, c.VesselCallId, c.VesselCode, c.TerminalCode, c.Etd, c.Remarks,
+                Voyage = l != null && l.VoyageOut != null ? l.VoyageOut : c.OperatorVoyageOut ?? c.OperatorVoyageIn,
+            };
+        if (Clean(agentCode) is { } agent) query = query.Where(x => x.LinePartyCode == agent);
+        if (Clean(vesselCode) is { } vessel) query = query.Where(x => x.VesselCode == vessel);
+        if (Clean(voyageNo) is { } voyage) query = query.Where(x => x.Voyage == voyage);
+        var bookings = await query.ToListAsync(ct);
+
+        var ids = bookings.Select(b => b.BookingId).ToList();
+        var moves = new List<(Guid Booking, string Direction, string? Type)>();
+        foreach (var slice in ids.Chunk(2000))
+            moves.AddRange((await db.GateTransactions.AsNoTracking()
+                    .Where(g => slice.Contains(g.BookingId) && g.Status == "COMPLETED" && g.DeletedAt == null && g.FullEmpty == GateRules.Full)
+                    .Select(g => new { g.BookingId, g.Direction, g.EquipmentTypeCode }).ToListAsync(ct))
+                .Select(g => (g.BookingId, g.Direction, (string?)g.EquipmentTypeCode)));
+        var byBooking = moves.ToLookup(m => m.Booking);
+        var types = await TypesAsync(master, moves.Select(m => m.Type), ct);
+        var vessels = await master.VesselsAsync(bookings.Select(b => b.VesselCode).Distinct(), ct);
+
+        (string Size, bool Reefer)[] kinds = [("20", false), ("40", false), ("45", false), ("20", true), ("40", true), ("45", true)];
+        bool Is((string Size, bool Reefer) kind, string? type) =>
+            SizeType(types, type).Size == kind.Size && (type is { } c && types.GetValueOrDefault(c)?.IsReefer == true) == kind.Reefer;
+        object?[] Counts(IReadOnlyCollection<(Guid Booking, string Direction, string? Type)> set)
+        {
+            var cells = new List<object?> { set.Count(m => m.Direction == GateRules.In) };
+            foreach (var direction in new[] { GateRules.In, GateRules.Out })
+            {
+                var counts = kinds.Select(k => set.Count(m => m.Direction == direction && Is(k, m.Type))).ToList();
+                cells.AddRange(counts.Cast<object?>());
+                cells.Add(counts.Sum());
+            }
+            return [.. cells];
+        }
+
+        var rows = new List<TabularRow>();
+        foreach (var port in bookings.GroupBy(b => b.PolPortCode ?? "").OrderBy(g => g.Key, StringComparer.Ordinal))
+        {
+            var label = port.Key;
+            var groups = port.GroupBy(b => (b.VesselCallId, b.LinePartyCode, b.LinePartyId))
+                .OrderBy(g => g.First().Etd).ThenBy(g => vessels.GetValueOrDefault(g.First().VesselCode)?.VesselName, StringComparer.Ordinal)
+                .ThenBy(g => g.Key.LinePartyCode, StringComparer.Ordinal);
+            foreach (var call in groups)
+            {
+                var first = call.First();
+                var cutoffs = await CutoffLookup.EffectiveAsync(db, first.VesselCallId, first.LinePartyId, h.Branch.BranchId, ct);
+                object?[] Closing(string kind) =>
+                    cutoffs.FirstOrDefault(c => c.Kind == kind) is { } c ? [Local(h.Branch, c.At), Local(h.Branch, c.At)] : [null, null];
+                rows.Add(new TabularRow([label, call.Key.LinePartyCode, vessels.GetValueOrDefault(first.VesselCode)?.VesselName ?? first.VesselCode,
+                    first.Voyage, .. Closing("CFS_DRY"), .. Closing("YARD_DRY"), .. Closing("PORT_DRY"),
+                    .. Closing("CFS_REEFER"), .. Closing("YARD_REEFER"), .. Closing("PORT_REEFER"),
+                    first.TerminalCode, Local(h.Branch, first.Etd), .. Counts(call.SelectMany(b => byBooking[b.BookingId]).ToList()), first.Remarks]));
+                label = null;
+            }
+            rows.Add(new TabularRow([null, "Total", null, null, .. Enumerable.Repeat<object?>(null, 14),
+                .. Counts(port.SelectMany(b => byBooking[b.BookingId]).ToList()), null], RowKind.Subtotal));
+            rows.Add(new TabularRow([]));
+        }
+        rows.Add(new TabularRow(["GrandTotal", null, null, null, .. Enumerable.Repeat<object?>(null, 14), .. Counts(moves), null], RowKind.Total));
+
+        double[] mm = [25, 24.91179, 13.36344, 17.29181, 9.38959, 17.98251, 11.59165, 18.08278, 9.38959, 18.43264, 10.2271, 17.50347, 9.38959,
+            18.65, 9.34862, 20.49113, 24.64111, 11.77083, 10.7125, 10.7125, 10.7125, 10.7125, 13.40569, 11.46513, 10.97708, 11.24167, 10.7125,
+            10.7125, 10.7125, 10.97708, 10.97708, 11.50625, 11.50625, 68.39167];
+        // The closing columns alternate date and time (from the 5th); ETD prints date and time; the counts are centred.
+        // (The spec's width list lacked QTY's; it takes the count columns' 10.7mm.)
+        var columns = mm.Select((w, i) => new TabularColumn(w / 10,
+            i is >= 4 and <= 15 ? (i % 2 == 0 ? "dd/MM/yyyy" : "HH:mm") : i == 17 ? "dd/MM/yyyy HH:mm" : null,
+            i is 0 or 1 or 2 or 33 ? CellAlign.Left : CellAlign.Center)).ToList();
+        string[] closings = ["CFS CLOSING", "CY CLOSING", "LCB/CLOSING TIME"];
+        string[] counted = ["20'", "40'", "45'", "20'RF", "40'RH", "45'RH", "Total"];
+        return new TabularReport(
+            FileName: $"TruckControl_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 0.5,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("<< Truck Control Report >>", 10, Bold: true),
+                new($"From ETD: {Day(from, "dd/MM/yyyy")}   To ETD: {Day(to, "dd/MM/yyyy")}"),
+            ],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {Stamp(h.PrintedAt, "dd/MM/yyyy")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: columns,
+            HeaderRows:
+            [
+                [new("Loading Port", RowSpan: 3), new("AGENT", RowSpan: 3), new("VESSEL NAME ", RowSpan: 3), new(" VOY", RowSpan: 3),
+                 new("Dry", ColSpan: 6), new("Reefer", ColSpan: 6), new("Terminal", RowSpan: 3), new("ETD DATE", RowSpan: 3), new("QTY", RowSpan: 3),
+                 new("Full Gate In", ColSpan: 7), new("Full Gate Out", ColSpan: 7), new("Remarks", RowSpan: 3)],
+                [.. closings.Concat(closings).Select(c => new HeaderCell(c, ColSpan: 2)),
+                 .. counted.Select(c => new HeaderCell(c, RowSpan: 2)), .. counted.Select(c => new HeaderCell(c, RowSpan: 2))],
+                [.. Enumerable.Range(0, 6).SelectMany(_ => new[] { new HeaderCell("DATE"), new HeaderCell("TIME") })],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#");
+    }
 }
 
 /// <summary>Stuffing - UnStuffing's filters, Vector's (BookingBLNo matches the carrier or customer reference).</summary>

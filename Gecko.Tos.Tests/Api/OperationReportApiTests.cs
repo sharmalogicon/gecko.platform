@@ -28,7 +28,8 @@ public sealed class OperationReportApiTests(TosApiFactory api)
     }
 
     /// <summary>An EXP CY/CY booking on EASTPIONEER-069S (a call carrying ONEY) with one 20GP box, gated in full.</summary>
-    private static async Task<VesselCallSummaryResponse> ExportGatedInAsync(HttpClient client, string carrierRef, string box, CancellationToken ct)
+    private static async Task<VesselCallSummaryResponse> ExportGatedInAsync(HttpClient client, string carrierRef, string box, CancellationToken ct,
+        DateOnly? requiredDate = null)
     {
         var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>("/api/tos/vessel-calls?pageSize=200", ct))!
             .Items.Single(c => c.CallRef == "EASTPIONEER-069S");
@@ -38,7 +39,7 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             vesselCallId = call.VesselCallId, polPortCode = "THLCH", podPortCode = "SGSIN",
             validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
             requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
-            containers = new object[] { new { containerNo = box } },
+            containers = new object[] { new { containerNo = box, requiredDate } },
         }, ct);
         Assert.True(booked.StatusCode == HttpStatusCode.Created, $"booking returned {(int)booked.StatusCode}: {await booked.Content.ReadAsStringAsync(ct)}");
         // The empty pick-up (MTY_OUT, step 1) is taken as done: the box comes back full.
@@ -477,6 +478,35 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             Assert.Equal(["1", box, "20GP", "FCL", "", "", day.ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture), ""], row[..8]);
             Assert.Equal([$"ZZ-{box[^4..]}", carrierRef, day.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), "/"], row[8..12]);
             Assert.Equal(["Total", "1", "1"], rows.Single(r => r[0] == "Total")[..3]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    [Fact]
+    public async Task Shore_pass_ect_lists_the_box_required_on_the_day_with_its_weight()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var required = new DateOnly(2026, 12, 24);
+        var url = $"{Reports}/shore-pass-ect.xlsx?branchId={SctLcb01}&dateFrom={required:yyyy-MM-dd}&dateTo={required:yyyy-MM-dd}&agentCode=ONEY&loadingPort=THLCH";
+        try
+        {
+            await ExportGatedInAsync(client, carrierRef, box, ct, required);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<<SHORE PASS REPORT>>");
+            Assert.Contains(rows, r => r[0] == "DEPOT : THLCH");
+            Assert.Contains(rows, r => r[0] == "No." && r[1] == "CONTAINER NO." && r[8] == "PORT");
+            var row = Assert.Single(rows, r => r[1] == box);
+            Assert.Equal(["20GP", carrierRef, "18000.00"], [row[2], row[6], row[7]]);
+            Assert.Equal("EASTERN PIONEER 069S", row[5]);   // FEEDER: vessel name + export voyage
             await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
         }
         finally

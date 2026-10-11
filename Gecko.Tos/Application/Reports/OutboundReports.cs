@@ -323,6 +323,82 @@ internal static class OutboundReports
             PageLabel: "Page No#",
             After: [summary]);
     }
+
+    // ── TMS.Operation.OutBound.ShorePassECT ──
+
+    /// <summary>
+    /// &lt;&lt;SHORE PASS REPORT&gt;&gt;, the desktop's "Shore Pass ECT" (Report.usp_OutBound_ShorePassECT): unlike Shore Pass 1-3,
+    /// the booked boxes REQUIRED on the days asked for (a box with no required date is not listed, as on Vector), by booking
+    /// no then container, with the line, shipper, feeder (vessel + voyage), the cargo weight of the box's latest full
+    /// gate-in (0.00 before it comes in) and the destination port (final, else discharge). One row per box (Vector repeated
+    /// a box with two full gate-ins). DEPOT prints the loading port asked for, as the RDL did.
+    /// </summary>
+    public static async Task<TabularReport> ShorePassEctAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? bookingType, string? loadingPort, CancellationToken ct)
+    {
+        var bookings = db.Bookings.AsNoTracking().Where(b => b.BranchId == h.Branch.BranchId && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => b.LinePartyCode == agent);
+        if (Clean(bookingType) is { } type) bookings = bookings.Where(b => b.BookingTypeCode == type);
+        if (Clean(loadingPort) is { } pol) bookings = bookings.Where(b => b.PolPortCode == pol);
+        var (first, last) = (from, to);
+        var boxes = await (
+                from b in bookings
+                join x in db.BookingContainers on b.BookingId equals x.BookingId
+                join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+                join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId into calls
+                from c in calls.DefaultIfEmpty()
+                where x.DeletedAt == null && x.ContainerNo != null && x.ContainerNo != "" && x.RequiredDate >= first && x.RequiredDate <= last
+                select new
+                {
+                    x.BookingContainerId, ContainerNo = x.ContainerNo!, r.EquipmentTypeCode, b.LinePartyCode, b.CustomerPartyCode,
+                    b.CarrierRef, b.CustomerRef, b.DirectionCode, b.FpdPortCode, b.PodPortCode,
+                    VesselCode = c == null ? null : c.VesselCode, VoyageIn = c == null ? null : c.OperatorVoyageIn, VoyageOut = c == null ? null : c.OperatorVoyageOut,
+                })
+            .ToListAsync(ct);
+
+        var weights = new Dictionary<Guid, decimal?>();
+        foreach (var slice in boxes.Select(b => b.BookingContainerId).Chunk(2000))
+            foreach (var g in (await db.GateTransactions.AsNoTracking()
+                         .Where(g => slice.Contains(g.BookingContainerId) && g.Status == "COMPLETED" && g.DeletedAt == null
+                                     && g.Direction == GateRules.In && g.FullEmpty == GateRules.Full)
+                         .Select(g => new { g.BookingContainerId, g.TransactionAt, g.CargoWeightKg }).ToListAsync(ct))
+                     .OrderBy(g => g.TransactionAt))
+                weights[g.BookingContainerId] = g.CargoWeightKg;
+        var types = await TypesAsync(master, boxes.Select(b => (string?)b.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(boxes.Select(b => b.LinePartyCode).Concat(boxes.Select(b => b.CustomerPartyCode)).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(boxes.Select(b => b.VesselCode).OfType<string>().Distinct(), ct);
+        var ports = await master.PortsAsync(boxes.Select(b => b.FpdPortCode ?? b.PodPortCode).OfType<string>().Distinct(), ct);
+
+        var rows = boxes
+            .OrderBy(b => BookingBlNo(b.CarrierRef, b.CustomerRef), StringComparer.Ordinal).ThenBy(b => b.ContainerNo, StringComparer.Ordinal)
+            .Select((b, i) =>
+            {
+                var (size, kind) = SizeType(types, b.EquipmentTypeCode);
+                var vesselName = b.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName ?? v : "";
+                var port = b.FpdPortCode ?? b.PodPortCode;
+                return new TabularRow([i + 1, b.ContainerNo, $"{size}{kind}", parties.GetValueOrDefault(b.LinePartyCode)?.Name,
+                    b.CustomerPartyCode is { } c ? parties.GetValueOrDefault(c)?.Name : null,
+                    $"{vesselName} {Voyage(b.DirectionCode ?? "", b.VoyageIn, b.VoyageOut)}", BookingBlNo(b.CarrierRef, b.CustomerRef),
+                    weights.GetValueOrDefault(b.BookingContainerId) ?? 0m, port is null ? null : ports.GetValueOrDefault(port)?.Name ?? port]);
+            }).ToList();
+
+        return new TabularReport(
+            FileName: $"ShorePassECT_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading: [new(h.BranchName, 10, Bold: true), new("<<SHORE PASS REPORT>>", 10, Bold: true)],
+            HeadingRight: [],
+            Preamble: [new($"DATE  {h.PrintedAt:dd/MM/yyyy}"), new($"DEPOT : {loadingPort?.Trim()}")],
+            PreambleRight: [],
+            Columns: [new(1.40639), new(2.35007), new(1.21896), new(4.21097), new(5.18993), new(6.53931), new(2.62347), new(1.88264, "0.00"), new(2.63906)],
+            HeaderRows:
+            [
+                [new("No."), new("CONTAINER NO."), new("SIZE"), new("AGENT"), new("SHIPPER"), new("FEEDER"), new("BOOKING NO."), new("WEIGHT"), new("PORT")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No #");
+    }
 }
 
 /// <summary>Stuffing - UnStuffing's filters, Vector's (BookingBLNo matches the carrier or customer reference).</summary>

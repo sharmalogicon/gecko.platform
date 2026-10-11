@@ -33,6 +33,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
 ///   GET /reports/stock-report.{pdf|xlsx}   TMS.Operation.OutBound.StockReport
 ///   GET /reports/stuffing-unstuffing.{pdf|xlsx}   TMS.Operation.OutBound.StuffingUnstuffing
+///   GET /reports/shore-pass-ect.{pdf|xlsx}   TMS.Operation.OutBound.ShorePassECT
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -88,6 +89,10 @@ internal static class ListReportEndpoints
                 r => OutboundReports.StuffingUnstuffingAsync(r.Db, r.Master, r.Heading, r.From, r.To,
                     new StuffingFilter(r.Q.AgentCode, r.Q.CustomerCode, r.Q.BookingBlNo, r.Q.VesselCode, r.Q.VoyageNo, r.Q.BookingType, r.Q.OrderType), r.Ct))
             .WithSummary("Stuffing - UnStuffing (Vector OutBound.StuffingUnstuffing): full gate-ins of booked boxes with their booking dates");
+        reports.MapOperation("/shore-pass-ect.{format}",
+                r => OutboundReports.ShorePassEctAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.LoadingPort, r.Ct))
+            .WithSummary("Shore Pass ECT (Vector OutBound.ShorePassECT): booked boxes by required date, with weight and destination")
+            .WithDescription("dateFrom/dateTo: the boxes' required dates. loadingPort: the booking's port of loading.");
 
         return tos;
     }

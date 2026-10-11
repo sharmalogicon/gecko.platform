@@ -378,4 +378,95 @@ internal static class InboundReports
             PageLabel: "Page No#",
             After: [summary]);
     }
+
+    // ── TMS.Operation.InBound.CustomsImportUnStuffing ──
+
+    private static readonly string[] CustomsSizes =
+        ["20GP", "20HC", "40GP", "40HC", "45HC", "20RF", "40RF", "40RH", "20HG", "40HG", "20OT", "40OT", "20FR", "40FR", "20TK"];
+
+    /// <summary>
+    /// สมุดควบคุมคอนเทนเนอร์ (กศก 84), the desktop's "IMPORT - Unstuffing Customs" (Report.usp_Inbound_CustomsImportUnStuffing):
+    /// every IMPORT full gate-in on the depot days asked for — FCL included, as on Vector — numbered in gate order, with the
+    /// shipment type as status, the box's first gate-out on that booking (full for FCL, else empty), the call's vessel, voyage,
+    /// ETA and terminal (the RDL's "Loading Port" printed the booking's terminal), then the Summary by size/type and SUM.
+    /// Unstuffing Date prints blank: Gecko records no unstuffing yet (gap D9). 40HG counts 40HG (the RDL repeated 20HG);
+    /// 24-hour time.
+    /// </summary>
+    public static async Task<TabularReport> CustomsImportUnstuffingAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? vesselCode, string? voyageNo, CancellationToken ct)
+    {
+        var query = Moves(db, h.Branch, from, to)
+            .Where(m => m.Direction == GateRules.In && m.FullEmpty == GateRules.Full && m.BookingTypeCode == "IMPORT");
+        if (Clean(agentCode) is { } agent) query = query.Where(m => m.LineCode == agent);
+        if (Clean(vesselCode) is { } vessel) query = query.Where(m => m.VesselCode == vessel);
+        if (Clean(voyageNo) is { } voyage) query = query.Where(m => m.VoyageIn == voyage || m.VoyageOut == voyage);
+        var moves = (await query.ToListAsync(ct)).OrderBy(m => m.At).ThenBy(m => m.EirNo, StringComparer.Ordinal).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(moves.Select(m => m.CustomerCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(moves.Select(m => m.VesselCode).OfType<string>().Distinct(), ct);
+
+        // The box's gate-outs on the same booking line.
+        var lines = moves.Select(m => m.BookingContainerId).Distinct().ToList();
+        var outs = new List<(Guid Box, string FullEmpty, DateTimeOffset At)>();
+        foreach (var slice in lines.Chunk(2000))
+            outs.AddRange((await db.GateTransactions.AsNoTracking()
+                    .Where(g => slice.Contains(g.BookingContainerId) && g.Status == "COMPLETED" && g.DeletedAt == null && g.Direction == GateRules.Out)
+                    .Select(g => new { g.BookingContainerId, g.FullEmpty, g.TransactionAt }).ToListAsync(ct))
+                .Select(g => (g.BookingContainerId, g.FullEmpty, g.TransactionAt)));
+        var outsByBox = outs.ToLookup(o => o.Box);
+        string SizeOf(Move m, string between = "")
+        {
+            var (size, kind) = SizeType(types, m.EquipmentTypeCode);
+            return $"{size}{between}{kind}";
+        }
+
+        var rows = moves.Select((m, i) =>
+        {
+            var status = ShipmentType(m.OrderTypeCode);
+            var load = status == Fcl ? GateRules.Full : GateRules.Empty;
+            var gateOut = outsByBox[m.BookingContainerId].Where(o => o.FullEmpty == load).Select(o => (DateTimeOffset?)o.At).Min();
+            var vesselName = m.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName ?? v : "";
+            return new TabularRow([i + 1, Local(h.Branch, m.At), m.ContainerNo, SizeOf(m, "'"), status, null,
+                gateOut is { } o ? Local(h.Branch, o) : null, m.BookingBlNo, $"{vesselName}/{m.Voyage}",
+                m.Eta is { } eta ? Local(h.Branch, eta) : null, m.TerminalCode, m.LineCode,
+                m.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, m.Remarks]);
+        }).ToList();
+
+        double[] summaryWidths = [2.5, 1.23, 1.20354, 1.12417, 1.15599, 1.09297, 1.15063, 1.09016, 1.08859, 1.12417, 1.02807, 1.20354, 1.15063, 1.15063, 1.12417, 1.33583, 1.09771];
+        var summary = new TabularBlock("Summary",
+            summaryWidths.Select((w, i) => new TabularColumn(w, null, i == 0 ? CellAlign.Left : CellAlign.Center)).ToList(),
+            [[new HeaderCell("Container Size"), .. CustomsSizes.Select(s => new HeaderCell(s == "20TK" ? "20 TK" : s)), new HeaderCell("SUM")]],
+            [new TabularRow(["TOTAL", .. CustomsSizes.Select(s => (object?)moves.Count(m => SizeOf(m) == s)), moves.Count])]);
+
+        return new TabularReport(
+            FileName: $"CustomsImportUnstuffing_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("สมุดควบคุมคอนเทนเนอร์ (กศก 84)", 10, Bold: true),
+                new($"from Gate In date: {Day(from, "dd/MM/yyyy")}   to Gate In date:{Day(to, "dd/MM/yyyy")}", 10, Bold: true),
+                new($"AGENT :{Clean(agentCode)}", 10, Bold: true), new($"Vessel Code :{Clean(vesselCode)}", 10, Bold: true),
+                new($"Voyage No.:{voyageNo?.Trim()}", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {h.PrintedAt:dd/MM/yyyy}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.36229), new(2.03129, "dd/MM/yyyy"), new(2.76458), new(1.15599), new(1.70308), new(3.24083),
+                new(2.38443, "dd/MM/yyyy HH:mm"), new(3.61125), new(4.44875), new(2.1825, "dd/MM/yyyy"), new(2.5), new(1.57396),
+                new(4.77541), new(2.77432),
+            ],
+            HeaderRows:
+            [
+                [new("Item"), new("Gate In Date"), new("Container No"), new("size"), new("status"), new("Unstuffing Date"),
+                 new("Gate Out Date"), new("BL No."), new("Vessel/Voyage"), new("ETA"), new("Loading Port"), new("Agent"),
+                 new("Consignee"), new("Remark")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#",
+            After: [summary]);
+    }
 }

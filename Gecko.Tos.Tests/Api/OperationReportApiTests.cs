@@ -320,4 +320,34 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Customs_import_unstuffing_numbers_the_import_full_gate_ins()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/customs-import-unstuffing.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU";
+        try
+        {
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "สมุดควบคุมคอนเทนเนอร์ (กศก 84)");
+            Assert.Contains(rows, r => r[0] == "Item" && r[5] == "Unstuffing Date" && r[10] == "Loading Port" && r[13] == "Remark");
+            var row = Assert.Single(rows, r => r[2] == box);
+            Assert.Equal(["20'GP", "FCL", "", ""], row[3..7]);
+            Assert.Equal([carrierRef, "/"], row[7..9]);
+            Assert.Equal("MAEU", row[11]);
+            Assert.Contains(rows, r => r[0] == "Container Size" && r[15] == "20 TK" && r[16] == "SUM");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

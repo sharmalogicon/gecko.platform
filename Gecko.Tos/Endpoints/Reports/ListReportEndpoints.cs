@@ -26,6 +26,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/empty-out.{pdf|xlsx}   TMS.Operation.InBound.EmptyOut ("EMPTY OUT" and "INBOUND Empty Out")
 ///   GET /reports/import-export-summary.{pdf|xlsx}   TMS.Operation.InBound.ImportExportSummary
 ///   GET /reports/inbound-full-in.{pdf|xlsx}   TMS.Operation.InBound.NYKExternal (the desktop's "NYK External")
+///   GET /reports/customs-import-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.CustomsImportUnStuffing
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -62,6 +63,9 @@ internal static class ListReportEndpoints
         reports.MapOperation("/inbound-full-in.{format}",
                 r => InboundReports.NykExternalAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
             .WithSummary("INBOUND FULL IN REPORT (Vector InBound.NYKExternal, the desktop's NYK External menu): full gate-ins with seals and weight");
+        reports.MapOperation("/customs-import-unstuffing.{format}",
+                r => InboundReports.CustomsImportUnstuffingAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
+            .WithSummary("IMPORT - Unstuffing Customs (Vector InBound.CustomsImportUnStuffing, กศก 84): import full gate-ins with their gate-out");
 
         return tos;
     }

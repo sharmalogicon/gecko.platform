@@ -350,4 +350,19 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Daily_unstuffing_prints_its_heading_and_columns_with_no_lines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var url = $"{Reports}/daily-unstuffing.xlsx?branchId={SctLcb01}&dateFrom=2026-10-01&dateTo=2026-10-10";
+
+        var rows = await SheetAsync(client, url, ct);
+        Assert.Contains(rows, r => r[0] == "DAILY UNSTUFFING REPORT ");
+        Assert.Contains(rows, r => r[0] == "UNSTUFFING DATE FROM : 01-10-2026   TO : 10-10-2026");
+        Assert.Equal("Container No.", rows[^1][0]);
+        Assert.Equal("Invoice No", rows[^1][9]);
+        await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+    }
 }

@@ -469,4 +469,36 @@ internal static class InboundReports
             PageLabel: "Page No#",
             After: [summary]);
     }
+
+    // ── TMS.Operation.InBound.DailyUnStuffing ──
+
+    /// <summary>
+    /// DAILY UNSTUFFING REPORT (Report.usp_InBound_DailyUnstuffingReport): Vector selected the CFS / CY-direct boxes by their
+    /// unstuffing day, a block per agent + vessel + voyage. Gecko records no unstuffing yet (gap D9), so — as the owner ruled
+    /// for the accounting unstuffing reports (2026-10-10) — the heading and the columns print with no lines.
+    /// </summary>
+    public static TabularReport DailyUnstuffing(ReportHeading h, DateOnly from, DateOnly to) => new(
+        FileName: $"DailyUnstuffing_{from:yyyyMMdd}-{to:yyyyMMdd}",
+        Page: ReportPage.A3Landscape,
+        MarginCm: 2,
+        Heading:
+        [
+            new(h.BranchName, 10, Bold: true), new("DAILY UNSTUFFING REPORT ", 10, Bold: true),
+            new($"UNSTUFFING DATE FROM : {Day(from)}   TO : {Day(to)}", 10, Bold: true),
+        ],
+        HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm}")],
+        Preamble: [],
+        PreambleRight: [],
+        Columns:
+        [
+            new(2.40486), new(1.15062), new(1.12417), new(5.43688), new(2.57938), new(3.70007), new(2.46695), new(2.47355),
+            new(4.28402), new(2.5),
+        ],
+        HeaderRows:
+        [
+            [new("Container No."), new("Size"), new("Type"), new("Consignee"), new("BOOKING MODE"), new("B/L No."), new("SEAL"),
+             new("Change Status"), new("Condition"), new("Invoice No")],
+        ],
+        Rows: [],
+        PageLabel: "Page No#");
 }

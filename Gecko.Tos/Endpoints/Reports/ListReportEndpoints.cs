@@ -27,6 +27,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/import-export-summary.{pdf|xlsx}   TMS.Operation.InBound.ImportExportSummary
 ///   GET /reports/inbound-full-in.{pdf|xlsx}   TMS.Operation.InBound.NYKExternal (the desktop's "NYK External")
 ///   GET /reports/customs-import-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.CustomsImportUnStuffing
+///   GET /reports/daily-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.DailyUnStuffing (no lines until unstuffing is recorded)
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -66,6 +67,8 @@ internal static class ListReportEndpoints
         reports.MapOperation("/customs-import-unstuffing.{format}",
                 r => InboundReports.CustomsImportUnstuffingAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
             .WithSummary("IMPORT - Unstuffing Customs (Vector InBound.CustomsImportUnStuffing, กศก 84): import full gate-ins with their gate-out");
+        reports.MapOperation("/daily-unstuffing.{format}", r => Task.FromResult(InboundReports.DailyUnstuffing(r.Heading, r.From, r.To)))
+            .WithSummary("DAILY UNSTUFFING REPORT (Vector InBound.DailyUnStuffing): heading and columns only until Gecko records unstuffing");
 
         return tos;
     }

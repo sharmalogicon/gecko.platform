@@ -1,4 +1,5 @@
 ﻿using Gecko.Data;
+using Gecko.Data.Documents;
 using Gecko.Identity.Contracts;
 using Gecko.MasterData.Contracts;
 using Gecko.SharedKernel;
@@ -20,6 +21,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/gate-in-out.{pdf|xlsx}     TMS.Operation.InBound.GateInOut
 ///   GET /reports/empty-in-yard.{pdf|xlsx}   TMS.Operation.OutBound.EmptyInYard
 ///   GET /reports/full-in-yard.{pdf|xlsx}    TMS.Operation.OutBound.FullInYard
+///   GET /reports/outbound-container-storage-activity.{pdf|xlsx}   TMS.Operation.OutBound.ContainerStorageActivity
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -36,6 +38,10 @@ internal static class ListReportEndpoints
             .WithSummary("Outbound Empty Container In Yard (Vector EmptyInYard), as PDF or Excel");
         reports.MapGet("/full-in-yard.{format}", FullInYardAsync).RequireBranchPermission(TosPermissions.GateView)
             .WithSummary("Full Container In Yard (Vector FullInYard), as PDF or Excel");
+
+        reports.MapGet("/outbound-container-storage-activity.{format}", StorageActivityAsync).RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("Outbound Container Storage Activity (Vector OutBound.ContainerStorageActivity): export boxes by vessel ETA, as PDF or Excel")
+            .WithDescription("dateFrom/dateTo: the depot days the vessel's ETA falls in (Vector's FromETD/ToETD).");
 
         return tos;
     }
@@ -59,6 +65,34 @@ internal static class ListReportEndpoints
     private static IResult File(ListReport report, string format) => format == "pdf"
         ? TypedResults.File(report.Pdf(), ListReport.PdfType, report.FileName + ".pdf")
         : TypedResults.File(report.Xlsx(), ListReport.XlsxType, report.FileName + ".xlsx");
+
+    private static IResult File(TabularReport report, string format) => format == "pdf"
+        ? TypedResults.File(report.Pdf(), TabularReport.PdfType, report.FileName + ".pdf")
+        : TypedResults.File(report.Xlsx(), TabularReport.XlsxType, report.FileName + ".xlsx");
+
+    /// <summary>The inclusive depot-day range most Operation reports take; null when it is fine.</summary>
+    private static IResult? InvalidRange(DateOnly? from, DateOnly? to, string fromName = "dateFrom", string toName = "dateTo")
+    {
+        if (from is null) return TosSupport.Invalid(fromName, "The first day of the report.");
+        if (to is null) return TosSupport.Invalid(toName, "The last day of the report.");
+        if (to < from) return TosSupport.Invalid(toName, "The last day is before the first.");
+        return to.Value.DayNumber - from.Value.DayNumber + 1 > ReportEndpoints.MaxDays
+            ? TosSupport.Invalid(toName, $"At most {ReportEndpoints.MaxDays} days in one report.")
+            : null;
+    }
+
+    private static async Task<IResult> StorageActivityAsync(
+        string format, TosDbContext db, IMasterDataReferences master, BranchClock clock, IUserDirectory users,
+        ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null, string? vesselCode = null,
+        string? voyageNo = null, string? orderType = null, string? bookingType = null)
+    {
+        var (context, refused) = await ContextAsync(branchId, format, clock, users, caller, scope, ct);
+        if (refused is not null) return refused;
+        if (InvalidRange(dateFrom, dateTo) is { } bad) return bad;
+        return File(await StorageActivityReport.BuildAsync(db, master, context!.Branch, context.BranchName, context.PrintedBy, context.Now,
+            new StorageActivityFilter(dateFrom!.Value, dateTo!.Value, agentCode, vesselCode, voyageNo, orderType, bookingType), ct), format);
+    }
 
     private static async Task<IResult> GateInOutAsync(
         string format, TosDbContext db, IMasterDataReferences master, BranchClock clock, IUserDirectory users,

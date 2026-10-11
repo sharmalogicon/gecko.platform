@@ -289,4 +289,35 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Inbound_full_in_lists_the_box_with_its_seal_and_weight()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/inbound-full-in.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU&bookingType=IMPORT";
+        try
+        {
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< INBOUND FULL IN REPORT >>");
+            Assert.Contains(rows, r => r[0] == "Container No." && r[3] == "PAY RECEIPT " && r[13] == "สภาพตู้" && r[16] == "Weight");
+            var row = Assert.Single(rows, r => r[0] == box);
+            Assert.Equal(day.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture), row[1]);
+            Assert.Equal(["MAEU", "20'GP", "70-4321"], row[3..6]);
+            Assert.Equal([$"ZZ-{box[^4..]}", "", ""], row[7..10]);
+            Assert.Equal([carrierRef, "24 TONS"], row[15..17]);
+            Assert.Contains(rows, r => r[0] == "Container Size" && r[1] == "20HC" && r[16] == "SUM");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

@@ -289,4 +289,93 @@ internal static class InboundReports
             Rows: rows,
             PageLabel: "Page No#");
     }
+
+    /// <summary>The moves' seals by gate transaction, in the order they were recorded.</summary>
+    private static async Task<ILookup<Guid, (string SealNo, string SealType)>> SealsAsync(TosDbContext db, IEnumerable<Guid> moveIds, CancellationToken ct)
+    {
+        var found = new List<(Guid Move, DateTimeOffset At, string SealNo, string SealType)>();
+        foreach (var slice in moveIds.Distinct().Chunk(2000))
+            found.AddRange((await db.GateTransactionSeals.AsNoTracking().Where(s => slice.Contains(s.GateTransactionId) && s.DeletedAt == null)
+                    .Select(s => new { s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType }).ToListAsync(ct))
+                .Select(s => (s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType)));
+        return found.OrderBy(s => s.At).ToLookup(s => s.Move, s => (s.SealNo, s.SealType));
+    }
+
+    // ── TMS.Operation.InBound.NYKExternal ──
+
+    private static readonly string[] NykSizes =
+        ["20HC", "40GP", "40HC", "20GP", "20RF", "40RF", "40RH", "45HC", "20HG", "40HG", "20OT", "40OT", "20FR", "40FR", "20TK"];
+
+    /// <summary>
+    /// INBOUND FULL IN REPORT, the desktop's "NYK External" (Report.usp_InBound_NYKExternal; any agent, not only NYK): the full
+    /// gate-ins on the depot days asked for, optionally of one booking type and order type, in gate order, with the RDL's 17
+    /// columns — "PAY RECEIPT" prints the agent code and "Chassis No." the haulier code, as the RDL did; SCT seal and Damage
+    /// blank as in the RDL; Weight the gate's gross weight in whole tonnes — then the Summary over 15 fixed size/types in the
+    /// RDL's order and SUM. Completed moves only (Vector listed cancelled ones too); 24-hour time.
+    /// </summary>
+    public static async Task<TabularReport> NykExternalAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? bookingType, string? orderType, CancellationToken ct)
+    {
+        var query = Moves(db, h.Branch, from, to).Where(m => m.Direction == GateRules.In && m.FullEmpty == GateRules.Full);
+        if (Clean(agentCode) is { } agent) query = query.Where(m => m.LineCode == agent);
+        if (Clean(bookingType) is { } type) query = query.Where(m => m.BookingTypeCode == type);
+        if (Clean(orderType) is { } order) query = query.Where(m => m.OrderTypeCode == order);
+        var moves = (await query.ToListAsync(ct)).OrderBy(m => m.At).ThenBy(m => m.EirNo, StringComparer.Ordinal).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(moves.Select(m => m.CustomerCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(moves.Select(m => m.VesselCode).OfType<string>().Distinct(), ct);
+        var seals = await SealsAsync(db, moves.Select(m => m.GateTransactionId), ct);
+        string? Seal(Move m, Func<string, bool> kind) => seals[m.GateTransactionId].Where(s => kind(s.SealType)).Select(s => s.SealNo).FirstOrDefault();
+        string SizeOf(Move m, string between = "")
+        {
+            var (size, kind) = SizeType(types, m.EquipmentTypeCode);
+            return $"{size}{between}{kind}";
+        }
+
+        var rows = moves.Select(m =>
+        {
+            var at = Local(h.Branch, m.At);
+            return new TabularRow([m.ContainerNo, at, at, m.LineCode, SizeOf(m, "'"), m.TruckPlate, m.HaulierCode,
+                Seal(m, IsAgentSeal), Seal(m, s => s == "CUSTOMS"), null,
+                m.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName : null, m.Voyage,
+                m.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, m.ConditionCode, null, m.BookingBlNo,
+                $"{Math.Floor((m.GrossKg ?? 0) / 1000)} TONS"]);
+        }).ToList();
+
+        double[] summaryWidths = [2.64757, 1.08703, 1.14145, 1.16417, 1.05833, 1.01459, 1.16791, 1.07125, 1.09771, 1.21709, 1.05833, 1.08479, 0.99188, 1.07125, 1.08479, 0.96542, 1.09771];
+        var summary = new TabularBlock("Summary",
+            summaryWidths.Select((w, i) => new TabularColumn(w, null, i == 0 ? CellAlign.Left : CellAlign.Center)).ToList(),
+            [[new HeaderCell("Container Size"), .. NykSizes.Select(s => new HeaderCell(s)), new HeaderCell("SUM")]],
+            [new TabularRow(["TOTAL", .. NykSizes.Select(s => (object?)moves.Count(m => SizeOf(m) == s)), moves.Count])]);
+
+        return new TabularReport(
+            FileName: $"InboundFullIn_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("<< INBOUND FULL IN REPORT >>", 10, Bold: true),
+                new($"ระหว่างวันที่ Gate In :{Day(from)} ถึงวันที่ Gate In :{Day(to)}", 10, Bold: true),
+                new($"Agent : {Clean(agentCode)}", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm:ss}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.5), new(1.89146, "yyyyMMdd"), new(1.51401, "HH:mm"), new(2.20767), new(1.10796), new(1.87854), new(2.05021),
+                new(2.15147), new(2.5), new(1.89413), new(5.18583), new(1.83854), new(5.63026), new(1.97083), new(1.70625), new(3.24083),
+                new(1.73271),
+            ],
+            HeaderRows:
+            [
+                [new("Container No."), new("Date"), new("Time"), new("PAY RECEIPT "), new("Size"), new("Plate No."), new("Chassis No."),
+                 new("Seal Agent"), new("Seal Customs"), new("SCT seal"), new("Vessel Name"), new("Voyage No"), new("Consignee"),
+                 new("สภาพตู้"), new("Damage"), new("BL No."), new("Weight")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#",
+            After: [summary]);
+    }
 }

@@ -84,6 +84,8 @@ public sealed record TabularReport(
 
     private TabularBlock Main => new(null, Columns, HeaderRows, Rows);
 
+    private bool MainIsEmpty => HeaderRows.Count == 0 && Rows.Count == 0;
+
     private IEnumerable<TabularBlock> Blocks => After is null ? [Main] : [Main, .. After];
 
     /// <summary>A cell as the RDL prints it: the column's format applied, invariant culture, null as blank.</summary>
@@ -159,10 +161,11 @@ public sealed record TabularReport(
                     });
                     c.Item().Height(6);
                 }
-                c.Item().Element(x => Grid(x, Main));
-                foreach (var block in After ?? [])
+                // A report made only of blocks (one per group, each with its own headers) leaves the main grid empty.
+                if (!MainIsEmpty) c.Item().Element(x => Grid(x, Main));
+                foreach (var (block, i) in (After ?? []).Select((b, i) => (b, i)))
                 {
-                    c.Item().Height(10);
+                    if (i > 0 || !MainIsEmpty) c.Item().Height(10);
                     if (block.Caption is { } caption) c.Item().PaddingBottom(2).Text(caption).Bold();
                     // A later table keeps its own width (cm), on the same scale as the grid.
                     c.Item().AlignLeft().Width((float)block.Columns.Sum(x => x.WidthCm) * pointsPerCm).Element(x => Grid(x, block));
@@ -261,8 +264,7 @@ public sealed record TabularReport(
         r++;
 
         for (var i = 0; i < last; i++) sheet.Column(i + 1).Width = Math.Max(6, Columns[i].WidthCm * 4.4);
-        var headerBottom = Write(sheet, Main, ref r);
-        sheet.SheetView.FreezeRows(headerBottom);
+        if (!MainIsEmpty) sheet.SheetView.FreezeRows(Write(sheet, Main, ref r));
 
         foreach (var block in After ?? [])
         {

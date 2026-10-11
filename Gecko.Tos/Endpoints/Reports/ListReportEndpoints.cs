@@ -22,6 +22,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/empty-in-yard.{pdf|xlsx}   TMS.Operation.OutBound.EmptyInYard
 ///   GET /reports/full-in-yard.{pdf|xlsx}    TMS.Operation.OutBound.FullInYard
 ///   GET /reports/outbound-container-storage-activity.{pdf|xlsx}   TMS.Operation.OutBound.ContainerStorageActivity
+///   GET /reports/daily-import-full-in.{pdf|xlsx}   TMS.Operation.InBound.DailyImportFullIn
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -42,11 +43,16 @@ internal static class ListReportEndpoints
         reports.MapGet("/outbound-container-storage-activity.{format}", StorageActivityAsync).RequireBranchPermission(TosPermissions.GateView)
             .WithSummary("Outbound Container Storage Activity (Vector OutBound.ContainerStorageActivity): export boxes by vessel ETA, as PDF or Excel")
             .WithDescription("dateFrom/dateTo: the depot days the vessel's ETA falls in (Vector's FromETD/ToETD).");
+        reports.MapGet("/daily-import-full-in.{format}", DailyImportFullInAsync).RequireBranchPermission(TosPermissions.GateView)
+            .WithSummary("Daily IMPORT FULL-IN (Vector InBound.DailyImportFullIn): import full gate-ins per agent and day by CY/CYD/CFS and size");
 
         return tos;
     }
 
-    private sealed record Context(BranchClock.Branch Branch, string BranchName, string PrintedBy, DateTimeOffset Now);
+    private sealed record Context(BranchClock.Branch Branch, string BranchName, string PrintedBy, DateTimeOffset Now)
+    {
+        public ReportHeading Heading => new(Branch, BranchName, PrintedBy, Now);
+    }
 
     private static async Task<(Context? Context, IResult? Refused)> ContextAsync(
         Guid? branchId, string format, BranchClock clock, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct)
@@ -92,6 +98,17 @@ internal static class ListReportEndpoints
         if (InvalidRange(dateFrom, dateTo) is { } bad) return bad;
         return File(await StorageActivityReport.BuildAsync(db, master, context!.Branch, context.BranchName, context.PrintedBy, context.Now,
             new StorageActivityFilter(dateFrom!.Value, dateTo!.Value, agentCode, vesselCode, voyageNo, orderType, bookingType), ct), format);
+    }
+
+    private static async Task<IResult> DailyImportFullInAsync(
+        string format, TosDbContext db, IMasterDataReferences master, BranchClock clock, IUserDirectory users,
+        ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
+        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null)
+    {
+        var (context, refused) = await ContextAsync(branchId, format, clock, users, caller, scope, ct);
+        if (refused is not null) return refused;
+        if (InvalidRange(dateFrom, dateTo) is { } bad) return bad;
+        return File(await InboundReports.DailyImportFullInAsync(db, master, context!.Heading, dateFrom!.Value, dateTo!.Value, agentCode, ct), format);
     }
 
     private static async Task<IResult> GateInOutAsync(

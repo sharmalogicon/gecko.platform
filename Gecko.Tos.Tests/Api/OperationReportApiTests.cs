@@ -57,6 +57,31 @@ public sealed class OperationReportApiTests(TosApiFactory api)
         return call;
     }
 
+    /// <summary>An IMP CY/CY booking (MAEU, CUS-TAE) with one 20GP box, gated in full two hours ago.</summary>
+    private static async Task ImportGatedInAsync(HttpClient client, string carrierRef, string box, CancellationToken ct)
+    {
+        var booked = await client.PostAsJsonAsync("/api/tos/bookings", new
+        {
+            branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+            validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+            requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
+            containers = new object[] { new { containerNo = box } },
+        }, ct);
+        Assert.True(booked.StatusCode == HttpStatusCode.Created, $"booking returned {(int)booked.StatusCode}: {await booked.Content.ReadAsStringAsync(ct)}");
+        var gated = await client.PostAsJsonAsync("/api/tos/gate/transactions", new
+        {
+            branchId = SctLcb01, containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT",
+            tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
+            truck = new { plate = "70-4321", driverName = "Somchai P." }, grossWeightKg = 24100m, weightSource = "WEIGHBRIDGE",
+            seals = new object[] { new { sealNo = $"ZZ-{box[^4..]}", sealType = "LINE", isIntact = true } },
+            transactionAt = DateTimeOffset.UtcNow.AddHours(-2),
+        }, ct);
+        Assert.True(gated.StatusCode == HttpStatusCode.Created, $"gate in returned {(int)gated.StatusCode}: {await gated.Content.ReadAsStringAsync(ct)}");
+    }
+
+    /// <summary>The depot day two hours ago (the gate time the helpers use).</summary>
+    private static DateOnly GateDay => DateOnly.FromDateTime(DateTime.UtcNow.AddHours(7 - 2));
+
     /// <summary>Every used row of the first sheet, as formatted text.</summary>
     internal static async Task<List<string[]>> SheetAsync(HttpClient client, string url, CancellationToken ct)
     {
@@ -105,6 +130,38 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await PdfAsync(client, $"{Reports}/outbound-container-storage-activity.pdf?{query}", ct);
             Assert.Equal(HttpStatusCode.BadRequest,
                 (await client.GetAsync($"{Reports}/outbound-container-storage-activity.pdf?branchId={SctLcb01}&dateFrom={eta:yyyy-MM-dd}", ct)).StatusCode);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    [Fact]
+    public async Task Daily_import_full_in_counts_the_box_under_its_agent_day_and_cy_size()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/daily-import-full-in.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU";
+        string Label() => day.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);
+        static int[] Counts(string[]? row) => row is null ? new int[10] : row[1..11].Select(c => c.Length == 0 ? 0 : int.Parse(c)).ToArray();
+        try
+        {
+            var before = Counts((await SheetAsync(client, url, ct)).FirstOrDefault(r => r[0] == Label()));
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<<Daily Import FULL IN>>");
+            Assert.Contains(rows, r => r[0] == "Date" && r[1] == "FULL IN" && r[2] == "CY" && r[5] == "CYD" && r[8] == "CFS");
+            Assert.Contains(rows, r => r[0] == "MAEU" && r[2] == "20'" && r[10] == "45'");
+            var after = Counts(rows.Single(r => r[0] == Label()));
+            Assert.Equal([1, 1, 0, 0, 0, 0, 0, 0, 0, 0], after.Zip(before, (a, b) => a - b));
+            Assert.Contains(rows, r => r[0] == "Total");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
         }
         finally
         {

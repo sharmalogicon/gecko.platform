@@ -29,6 +29,24 @@ internal static class OperationReportKit
             rows);
     }
 
+    public const string Fcl = "FCL";
+    public const string LclCfs = "LCL-CFS";
+    public const string LclCyd = "LCL-CYD";
+
+    private static readonly IReadOnlyDictionary<string, string> NotFcl = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["EXP CFS"] = LclCfs, ["EXP CFS W/H"] = LclCfs, ["IMP CFS"] = LclCfs,
+        ["EXP CY-IN (NOMINATING)"] = LclCyd, ["EXP CY-IN (NON-NOMINATING)"] = LclCyd, ["IMP CYD"] = LclCyd,
+        ["INT IN"] = "NONE", ["INT OUT"] = "NONE",
+    };
+
+    /// <summary>
+    /// Vector's shipment type of an order type (Master.OrderType.ShipmentType, read from TMSKORAKIT): the CFS order types
+    /// LCL-CFS, the CY-direct ones LCL-CYD, the internal moves NONE, every other order type FCL — as Vector set every one of
+    /// them. Gecko's order types carry no shipment type (owner to confirm this map, 2026-10-11).
+    /// </summary>
+    public static string ShipmentType(string orderTypeCode) => NotFcl.GetValueOrDefault(orderTypeCode) ?? Fcl;
+
     public static string Day(DateOnly? day, string format = "dd-MM-yyyy") => day?.ToString(format, CultureInfo.InvariantCulture) ?? "";
 
     /// <summary>A depot-local day, or null.</summary>

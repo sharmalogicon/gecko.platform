@@ -392,4 +392,174 @@ internal static class CustomerServiceReports
             Rows: rows,
             PageLabel: "Page No#");
     }
+
+    // ── TMS.CustomerService.PendingBookingSummary ──
+
+    /// <summary>
+    /// The desktop's "Pending Booking Summary" (Report.usp_CustomerService_PendingBookingSummary): the depot's EXPORT bookings
+    /// whose vessel's ETA falls on the days asked for (Vector's "ETD" is the ETA everywhere — labels, parameters, filter), a
+    /// block per agent (the booking's agent, else its line) / vessel / ETA with C/T YARD and C/T PORT (the call's effective
+    /// YARD_DRY / PORT_DRY cut-offs for the booking's line at this depot, printed unformatted as Vector's en-US
+    /// M/d/yyyy h:mm:ss tt), then a row per customer (whatever its roles) + booking — customers ascending — and the block's
+    /// Total row; no grand total, as on the RDL. The counts are the boxes' planned steps (Gecko's movement plans, Vector's
+    /// BookingMovement): Booking Empty = the empty gate-out steps, Pending Empty Out = those still pending, Booking Full =
+    /// the full gate-in steps, PENDING FULL IN = those pending, Pending Full Out = full gate-ins done less full gate-outs done
+    /// (it can go negative, as on Vector). A step is chosen by its order-type step's direction and full/empty, not by the
+    /// tenant's movement code; skipped and cancelled steps count nowhere (neither pending nor done). The size columns use the
+    /// booked type: 20' / 40' dry, 45' any, 20'R / 40'R reefer (40'R without RH), 40'RH — the same tests in all five
+    /// sections (owner 2026-10-11, totals computed correctly: the RDL's Pending Full Out used narrower tests, so a 45' reefer
+    /// fell out of its total). Bookings without a vessel call have no ETA and so never fall in the range; blocks are ordered
+    /// by agent, ETA, vessel (Vector: by first container no). Cancelled bookings and ended lines are out. The 51 cm grid
+    /// prints on one A3 sheet, scaled.
+    /// </summary>
+    public static async Task<TabularReport> PendingBookingSummaryAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? customerCode, string? vesselCode, string? bookingBlNo, CancellationToken ct)
+    {
+        var bookings = db.Bookings.AsNoTracking()
+            .Where(b => b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "EXPORT" && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => (b.AgentPartyCode ?? b.LinePartyCode) == agent);
+        if (Clean(customerCode) is { } customer) bookings = bookings.Where(b => b.CustomerPartyCode == customer);
+        if (bookingBlNo?.Trim() is { Length: > 0 } bl) bookings = bookings.Where(b => b.CarrierRef == bl || b.CustomerRef == bl || b.SubBlNo == bl);
+        var calls = db.VesselCalls.Where(c => c.DeletedAt == null);
+        if (Clean(vesselCode) is { } vessel) calls = calls.Where(c => c.VesselCode == vessel);
+        var (start, end) = (BranchClock.StartOf(h.Branch, from), BranchClock.StartOf(h.Branch, to.AddDays(1)));
+        var heads = await (
+                from b in bookings
+                join c in calls on b.VesselCallId equals c.VesselCallId
+                where c.Eta >= start && c.Eta < end
+                select new
+                {
+                    b.BookingId, Agent = b.AgentPartyCode ?? b.LinePartyCode, b.LinePartyId, b.CustomerPartyCode, b.CarrierRef, b.CustomerRef,
+                    b.OrderTypeCode, c.VesselCallId, c.VesselCode, c.Eta, c.OperatorVoyageIn, c.OperatorVoyageOut,
+                })
+            .ToListAsync(ct);
+
+        var boxes = new List<(Guid BookingContainerId, Guid BookingId, string EquipmentTypeCode)>();
+        foreach (var slice in heads.Select(b => b.BookingId).Chunk(2000))
+            boxes.AddRange((await (
+                    from x in db.BookingContainers
+                    join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+                    where slice.Contains(x.BookingId) && x.DeletedAt == null && (x.EndedAt == null || x.EndReason == "COMPLETED")
+                    select new { x.BookingContainerId, x.BookingId, r.EquipmentTypeCode })
+                .ToListAsync(ct)).Select(x => (x.BookingContainerId, x.BookingId, x.EquipmentTypeCode)));
+        var plans = new List<(Guid BookingContainerId, Guid StepId, string Status)>();
+        foreach (var slice in boxes.Select(b => b.BookingContainerId).Chunk(2000))
+            plans.AddRange((await db.MovementPlans.AsNoTracking()
+                    .Where(p => slice.Contains(p.BookingContainerId) && p.DeletedAt == null && (p.Status == "PENDING" || p.Status == "DONE"))
+                    .Select(p => new { p.BookingContainerId, p.OrderTypeMovementId, p.Status }).ToListAsync(ct))
+                .Select(p => (p.BookingContainerId, p.OrderTypeMovementId, p.Status)));
+
+        var steps = (await master.OrderTypePlansAsync(heads.Select(b => b.OrderTypeCode).Distinct(), ct)).Values
+            .SelectMany(p => p.Steps).GroupBy(s => s.OrderTypeMovementId).ToDictionary(g => g.Key, g => (g.First().Direction, g.First().FullEmpty));
+        var types = await TypesAsync(master, boxes.Select(b => (string?)b.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(heads.Select(b => b.CustomerPartyCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(heads.Select(b => b.VesselCode).Distinct(), ct);
+
+        // A booking's steps: (box type, direction, full/empty, done).
+        var typeOf = boxes.ToDictionary(b => b.BookingContainerId, b => b.EquipmentTypeCode);
+        var bookingOf = boxes.ToDictionary(b => b.BookingContainerId, b => b.BookingId);
+        var stepsOf = plans.Where(p => steps.ContainsKey(p.StepId))
+            .Select(p => (Booking: bookingOf[p.BookingContainerId], Type: typeOf[p.BookingContainerId],
+                Move: steps[p.StepId], Done: p.Status == "DONE"))
+            .ToLookup(p => p.Booking);
+
+        bool[] Buckets(string code)
+        {
+            var (size, type) = SizeType(types, code);
+            var reefer = types.GetValueOrDefault(code)?.IsReefer;
+            return
+            [
+                size == "20" && reefer == false, size == "40" && reefer == false, size == "45",
+                size == "20" && reefer == true, size == "40" && reefer == true && type != "RH", size == "40" && type == "RH",
+            ];
+        }
+        object?[] Counts(IReadOnlyCollection<Guid> bookingIds)
+        {
+            var set = bookingIds.SelectMany(id => stepsOf[id]).Select(s => (s.Move, s.Done, Buckets: Buckets(s.Type))).ToList();
+            int Count(string direction, string load, bool? done, int k) =>
+                set.Count(s => s.Move == (direction, load) && (done is null || s.Done == done) && s.Buckets[k]);
+            var sections = new Func<int, int>[]
+            {
+                k => Count(GateRules.Out, GateRules.Empty, null, k),
+                k => Count(GateRules.Out, GateRules.Empty, false, k),
+                k => Count(GateRules.In, GateRules.Full, null, k),
+                k => Count(GateRules.In, GateRules.Full, false, k),
+                k => Count(GateRules.In, GateRules.Full, true, k) - Count(GateRules.Out, GateRules.Full, true, k),
+            };
+            return sections.SelectMany(section =>
+            {
+                var cells = Enumerable.Range(0, 6).Select(section).ToList();
+                return cells.Append(cells.Sum()).Cast<object?>();
+            }).ToArray();
+        }
+
+        string Cutoff(IReadOnlyList<EffectiveCutoff> list, string kind) =>
+            list.FirstOrDefault(c => c.Kind == kind) is { } c ? Stamp(Local(h.Branch, c.At), "M/d/yyyy h:mm:ss tt") : "";
+        string? Customer(string? code) => code is null ? null : parties.GetValueOrDefault(code)?.Name;
+
+        string[] sizes = ["20'", "40'", "45'", "20'R", "40'R", "40'RH"];
+        string[] titles = ["Booking Empty", "Pending Empty Out", "Booking Full", "PENDING FULL IN", "Pending Full Out"];
+        double[][] widths =
+        [
+            [9.78485, 9.4962, 9.61987, 9.66909, 9.4152, 10.7125, 12.93502],
+            [10.04048, 11.65942, 9.47766, 10.12473, 10.18333, 12.3, 12.82917],
+            [10.44792, 10.04276, 9.91875, 9.96599, 9.91875, 11.24167, 11.50625],
+            [9.65417, 8.59583, 9.38958, 9.91875, 10.18333, 11.50625, 11.77083],
+            [10.18333, 10.97708, 10.18333, 10.44792, 9.65417, 11.77083, 11.77083],
+        ];
+        IReadOnlyList<TabularColumn> columns =
+        [
+            new(6.698793), new(3.862292), new(2.5),
+            .. widths.SelectMany(w => w.Select(mm => new TabularColumn(mm / 10, null, CellAlign.Center))),
+        ];
+        IReadOnlyList<IReadOnlyList<HeaderCell>> headers =
+        [
+            [new("Customer Name", RowSpan: 2), new("booking", RowSpan: 2), new("ETD", RowSpan: 2),
+             .. titles.SelectMany(t => new[] { new HeaderCell(t, ColSpan: 6), new HeaderCell("TOTAL", RowSpan: 2) })],
+            [.. titles.SelectMany(_ => sizes.Select(s => new HeaderCell(s)))],
+        ];
+
+        var blocks = new List<TabularBlock>();
+        foreach (var block in heads.GroupBy(b => (b.Agent, b.VesselCode, Eta: LocalDay(h.Branch, b.Eta)!.Value))
+                     .OrderBy(g => g.Key.Agent, StringComparer.Ordinal).ThenBy(g => g.Key.Eta)
+                     .ThenBy(g => vessels.GetValueOrDefault(g.Key.VesselCode)?.VesselName ?? g.Key.VesselCode, StringComparer.Ordinal))
+        {
+            var first = block.First();
+            var eta = Day(block.Key.Eta, "dd/MM/yyyy");
+            var cutoffs = await CutoffLookup.EffectiveAsync(db, first.VesselCallId, first.LinePartyId, h.Branch.BranchId, ct);
+            var rows = block.GroupBy(b => (Customer: Customer(b.CustomerPartyCode), BookingNo: BookingBlNo(b.CarrierRef, b.CustomerRef)))
+                .OrderBy(g => g.Key.Customer, StringComparer.Ordinal).ThenBy(g => g.Key.BookingNo, StringComparer.Ordinal)
+                .Select(g => new TabularRow([g.Key.Customer, g.Key.BookingNo, eta, .. Counts(g.Select(b => b.BookingId).ToList())]))
+                .ToList();
+            rows.Add(new TabularRow(["Total", null, null, .. Counts(block.Select(b => b.BookingId).ToList())], RowKind.Subtotal));
+            blocks.Add(new TabularBlock(null, columns, headers, rows, Lines:
+            [
+                new($"AGENT: {block.Key.Agent}        C/T YARD {Cutoff(cutoffs, "YARD_DRY")}        C/T PORT {Cutoff(cutoffs, "PORT_DRY")}"),
+                new($"VESSEL: {vessels.GetValueOrDefault(first.VesselCode)?.VesselName} / {Voyage("EXPORT", first.OperatorVoyageIn, first.OperatorVoyageOut)}"),
+                new($"ETD: {eta}"),
+            ]));
+        }
+
+        return new TabularReport(
+            FileName: $"PendingBookingSummary_{Day(from, "yyyyMMdd")}-{Day(to, "yyyyMMdd")}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 1,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true),
+                new(" Summary Pending Booking Report", 10, Bold: true),
+                new($"From ETD:{Day(from, "dd-MM-yyyy")} ", 10, Bold: true),
+                new($"To ETD:{Day(to, "dd-MM-yyyy")}", 10, Bold: true),
+                new(" ", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: columns,
+            HeaderRows: [],
+            Rows: [],
+            PageLabel: "Page No#",
+            After: blocks);
+    }
 }

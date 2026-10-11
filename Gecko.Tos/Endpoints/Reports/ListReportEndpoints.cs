@@ -34,6 +34,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/booking-container-list.{pdf|xlsx}   TMS.CustomerService.BookingContainerList
 ///   GET /reports/booking-form.{pdf|xlsx}   TMS.CustomerService.BookingForm
 ///   GET /reports/repo-form.{pdf|xlsx}   TMS.CustomerService.BookingForm.RepoInForm (the desktop's "Repo Form")
+///   GET /reports/pending-booking-summary.{pdf|xlsx}   TMS.CustomerService.PendingBookingSummary
 ///   GET /reports/truck-control.{pdf|xlsx}   TMS.Operation.OutBound.TruckControl
 ///   GET /reports/cy-container-monthly-movement.{pdf|xlsx}   TMS.Operation.OutBound.CYContainerMonthlyMovement
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
@@ -107,6 +108,11 @@ internal static class ListReportEndpoints
                 r => CustomerServiceReports.RepoFormAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
             .WithSummary("Repo Form (Vector CustomerService.BookingForm.RepoInForm): REPO bookings' boxes per movement day and booking, summed by size")
             .WithDescription("dateFrom/dateTo: the lines' required (movement) days.");
+        reports.MapOperation("/pending-booking-summary.{format}",
+                r => CustomerServiceReports.PendingBookingSummaryAsync(r.Db, r.Master, r.Heading, r.From, r.To,
+                    r.Q.AgentCode, r.Q.CustomerCode, r.Q.VesselCode, r.Q.BookingBlNo, r.Ct))
+            .WithSummary("Summary Pending Booking Report (Vector CustomerService.PendingBookingSummary): export bookings' booked and pending steps by size")
+            .WithDescription("dateFrom/dateTo: the depot days the vessel's ETA falls on (Vector's FromETD/ToETD, which filtered the ETA).");
         reports.MapOperation("/truck-control.{format}",
                 r => OutboundReports.TruckControlAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
             .WithSummary("Truck Control (Vector OutBound.TruckControl): export calls by loading port with closings and full gate-in/out counts")

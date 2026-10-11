@@ -842,4 +842,43 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Pending_booking_summary_counts_the_export_boxs_booked_and_pending_steps()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        try
+        {
+            var call = await ExportGatedInAsync(client, carrierRef, box, ct);
+            var eta = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(call.Eta, TimeZoneInfo.FindSystemTimeZoneById("Asia/Bangkok")).DateTime);
+            var url = $"{Reports}/pending-booking-summary.xlsx?branchId={SctLcb01}&dateFrom={eta:yyyy-MM-dd}&dateTo={eta:yyyy-MM-dd}&agentCode=ONEY&bookingBlNo={carrierRef}";
+            var etaText = eta.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == " Summary Pending Booking Report");
+            Assert.Contains(rows, r => r[0].StartsWith("AGENT: ONEY", StringComparison.Ordinal) && r[0].Contains("C/T YARD") && r[0].Contains("C/T PORT"));
+            Assert.Contains(rows, r => r[0] == "VESSEL: EASTERN PIONEER / 069S");
+            Assert.Contains(rows, r => r[0] == "ETD: " + etaText);
+            Assert.Contains(rows, r => r[0] == "Customer Name" && r[1] == "booking" && r[2] == "ETD" && r[3] == "Booking Empty" && r[9] == "TOTAL"
+                                       && r[10] == "Pending Empty Out" && r[17] == "Booking Full" && r[24] == "PENDING FULL IN" && r[31] == "Pending Full Out");
+            Assert.Contains(rows, r => r[3] == "20'" && r[8] == "40'RH" && r[36] == "40'RH");
+            var row = Assert.Single(rows, r => r[1] == carrierRef);
+            Assert.Equal(etaText, row[2]);
+            Assert.True(row[0].Length > 0, "the customer's name prints");
+            // 20' and TOTAL of each section: the empty pick-up done, the full gate-in done, not yet gone out full.
+            Assert.Equal(["1", "1", "0", "0", "1", "1", "0", "0", "1", "1"],
+                [row[3], row[9], row[10], row[16], row[17], row[23], row[24], row[30], row[31], row[37]]);
+            var total = Assert.Single(rows, r => r[0] == "Total");
+            Assert.Equal(row[3..], total[3..]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

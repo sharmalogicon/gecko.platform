@@ -83,17 +83,23 @@ public sealed class OperationReportApiTests(TosApiFactory api)
     /// An empty box brought in on an INT IN (MAEU) and taken out on an INT OUT by another truck: an empty gate-out now.
     /// Through the one-call trip Save, as GateOutTripApiTests gates INT IN / INT OUT.
     /// </summary>
-    private static async Task EmptyInThenOutAsync(HttpClient client, string carrierRef, string box, CancellationToken ct)
+    private static async Task EmptyInThenOutAsync(HttpClient client, string carrierRef, string box, CancellationToken ct,
+        string line = "MAEU", string outOrderType = "INT OUT", Guid? outCall = null)
     {
-        foreach (var (orderType, suffix, move, plate) in new (string, string, object, string)[]
+        foreach (var (orderType, suffix, move, plate, call) in new (string, string, object, string, Guid?)[]
                  {
-                     ("INT IN", "I", new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m }, "70-4321"),
-                     ("INT OUT", "O", new { containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT" }, "70-4322"),
+                     ("INT IN", "I", new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m }, "70-4321", null),
+                     (outOrderType, "O", new
+                     {
+                         containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT", grossWeightKg = 2200m, weightSource = "WEIGHBRIDGE",
+                         seals = new object[] { new { sealNo = $"ZZ-{box[^4..]}", sealType = "LINE", isIntact = true } },
+                     }, "70-4322", outCall),
                  })
         {
             var booked = await client.PostAsJsonAsync("/api/tos/bookings", new
             {
-                branchId = SctLcb01, orderTypeCode = orderType, lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef = carrierRef + suffix,
+                branchId = SctLcb01, orderTypeCode = orderType, lineCode = line, customerCode = call is null ? "CUS-TAE" : "CUS-BKF",
+                carrierRef = carrierRef + suffix, vesselCallId = call, polPortCode = call is null ? null : "THLCH", podPortCode = call is null ? null : "SGSIN",
                 validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
                 requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
                 containers = new object[] { new { containerNo = box } },
@@ -104,6 +110,8 @@ public sealed class OperationReportApiTests(TosApiFactory api)
 
             // An empty pick-up is planned when the truck arrives and gated on a second Save of the same visit at the out lane.
             Guid? visit = null;
+            var status = "";
+            var last = "";
             for (var pass = 0; pass < (DirectionOf(move) == "OUT" ? 2 : 1); pass++)
             {
                 using var request = new HttpRequestMessage(HttpMethod.Post, "/api/tos/gate/trips")
@@ -120,8 +128,10 @@ public sealed class OperationReportApiTests(TosApiFactory api)
                 Assert.True(saved.StatusCode == HttpStatusCode.Created, $"{orderType} gate returned {(int)saved.StatusCode}: {body}");
                 using var answer = System.Text.Json.JsonDocument.Parse(body);
                 visit = answer.RootElement.GetProperty("truckVisitId").GetGuid();
-                if (answer.RootElement.GetProperty("rows")[0].GetProperty("status").GetString() == "GATED") break;
+                (status, last) = (answer.RootElement.GetProperty("rows")[0].GetProperty("status").GetString()!, body);
+                if (status == "GATED") break;
             }
+            Assert.True(status == "GATED", $"{orderType}: {last}");
         }
     }
 
@@ -403,6 +413,40 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             Assert.Equal(["70-4322"], row[2..3]);
             Assert.Equal(["20", "GP"], row[6..8]);
             Assert.Equal("MAEU", row[9]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    [Fact]
+    public async Task Stock_report_lists_an_empty_release_to_an_export_booking()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = Today;
+        var url = $"{Reports}/stock-report.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=ONEY";
+        try
+        {
+            var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>("/api/tos/vessel-calls?pageSize=200", ct))!
+                .Items.Single(c => c.CallRef == "EASTPIONEER-069S");
+            await EmptyInThenOutAsync(client, carrierRef, box, ct, line: "ONEY", outOrderType: "EXP CY/CY", outCall: call.VesselCallId);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< STOCK REPORT >>");
+            Assert.Contains(rows, r => r[0] == "CONTAINER NO." && r[3] == "EMPTY IN" && r[5] == "EMPTY OUT" && r[14] == "REPO");
+            Assert.Contains(rows, r => r[3] == "DATE" && r[4] == "TIME");
+            var row = Assert.Single(rows, r => r[0] == box);
+            Assert.Equal("20GP", row[2]);
+            var date = day.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);
+            Assert.Equal(("", date), (row[3], row[5]));   // it came in on another booking (INT IN): no empty in on this one
+            Assert.Equal(carrierRef + "O", row[13]);
             await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
         }
         finally

@@ -123,4 +123,93 @@ internal static class OutboundReports
             Rows: rows,
             PageLabel: "Page No#");
     }
+
+    // ── TMS.Operation.OutBound.StockReport ──
+
+    /// <summary>
+    /// &lt;&lt; STOCK REPORT &gt;&gt; (Report.usp_OutBound_StockReport) — despite its name, the empty releases to EXPORT bookings on the
+    /// depot days asked for, by container no, with the booked box's empty in, full in and full out around the release, the
+    /// booking's FROM location, shipper and booking no. SEAL NO. is the booked box's declared seal, else the latest line /
+    /// agent seal recorded at the gate on that box (Vector printed its container master's seal, which Gecko does not keep);
+    /// REPO prints blank, as in the RDL.
+    /// </summary>
+    public static async Task<TabularReport> StockReportAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to, string? agentCode, CancellationToken ct)
+    {
+        var query = InboundReports.Moves(db, h.Branch, from, to)
+            .Where(m => m.Direction == GateRules.Out && m.FullEmpty == GateRules.Empty && m.BookingTypeCode == "EXPORT");
+        if (Clean(agentCode) is { } agent) query = query.Where(m => m.LineCode == agent);
+        var moves = (await query.ToListAsync(ct)).OrderBy(m => m.ContainerNo, StringComparer.Ordinal).ThenBy(m => m.At).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(moves.Select(m => m.CustomerCode).OfType<string>().Distinct(), ct);
+
+        // The booked boxes' own moves (their empty in, full in / out) and seals.
+        var boxes = moves.Select(m => m.BookingContainerId).Distinct().ToList();
+        var declared = new Dictionary<Guid, string?>();
+        var others = new List<(Guid Box, Guid Move, string Direction, string FullEmpty, DateTimeOffset At)>();
+        foreach (var slice in boxes.Chunk(2000))
+        {
+            foreach (var x in await db.BookingContainers.AsNoTracking().Where(b => slice.Contains(b.BookingContainerId))
+                         .Select(b => new { b.BookingContainerId, b.DeclaredSealNo }).ToListAsync(ct))
+                declared[x.BookingContainerId] = x.DeclaredSealNo;
+            others.AddRange((await db.GateTransactions.AsNoTracking()
+                    .Where(g => slice.Contains(g.BookingContainerId) && g.Status == "COMPLETED" && g.DeletedAt == null)
+                    .Select(g => new { g.BookingContainerId, g.GateTransactionId, g.Direction, g.FullEmpty, g.TransactionAt }).ToListAsync(ct))
+                .Select(g => (g.BookingContainerId, g.GateTransactionId, g.Direction, g.FullEmpty, g.TransactionAt)));
+        }
+        var byBox = others.ToLookup(o => o.Box);
+        var seals = new List<(Guid Move, DateTimeOffset At, string SealNo, string SealType)>();
+        foreach (var slice in others.Select(o => o.Move).Distinct().Chunk(2000))
+            seals.AddRange((await db.GateTransactionSeals.AsNoTracking().Where(s => slice.Contains(s.GateTransactionId) && s.DeletedAt == null)
+                    .Select(s => new { s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType }).ToListAsync(ct))
+                .Select(s => (s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType)));
+        var sealsByMove = seals.Where(s => IsAgentSeal(s.SealType)).ToLookup(s => s.Move);
+        string? Seal(Guid box) => declared.GetValueOrDefault(box)
+            ?? byBox[box].SelectMany(o => sealsByMove[o.Move]).OrderByDescending(s => s.At).Select(s => s.SealNo).FirstOrDefault();
+        DateTime? When(Guid box, string direction, string load, bool first)
+        {
+            var set = byBox[box].Where(o => o.Direction == direction && o.FullEmpty == load).Select(o => o.At).ToList();
+            return set.Count == 0 ? null : Local(h.Branch, first ? set.Min() : set.Max());
+        }
+
+        var rows = moves.Select(m =>
+        {
+            var (size, type) = SizeType(types, m.EquipmentTypeCode);
+            var (emptyIn, emptyOut) = (When(m.BookingContainerId, GateRules.In, GateRules.Empty, true), Local(h.Branch, m.At));
+            var (fullIn, fullOut) = (When(m.BookingContainerId, GateRules.In, GateRules.Full, true), When(m.BookingContainerId, GateRules.Out, GateRules.Full, false));
+            return new TabularRow([m.ContainerNo, Seal(m.BookingContainerId), $"{size}{type}", emptyIn, emptyIn, emptyOut, emptyOut,
+                m.NextPrevLocation, m.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, fullIn, fullIn, fullOut, fullOut,
+                m.BookingBlNo, null]);
+        }).ToList();
+
+        TabularColumn Col(double mm, string? format = null, CellAlign align = CellAlign.Left) => new(mm / 10, format, align);
+        TabularColumn Date(double mm) => Col(mm, "dd/MM/yyyy", CellAlign.Center);
+        TabularColumn Time() => Col(12.29311, "H:mm", CellAlign.Center);
+        return new TabularReport(
+            FileName: $"StockReport_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("<< STOCK REPORT >>", 10, Bold: true),
+                new($"ACTIVITIES DATE: {Day(from)} TO: {Day(to)}"), new($"Agent: {Clean(agentCode)}"),
+            ],
+            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                Col(26.86861), Col(22.14781), Col(10.56608, null, CellAlign.Center), Date(23.16795), Time(), Date(23.14791), Time(),
+                Col(19.97292), Col(31.53963), Date(20.50208), Time(), Date(21.47223), Time(), Col(26.05834), Col(13.62292),
+            ],
+            HeaderRows:
+            [
+                [new("CONTAINER NO.", RowSpan: 2), new("SEAL NO.", RowSpan: 2), new("SIZE", RowSpan: 2), new("EMPTY IN", ColSpan: 2),
+                 new("EMPTY OUT", ColSpan: 2), new("FROM", RowSpan: 2), new("SHIPPER", RowSpan: 2), new("FULL IN", ColSpan: 2),
+                 new("FULL OUT", ColSpan: 2), new("BOOKING NO.", RowSpan: 2), new("REPO", RowSpan: 2)],
+                [new("DATE"), new("TIME"), new("DATE"), new("TIME"), new("DATE"), new("TIME"), new("DATE"), new("TIME")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#");
+    }
 }

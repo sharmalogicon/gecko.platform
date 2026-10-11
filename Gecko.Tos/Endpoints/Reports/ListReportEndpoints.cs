@@ -31,6 +31,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
+///   GET /reports/stock-report.{pdf|xlsx}   TMS.Operation.OutBound.StockReport
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -79,6 +80,9 @@ internal static class ListReportEndpoints
         reports.MapOperation("/truck-turn-around.{format}",
                 r => OutboundReports.TruckTurnAroundAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
             .WithSummary("Truck Turn Around (Vector OutBound.TruckTurnAround, มาตรฐานปล่อยตู้เปล่า CY): empty gate-outs with the truck's in/out minutes");
+        reports.MapOperation("/stock-report.{format}",
+                r => OutboundReports.StockReportAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("STOCK REPORT (Vector OutBound.StockReport): empty releases to export bookings with the box's in/out dates");
 
         return tos;
     }

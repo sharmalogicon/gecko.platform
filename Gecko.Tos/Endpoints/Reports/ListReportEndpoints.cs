@@ -33,6 +33,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/weekly-monthly-statistics.{pdf|xlsx}   TMS.CustomerService.WeeklyMonthlyStatistics ("EXPORT - Monthly/Weekly")
 ///   GET /reports/booking-container-list.{pdf|xlsx}   TMS.CustomerService.BookingContainerList
 ///   GET /reports/truck-control.{pdf|xlsx}   TMS.Operation.OutBound.TruckControl
+///   GET /reports/cy-container-monthly-movement.{pdf|xlsx}   TMS.Operation.OutBound.CYContainerMonthlyMovement
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
@@ -100,6 +101,10 @@ internal static class ListReportEndpoints
                 r => OutboundReports.TruckControlAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
             .WithSummary("Truck Control (Vector OutBound.TruckControl): export calls by loading port with closings and full gate-in/out counts")
             .WithDescription("dateFrom/dateTo: the depot days the vessel's ETD falls on.");
+        reports.MapOperation("/cy-container-monthly-movement.{format}",
+                r => OutboundReports.CyMonthlyMovementAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("CY Container Movements - Monthly (Vector OutBound.CYContainerMonthlyMovement): export box places by shipper and agent, region, dry/reefer, size")
+            .WithDescription("dateFrom/dateTo: the days the places are due (required date, else vessel ETD, else the booking's valid-from).");
         reports.MapOperation("/pti.{format}", r => Task.FromResult(OutboundReports.Pti(r.Heading, r.From, r.To)))
             .WithSummary("PTI REPORT (Vector OutBound.PTI): heading and columns only until Gecko records PTI work orders");
         reports.MapOperation("/container-repair-summary.{format}", r => Task.FromResult(OutboundReports.ContainerRepairSummary(r.Heading, r.From, r.To)))

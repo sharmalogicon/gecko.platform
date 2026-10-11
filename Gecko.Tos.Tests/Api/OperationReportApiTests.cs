@@ -736,4 +736,36 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Cy_monthly_movement_counts_the_export_place_under_its_shipper_agent_and_region()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var required = new DateOnly(2026, 12, 23);
+        var url = $"{Reports}/cy-container-monthly-movement.xlsx?branchId={SctLcb01}&dateFrom={required:yyyy-MM-dd}&dateTo={required:yyyy-MM-dd}&agentCode=ONEY";
+        try
+        {
+            await ExportGatedInAsync(client, carrierRef, box, ct, required);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "CY CONTAINERS MOVEMENT (PORT)");
+            var regions = rows.First(r => r[0] == "SHIPPER");
+            var region = Array.IndexOf(regions, "ASIA");   // SGSIN, the booking's discharge port
+            Assert.True(region > 0, string.Join("|", regions));
+            Assert.Contains(rows, r => r[region] == "DRY");
+            Assert.Contains(rows, r => r.Contains("20"));
+            var agent = rows.Single(r => r[0] == "ONEY");
+            Assert.Equal("1", agent[^1].Length > 0 ? agent.Last(c => c.Length > 0) : "");
+            Assert.Contains(rows, r => r[0] == "AGENT");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

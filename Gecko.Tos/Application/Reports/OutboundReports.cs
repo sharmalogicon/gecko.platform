@@ -519,6 +519,114 @@ internal static class OutboundReports
             Rows: rows,
             PageLabel: "Page No#");
     }
+
+    // ── TMS.Operation.OutBound.CYContainerMonthlyMovement ──
+
+    /// <summary>
+    /// CY CONTAINERS MOVEMENT (PORT) &lt;&lt; Monthly Report &gt;&gt; (Report.usp_OutBound_CYContainerMonthlyMovement): the EXPORT
+    /// bookings' box places due on the depot days asked for, counted by SHIPPER and by AGENT under the destination port's
+    /// region (gecko_master 33), DRY / REEFER and size, with Total column and row. Owner 2026-10-11: a place's day is its
+    /// box's required date, else the vessel's ETD, else the booking's valid-from (Gecko rarely holds a required date); places
+    /// with no box yet count too, as Vector counted every slot. A booking with no destination port or customer is out, as
+    /// on Vector; a port without a region counts under NONE.
+    /// </summary>
+    public static async Task<TabularReport> CyMonthlyMovementAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to, string? agentCode, CancellationToken ct)
+    {
+        var (first, last) = (from, to);
+        var (start, end) = (BranchClock.StartOf(h.Branch, from), BranchClock.StartOf(h.Branch, to.AddDays(1)));
+        var bookings = db.Bookings.AsNoTracking().Where(b => b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "EXPORT"
+            && b.Status != "CANCELLED" && b.DeletedAt == null && b.CustomerPartyCode != null && (b.FpdPortCode != null || b.PodPortCode != null));
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => b.LinePartyCode == agent);
+        var candidates = await (
+                from b in bookings
+                join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId into calls
+                from c in calls.DefaultIfEmpty()
+                where (c != null && c.Etd >= start && c.Etd < end) || (b.ValidFrom >= first && b.ValidFrom <= last)
+                      || db.BookingContainers.Any(x => x.BookingId == b.BookingId && x.RequiredDate >= first && x.RequiredDate <= last)
+                select new
+                {
+                    b.BookingId, b.LinePartyCode, b.CustomerPartyCode, Port = b.FpdPortCode ?? b.PodPortCode, b.ValidFrom,
+                    Etd = c == null ? (DateTimeOffset?)null : c.Etd,
+                })
+            .ToListAsync(ct);
+        var ids = candidates.Select(b => b.BookingId).ToList();
+        var requirements = new List<(Guid Booking, Guid Line, string Type, short Qty)>();
+        var boxes = new List<(Guid Line, DateOnly? Required)>();
+        foreach (var slice in ids.Chunk(2000))
+        {
+            requirements.AddRange((await db.EquipmentRequirements.AsNoTracking().Where(r => slice.Contains(r.BookingId))
+                    .Select(r => new { r.BookingId, r.EquipmentRequirementId, r.EquipmentTypeCode, r.Qty }).ToListAsync(ct))
+                .Select(r => (r.BookingId, r.EquipmentRequirementId, r.EquipmentTypeCode, r.Qty)));
+            boxes.AddRange((await db.BookingContainers.AsNoTracking()
+                    .Where(x => slice.Contains(x.BookingId) && x.DeletedAt == null && (x.EndedAt == null || x.EndReason == "COMPLETED"))
+                    .Select(x => new { x.EquipmentRequirementId, x.RequiredDate }).ToListAsync(ct))
+                .Select(x => (x.EquipmentRequirementId, x.RequiredDate)));
+        }
+        var boxesByLine = boxes.ToLookup(x => x.Line);
+        var byId = candidates.ToDictionary(b => b.BookingId);
+
+        // Every place of every line: its box's required date, else the vessel's ETD, else the booking's valid-from.
+        var slots = new List<(Guid Booking, string Type)>();
+        foreach (var r in requirements)
+        {
+            var b = byId[r.Booking];
+            DateOnly? fallback = b.Etd is { } etd ? LocalDay(h.Branch, etd) : b.ValidFrom;
+            var placed = boxesByLine[r.Line].Select(x => x.Required ?? fallback).ToList();
+            placed.AddRange(Enumerable.Repeat(fallback, Math.Max(0, r.Qty - placed.Count)));
+            slots.AddRange(placed.Where(d => d >= first && d <= last).Select(_ => (r.Booking, r.Type)));
+        }
+
+        var types = await TypesAsync(master, slots.Select(s => (string?)s.Type), ct);
+        var ports = await master.PortsAsync(candidates.Select(b => b.Port).OfType<string>().Distinct(), ct);
+        var parties = await master.PartiesAsync(candidates.Select(b => b.CustomerPartyCode).OfType<string>().Distinct(), ct);
+        var counted = slots
+            .Select(s => (Slot: s, Booking: byId[s.Booking]))
+            .Where(x => x.Booking.CustomerPartyCode is { } c && parties.ContainsKey(c))
+            .Select(x => (
+                Shipper: parties[x.Booking.CustomerPartyCode!].Name, Agent: x.Booking.LinePartyCode,
+                Column: (Region: ports.GetValueOrDefault(x.Booking.Port!)?.Region ?? "NONE",
+                    Kind: x.Slot.Type is { } t && types.GetValueOrDefault(t)?.IsReefer == true ? "REEFER" : "DRY",
+                    Size: SizeType(types, x.Slot.Type).Size ?? "")))
+            .ToList();
+        var columns = counted.Select(c => c.Column).Distinct()
+            .OrderBy(c => c.Region, StringComparer.Ordinal).ThenBy(c => c.Kind, StringComparer.Ordinal).ThenBy(c => c.Size, StringComparer.Ordinal).ToList();
+
+        IReadOnlyList<IReadOnlyList<HeaderCell>> Headers(string corner) =>
+        [
+            [new(corner, RowSpan: 3), .. columns.GroupBy(c => c.Region).Select(g => new HeaderCell(g.Key, ColSpan: g.Count())), new("Total", RowSpan: 3)],
+            [.. columns.GroupBy(c => (c.Region, c.Kind)).Select(g => new HeaderCell(g.Key.Kind, ColSpan: g.Count()))],
+            [.. columns.Select(c => new HeaderCell(c.Size))],
+        ];
+        IReadOnlyList<TabularRow> Rows(Func<(string Shipper, string Agent, (string Region, string Kind, string Size) Column), string> by)
+        {
+            var rows = counted.GroupBy(by).OrderBy(g => g.Key, StringComparer.Ordinal)
+                .Select(g => new TabularRow([g.Key, .. columns.Select(c => (object?)g.Count(x => x.Column == c)), g.Count()]))
+                .ToList();
+            rows.Add(new TabularRow(["Total", .. columns.Select(c => (object?)counted.Count(x => x.Column == c)), counted.Count], RowKind.Total));
+            return rows;
+        }
+        IReadOnlyList<TabularColumn> Cols(double labelCm) =>
+            [new(labelCm), .. columns.Select(_ => new TabularColumn(2.077, "0;(0);\"\"", CellAlign.Center)), new(1.574, null, CellAlign.Center)];
+
+        return new TabularReport(
+            FileName: $"CyContainerMonthlyMovement_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("CY CONTAINERS MOVEMENT (PORT)", 10, Bold: true), new("<< Monthly Report >>", 10, Bold: true),
+                new($"ACTIVITIES DATE: {Day(from)} TO: {Day(to)}"),
+            ],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: Cols(6.733),
+            HeaderRows: Headers("SHIPPER"),
+            Rows: Rows(x => x.Shipper),
+            PageLabel: "Page No#",
+            After: [new TabularBlock(null, Cols(6.733), Headers("AGENT"), Rows(x => x.Agent))]);
+    }
 }
 
 /// <summary>Stuffing - UnStuffing's filters, Vector's (BookingBLNo matches the carrier or customer reference).</summary>

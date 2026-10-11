@@ -23,6 +23,9 @@ public partial class Port
 
     public string TradeMode { get; set; } = null!;
 
+    /// <summary>Vector's region (ASIA, EUROPE, AMERICA, AUSTRALIA, AFRICA, MIDDLEEAST, CANADA, NONE) — gecko_master 33.</summary>
+    public string? RegionCode { get; set; }
+
     public decimal? Latitude { get; set; }
 
     public decimal? Longitude { get; set; }

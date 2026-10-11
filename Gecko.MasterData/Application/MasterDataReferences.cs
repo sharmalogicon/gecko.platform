@@ -170,7 +170,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(portCodes);
         return await db.Ports.AsNoTracking()
             .Where(p => codes.Contains(p.PortCode))
-            .Select(p => new PortRef(p.PortId, p.PortCode, p.PortNameEn, p.UnLocode, p.Timezone, p.IsActive, p.TradeMode))
+            .Select(p => new PortRef(p.PortId, p.PortCode, p.PortNameEn, p.UnLocode, p.Timezone, p.IsActive, p.TradeMode, p.RegionCode))
             .ToDictionaryAsync(p => p.PortCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 

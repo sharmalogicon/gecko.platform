@@ -3271,6 +3271,10 @@ public partial class MasterDataDbContext : DbContext
                 .HasMaxLength(50)
                 .IsUnicode(false)
                 .HasColumnName("timezone");
+            entity.Property(e => e.RegionCode)
+                .HasMaxLength(20)
+                .IsUnicode(false)
+                .HasColumnName("region_code");
             entity.Property(e => e.TradeMode)
                 .HasMaxLength(20)
                 .IsUnicode(false)

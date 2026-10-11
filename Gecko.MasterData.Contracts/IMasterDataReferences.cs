@@ -223,7 +223,9 @@ public sealed record EquipmentTypeRef(Guid EquipmentTypeId, string TypeCode, str
 public sealed record VesselRef(Guid VesselId, string VesselCode, string VesselName, string? ImoNumber, bool IsActive);
 
 /// <param name="TradeMode">MDM logistics.port.trade_mode — what Vector's booking showed as "Trade Mode" for the destination.</param>
-public sealed record PortRef(Guid PortId, string PortCode, string Name, string? UnLocode, string? TimeZone, bool IsActive, string? TradeMode = null);
+/// <param name="Region">Vector's region of the port (ASIA, EUROPE, …, NONE): what its CY Container Monthly Movement grouped by.</param>
+public sealed record PortRef(Guid PortId, string PortCode, string Name, string? UnLocode, string? TimeZone, bool IsActive, string? TradeMode = null,
+    string? Region = null);
 
 public sealed record OrderTypePlanRef(
     Guid OrderTypeId, string OrderTypeCode, bool IsActive,

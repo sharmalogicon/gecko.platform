@@ -799,4 +799,47 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Repo_form_sums_a_repo_bookings_boxes_on_their_movement_day()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var (box1, box2) = (NewBox(), NewBox());
+        var required = new DateOnly(2026, 12, 21);
+        var url = $"{Reports}/repo-form.xlsx?branchId={SctLcb01}&dateFrom={required:yyyy-MM-dd}&dateTo={required:yyyy-MM-dd}&agentCode=MAEU&orderType=REPO%20IN";
+        try
+        {
+            var booked = await client.PostAsJsonAsync("/api/tos/bookings", new
+            {
+                branchId = SctLcb01, orderTypeCode = "REPO IN", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                nextPrevLocation = "ZZ Lat Krabang", validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+                requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 2 } },
+                containers = new object[] { new { containerNo = box1, requiredDate = required }, new { containerNo = box2, requiredDate = required } },
+            }, ct);
+            Assert.True(booked.StatusCode == HttpStatusCode.Created, $"booking returned {(int)booked.StatusCode}: {await booked.Content.ReadAsStringAsync(ct)}");
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "REPO IN FORM ");
+            Assert.Contains(rows, r => r[0] == "AGENT CODE:MAEU");
+            Assert.Contains(rows, r => r[0] == "From Date:21/12/2026  To Date:21/12/2026");
+            Assert.Contains(rows, r => r[0] == "Movement Date" && r[5] == "Order Type " && r[7] == "Truck Name" && r[8] == "DRY" && r[14] == "REEFER" && r[17] == "REMARK");
+            Assert.Contains(rows, r => r[8] == "20'" && r[13] == "40'FT" && r[16] == "40'RH");
+            var row = Assert.Single(rows, r => r[4] == carrierRef);
+            Assert.Equal(["21/12/2026", "REPO IN", "ZZ Lat Krabang", ""], [row[0], row[5], row[6], row[7]]);
+            Assert.Contains(row[2], new[] { box1, box2 });
+            Assert.True(row[1].Length > 0 && row[3].Length > 0, "consignee and agent names print");
+            Assert.Equal(["2", "0", "0", "0", "0", "0", "0", "0", "0"], row[8..17]);
+
+            var other = await SheetAsync(client, url + "&bookingType=EXPORT", ct);
+            Assert.DoesNotContain(other, r => r[4] == carrierRef);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveBoxReservationsAsync(box1, box2);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

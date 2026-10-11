@@ -301,4 +301,95 @@ internal static class CustomerServiceReports
             Rows: rows,
             PageLabel: "Page No.");
     }
+
+    // ── TMS.CustomerService.BookingForm.RepoInForm ──
+
+    /// <summary>
+    /// The desktop's "Repo Form" (Report.usp_CustomerService_RepoInForm): the depot's REPO bookings' box lines whose required
+    /// day falls in the days asked for, a row per required day + booking as the RDL groups them — consignee / shipper
+    /// (whatever its roles), the group's first container no (lowest requirement line, then the earliest assigned, among the
+    /// nominated lines), agent (the booking's line), booking no, order type, Move empty From (the booking's next / previous
+    /// location), Truck Name blank (a blank textbox on the RDL) and the summed size columns (<see cref="SizeCounts"/>; 45'
+    /// leaves out open tops, as this RDL does). Asking for another booking type gives nothing, as on Vector; its movement and
+    /// shipment-type parameters were never applied. REMARK prints blank: it was Vector's booking text, which Gecko does not
+    /// keep. Cancelled bookings and ended (not completed) lines are out; Vector printed cancelled ones. Rows by day, then
+    /// booking no. The 45 cm grid prints on one A3 sheet, scaled.
+    /// </summary>
+    public static async Task<TabularReport> RepoFormAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? bookingType, string? orderType, CancellationToken ct)
+    {
+        var bookings = db.Bookings.AsNoTracking()
+            .Where(b => b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "REPO" && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(bookingType) is { } type && type != "REPO") bookings = bookings.Where(_ => false);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => b.LinePartyCode == agent);
+        if (Clean(orderType) is { } order) bookings = bookings.Where(b => b.OrderTypeCode == order);
+        var (first, last) = (from, to);
+        var lines = await (
+                from b in bookings
+                join x in db.BookingContainers on b.BookingId equals x.BookingId
+                join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+                where x.DeletedAt == null && (x.EndedAt == null || x.EndReason == "COMPLETED")
+                      && x.RequiredDate != null && x.RequiredDate >= first && x.RequiredDate <= last
+                select new
+                {
+                    RequiredDate = x.RequiredDate!.Value, x.ContainerNo, x.AssignedAt, r.LineNo, r.EquipmentTypeCode,
+                    b.BookingId, b.LinePartyCode, b.CustomerPartyCode, b.CarrierRef, b.CustomerRef, b.OrderTypeCode, b.NextPrevLocation,
+                })
+            .ToListAsync(ct);
+
+        var types = await TypesAsync(master, lines.Select(l => (string?)l.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(lines.Select(l => (string?)l.LinePartyCode).Concat(lines.Select(l => l.CustomerPartyCode))
+            .OfType<string>().Distinct(), ct);
+        string? Name(string? code) => code is null ? null : parties.GetValueOrDefault(code)?.Name;
+
+        var rows = lines.GroupBy(l => (l.RequiredDate, BookingNo: BookingBlNo(l.CarrierRef, l.CustomerRef), l.BookingId))
+            .OrderBy(g => g.Key.RequiredDate).ThenBy(g => g.Key.BookingNo, StringComparer.Ordinal)
+            .Select(g =>
+            {
+                var b = g.First();
+                var counts = new int[9];
+                foreach (var l in g)
+                    foreach (var (n, i) in SizeCounts(types, l.EquipmentTypeCode, noOpenTop45: true).Select((n, i) => (n, i))) counts[i] += n;
+                var box = g.Where(l => !string.IsNullOrEmpty(l.ContainerNo)).OrderBy(l => l.LineNo).ThenBy(l => l.AssignedAt).FirstOrDefault()?.ContainerNo;
+                return new TabularRow(
+                [
+                    g.Key.RequiredDate, Name(b.CustomerPartyCode), box, Name(b.LinePartyCode), g.Key.BookingNo, b.OrderTypeCode,
+                    b.NextPrevLocation, null, .. counts.Cast<object?>(), null,
+                ]);
+            }).ToList();
+
+        var center = CellAlign.Center;
+        return new TabularReport(
+            FileName: $"RepoForm_{Day(from, "yyyyMMdd")}-{Day(to, "yyyyMMdd")}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true),
+                new(Clean(orderType) + " FORM ", 10, Bold: true),
+                new("AGENT CODE:" + Clean(agentCode), 10, Bold: true),
+                new($"From Date:{Day(from, "dd/MM/yyyy")}  To Date:{Day(to, "dd/MM/yyyy")}", 10, Bold: true),
+                new("", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Printed By. {h.PrintedBy}"), new($"Printed On. {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.5, "dd/MM/yyyy", center), new(4.55963, null, center), new(4.19333, null, center), new(6.08953, null, center),
+                new(2.76459), new(3.09151, null, center), new(2.92334), new(2.5),
+                new(1.43757, null, center), new(1.48104, null, center), new(1.33583, null, center), new(1.41521, null, center),
+                new(1.36229, null, center), new(1.23, null, center), new(1.17708, null, center), new(1.33583, null, center),
+                new(1.28292, null, center), new(4.06104),
+            ],
+            HeaderRows:
+            [
+                [new("Movement Date"), new("Consignee / Shipper Name"), new("Container No"), new("Agent Name"), new("Booking No."),
+                 new("Order Type "), new("Move empty From"), new("Truck Name"), new("DRY", ColSpan: 6), new("REEFER", ColSpan: 3), new("REMARK")],
+                [new(""), new(""), new(""), new(""), new(""), new(""), new(""), new(""), .. SizeHeaders.Select(s => new HeaderCell(s)), new("")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#");
+    }
 }

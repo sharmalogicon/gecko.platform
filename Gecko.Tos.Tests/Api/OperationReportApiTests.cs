@@ -592,4 +592,44 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Monthly_incoming_counts_the_box_under_its_agent_service_month_and_size()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = GateDay;
+        var url = $"{Reports}/monthly-incoming-container.xlsx?branchId={SctLcb01}&year={day.Year}&bookingType=IMPORT";
+        var dry20 = 2 + (day.Month - 1) * 6;
+        int Cell(string[]? row, int i) => row is null || row[i].Length == 0 ? 0 : int.Parse(row[i]);
+        string[]? Fcl(List<string[]> rows)
+        {
+            var agent = rows.FindIndex(r => r[0] == "MAEU");
+            return agent < 0 ? null : rows.Skip(agent).TakeWhile(r => r[1] != "TOTAL").FirstOrDefault(r => r[1] == "FCL");
+        }
+        try
+        {
+            var before = Fcl(await SheetAsync(client, url, ct));
+            await ImportGatedInAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< Monthly Incoming Container Report >>");
+            Assert.Contains(rows, r => r[0] == "AGENT" && r[1] == "SERVICE" && r[2] == "JANUARY" && r[8] == "FEBUARY" && r[74] == "SUM");
+            Assert.Contains(rows, r => r[2] == "20'" && r[4] == "40'");
+            Assert.Contains(rows, r => r[2] == "DRY" && r[3] == "REEFER" && r[74] == "CONT" && r[75] == "TEU");
+            var after = Fcl(rows);
+            Assert.Equal((1, 1), (Cell(after, dry20) - Cell(before, dry20), Cell(after, 74) - Cell(before, 74)));
+            Assert.Contains(rows, r => r[0] == "SUB.TOTAL");
+            Assert.Contains(rows, r => r[0] == "G.TOTAL");
+            Assert.Contains(rows, r => r[0] == "G.TEUS");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

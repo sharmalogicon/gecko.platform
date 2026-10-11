@@ -29,6 +29,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/customs-import-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.CustomsImportUnStuffing
 ///   GET /reports/daily-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.DailyUnStuffing (no lines until unstuffing is recorded)
 ///   GET /reports/import-container-list.{pdf|xlsx}   TMS.Operation.InBound.ImportContainerList
+///   GET /reports/monthly-incoming-container.{pdf|xlsx}   TMS.Operation.InBound.MonthlyIncomingContainer
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
@@ -64,10 +65,7 @@ internal static class ListReportEndpoints
             .WithSummary("INBOUND EMPTY OUT REPORT (Vector InBound.EmptyOut): every empty gate-out in the days asked for, and its size count");
         reports.MapOperation("/import-export-summary.{format}",
                 r => InboundReports.ImportExportSummaryAsync(r.Db, r.Master, r.Heading, r.Q.Year!.Value, r.Q.MovementCode, r.Q.BookingType, r.Ct),
-                range: false, check: q =>
-                    q.Year is not (>= 2000 and <= 2100) ? TosSupport.Invalid("year", "Which year?")
-                    : q.MovementCode is { Length: > 0 } m && OperationReportKit.Movement(m) is null
-                        ? TosSupport.Invalid("movementCode", "FULL IN, MTY IN, FULL OUT or MTY OUT.") : null)
+                range: false, check: YearAndMovement)
             .WithSummary("SUMMARY (IMPORT - EXPORT) (Vector InBound.ImportExportSummary): a year's moves per agent and month, CONT and TEU");
         reports.MapOperation("/inbound-full-in.{format}",
                 r => InboundReports.NykExternalAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
@@ -82,6 +80,10 @@ internal static class ListReportEndpoints
                     r.Q.AgentCode, r.Q.CustomerCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
             .WithSummary("IMPORT Container List (Vector InBound.ImportContainerList): import boxes by vessel ETA, a page per agent/vessel/voyage")
             .WithDescription("dateFrom/dateTo: the depot days the vessel's ETA falls in (Vector's BookingDateFrom/To).");
+        reports.MapOperation("/monthly-incoming-container.{format}",
+                r => InboundReports.MonthlyIncomingAsync(r.Db, r.Master, r.Heading, r.Q.Year!.Value, r.Q.MovementCode, r.Q.BookingType, r.Ct),
+                range: false, check: YearAndMovement)
+            .WithSummary("Monthly Incoming Container Report (Vector InBound.MonthlyIncomingContainer): a year's moves per agent and service by month, size and reefer");
         reports.MapOperation("/pti.{format}", r => Task.FromResult(OutboundReports.Pti(r.Heading, r.From, r.To)))
             .WithSummary("PTI REPORT (Vector OutBound.PTI): heading and columns only until Gecko records PTI work orders");
         reports.MapOperation("/container-repair-summary.{format}", r => Task.FromResult(OutboundReports.ContainerRepairSummary(r.Heading, r.From, r.To)))
@@ -163,6 +165,12 @@ internal static class ListReportEndpoints
         return File(await StorageActivityReport.BuildAsync(db, master, context!.Branch, context.BranchName, context.PrintedBy, context.Now,
             new StorageActivityFilter(dateFrom!.Value, dateTo!.Value, agentCode, vesselCode, voyageNo, orderType, bookingType), ct), format);
     }
+
+    /// <summary>The yearly reports' year and, when given, one of Vector's four movement names.</summary>
+    private static IResult? YearAndMovement(OperationReportQuery q) =>
+        q.Year is not (>= 2000 and <= 2100) ? TosSupport.Invalid("year", "Which year?")
+        : q.MovementCode is { Length: > 0 } m && OperationReportKit.Movement(m) is null
+            ? TosSupport.Invalid("movementCode", "FULL IN, MTY IN, FULL OUT or MTY OUT.") : null;
 
     /// <summary>
     /// An Operation report taking the common query (<see cref="OperationReportQuery"/>): the depot checked, the date range

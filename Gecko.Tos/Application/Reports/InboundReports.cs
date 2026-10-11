@@ -642,4 +642,98 @@ internal static class InboundReports
             PageLabel: "Page No#",
             After: blocks);
     }
+
+    // ── TMS.Operation.InBound.MonthlyIncomingContainer ──
+
+    private static readonly string[] MonthNames =
+        ["JANUARY", "FEBUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+
+    private static readonly double[] MonthlyWidths =
+    [
+        0.85958, 1.30938, 0.93014, 1.25646, 0.88604, 1.25646, 0.9125, 1.33583, 0.96132, 1.25646, 0.85958, 1.25799,
+        0.83313, 1.30938, 0.85958, 1.25646, 0.85958, 1.28292, 0.99784, 1.25646, 0.85958, 1.28292, 0.89549, 1.25646,
+        0.96542, 1.30938, 0.93076, 1.24354, 0.83313, 1.30938, 0.80667, 1.30938, 1.07125, 1.46813, 0.96542, 1.36229,
+        0.96542, 1.36229, 0.9125, 1.33583, 0.93896, 1.38875, 0.85958, 1.33583, 0.9125, 1.36229, 0.96542, 1.33583,
+        0.96542, 1.30938, 0.93896, 1.30937, 0.88604, 1.33583, 0.96542, 1.30937, 0.99187, 1.33583, 0.99187, 1.38875,
+        0.83312, 1.30937, 0.93896, 1.36229, 0.93896, 1.25646, 0.93896, 1.23, 0.88604, 1.30937, 0.88604, 1.25646,
+    ];
+
+    /// <summary>
+    /// &lt;&lt; Monthly Incoming Container Report &gt;&gt; (Report.usp_Inbound_MonthlyIncomingContainer): one year's moves of one kind
+    /// (Vector's movement name, FULL IN by default), optionally of one booking type, as an AGENT × SERVICE (shipment type)
+    /// matrix of 12 months × 20'/40'/45' × DRY/REEFER, with SUM CONT and TEU (20' = 1, other sizes 2), each agent's TOTAL,
+    /// SUB.TOTAL, and the month's G.TOTAL and G.TEUS (printed in the first of the month's six cells; the RDL merged them).
+    /// Reefer is master data's (Vector flagged only RF, so it counted RH as dry); SUB.TOTAL's FEB 45' DRY counts 45' dry boxes
+    /// (the RDL's ignored the reefer flag). The 88 cm of columns print on one A3 sheet, scaled down; "FEBUARY" as the RDL.
+    /// </summary>
+    public static async Task<TabularReport> MonthlyIncomingAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, int year, string? movement, string? bookingType, CancellationToken ct)
+    {
+        var name = string.IsNullOrWhiteSpace(movement) ? "FULL IN" : movement.Trim().Replace('_', ' ').ToUpperInvariant();
+        var (direction, load) = Movement(name) ?? ("IN", "FULL");
+        var query = Moves(db, h.Branch, new DateOnly(year, 1, 1), new DateOnly(year, 12, 31)).Where(m => m.Direction == direction && m.FullEmpty == load);
+        if (Clean(bookingType) is { } type) query = query.Where(m => m.BookingTypeCode == type);
+        var moves = await query.ToListAsync(ct);
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        int Month(Move m) => Local(h.Branch, m.At).Month;
+        string? Size(Move m) => SizeType(types, m.EquipmentTypeCode).Size;
+        bool Reefer(Move m) => m.EquipmentTypeCode is { } c && types.GetValueOrDefault(c)?.IsReefer == true;
+        int Teu(Move m) => Size(m) == "20" ? 1 : 2;
+        string[] sizes = ["20", "40", "45"];
+        object?[] Cells(IReadOnlyCollection<Move> set, bool zeros) =>
+        [
+            .. Enumerable.Range(1, 12).SelectMany(month => sizes.SelectMany(size => new[] { false, true }.Select(reefer =>
+            {
+                var n = set.Count(m => Month(m) == month && Size(m) == size && Reefer(m) == reefer);
+                return zeros ? (object?)n.ToString(System.Globalization.CultureInfo.InvariantCulture) : n;
+            }))),
+            zeros ? set.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) : set.Count, set.Sum(Teu),
+        ];
+
+        var rows = new List<TabularRow>();
+        foreach (var agent in moves.GroupBy(m => m.LineCode).OrderBy(g => g.Key, StringComparer.Ordinal))
+        {
+            var label = agent.Key;
+            foreach (var service in agent.GroupBy(m => ShipmentType(m.OrderTypeCode)).OrderBy(g => g.Key, StringComparer.Ordinal))
+            {
+                rows.Add(new TabularRow([label, service.Key, .. Cells(service.ToList(), zeros: false)]));
+                label = null;
+            }
+            rows.Add(new TabularRow([null, "TOTAL", .. Cells(agent.ToList(), zeros: false)], RowKind.Subtotal));
+        }
+        rows.Add(new TabularRow([]));
+        rows.Add(new TabularRow(["SUB.TOTAL", null, .. Cells(moves, zeros: true)], RowKind.Subtotal));
+        object?[] PerMonth(Func<IEnumerable<Move>, int> value) =>
+            [.. Enumerable.Range(1, 12).SelectMany(month => new object?[] { value(moves.Where(m => Month(m) == month)), null, null, null, null, null })];
+        rows.Add(new TabularRow(["G.TOTAL", null, .. PerMonth(set => set.Count()), moves.Count, null], RowKind.Total));
+        rows.Add(new TabularRow(["G.TEUS", null, .. PerMonth(set => set.Sum(Teu)), null, moves.Sum(Teu)], RowKind.Total));
+
+        const string blankZero = "0;(0);\"\"";
+        return new TabularReport(
+            FileName: $"MonthlyIncomingContainer_{year}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 1,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("<< Monthly Incoming Container Report >>", 10, Bold: true),
+                new($"Year:{year} Booking Type:{Clean(bookingType)} Movement Code:{name}", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {ListReport.Text(h.PrintedAt.DateTime, null)}", 10)],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.07667), new(2.21778),
+                .. MonthlyWidths.Select(w => new TabularColumn(w, blankZero, CellAlign.Center)),
+                new(1.57396, blankZero, CellAlign.Center), new(1.49458, null, CellAlign.Center),
+            ],
+            HeaderRows:
+            [
+                [new("AGENT", RowSpan: 3), new("SERVICE", RowSpan: 3), .. MonthNames.Select(m => new HeaderCell(m, ColSpan: 6)), new HeaderCell("SUM", ColSpan: 2)],
+                [.. Enumerable.Range(0, 12).SelectMany(_ => sizes.Select(s => new HeaderCell(s + "'", ColSpan: 2))), new HeaderCell("", ColSpan: 2)],
+                [.. Enumerable.Range(0, 36).SelectMany(_ => new[] { new HeaderCell("DRY"), new HeaderCell("REEFER") }), new HeaderCell("CONT"), new HeaderCell("TEU")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No#");
+    }
 }

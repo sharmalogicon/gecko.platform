@@ -59,6 +59,7 @@ public static class RevenueModule
         services.AddScoped<WindowService>();
         services.AddScoped<ReceiptDocument>();
         services.AddScoped<CouponSlipDocument>();
+        services.AddScoped<InvoiceFormDocument>();
         services.AddScoped<AutomaticCoupons>();
 
         // What Revenue hears from TOS, off gecko_tos's outbox (ADR-007: it never reads gecko_tos).

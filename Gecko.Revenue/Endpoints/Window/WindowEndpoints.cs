@@ -2,6 +2,7 @@ using System.Text.Json;
 using Gecko.Data;
 using Gecko.MasterData.Contracts;
 using Gecko.Revenue.Application;
+using Gecko.Revenue.Endpoints.Charges;
 using Gecko.Revenue.Infrastructure.Persistence;
 using Gecko.Revenue.Infrastructure.Persistence.Entities;
 using Gecko.SharedKernel;
@@ -67,6 +68,8 @@ internal static class WindowEndpoints
             .WithSummary("The receipt as an A4 Thai full tax invoice (ใบเสร็จรับเงิน/ใบกำกับภาษี); a voided one prints with VOID");
         window.MapGet("/receipts/{id:guid}/coupon.pdf", CouponPdfAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
             .WithSummary("The receipt's gate coupons, one slip per box: coupon ref, container, movement, amount, valid until (Vector CouponInvoice)");
+        window.MapGet("/receipts/{id:guid}/cash-invoice.pdf", CashInvoicePdfAsync).RequireBranchPermission(RevenuePermissions.CashCollect)
+            .WithSummary("The receipt on Vector's cash-invoice stationery (TMS.Billing.CashInvoiceReceipt, CustomerCashBill.cs \"Cash Receipt\")");
         window.MapPost("/receipts/{id:guid}/void", VoidReceiptAsync).RequireBranchPermission(RevenuePermissions.ReceiptVoid)
             .WithSummary("Void a wrong receipt before the box has moved: it keeps its number, its charges are cancelled, its coupons are withdrawn");
         window.MapPost("/waive", WaiveAsync).RequireBranchPermission(RevenuePermissions.ChargeWaive)
@@ -525,6 +528,19 @@ internal static class WindowEndpoints
         if (!permissions.HasAt(RevenuePermissions.CashCollect, branchId.Value)) return TypedResults.Forbid();
 
         var rendered = await document.RenderAsync(id, ct);
+        return rendered is null
+            ? TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." })
+            : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
+    }
+
+    private static async Task<Results<FileContentHttpResult, NotFound<ProblemDetails>, ForbidHttpResult>> CashInvoicePdfAsync(
+        Guid id, RevenueDbContext db, InvoiceFormDocument document, ICallerPermissions permissions, CancellationToken ct)
+    {
+        var branchId = await db.Receipts.AsNoTracking().Where(r => r.ReceiptId == id).Select(r => (Guid?)r.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is null) return TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." });
+        if (!permissions.HasAt(RevenuePermissions.CashCollect, branchId.Value)) return TypedResults.Forbid();
+
+        var rendered = await document.ReceiptAsync(id, ct);
         return rendered is null
             ? TypedResults.NotFound(new ProblemDetails { Title = "No such receipt." })
             : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);

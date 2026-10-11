@@ -207,8 +207,11 @@ public sealed record BranchRef(Guid BranchId, string BranchCode, string? TimeZon
 
 /// <param name="OperatorCode">A shipping line's operator code (MDM shipping_line_extension): Vector's booking "Owner Code".</param>
 /// <param name="Phone">The party's primary phone (MDM party.primary_phone): the tax invoice's "โทร." line.</param>
+/// <param name="Address1">party.primary_address1 — with <paramref name="Address2"/>, <paramref name="State"/> and <paramref name="Postcode"/>
+/// the lines Vector's printed forms took from Master.Contact.</param>
 public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool IsActive,
-    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null, string? Phone = null);
+    bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null, string? Phone = null,
+    string? Address1 = null, string? Address2 = null, string? State = null, string? Postcode = null);
 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 

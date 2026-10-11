@@ -37,6 +37,8 @@ internal static class InvoiceEndpoints
             .WithSummary("Issued invoices, newest first");
         invoices.MapGet("/{invoiceId:guid}", GetAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
             .WithSummary("One invoice with its lines");
+        invoices.MapGet("/{invoiceId:guid}/invoice.pdf", PdfAsync).RequireBranchPermission(RevenuePermissions.ChargeView)
+            .WithSummary("The invoice as Vector printed it: TMS.Billing.CreditInvoiceReceipt, or format=cash for TMS.Billing.CashInvoiceReceipt");
         return revenue;
     }
 
@@ -155,6 +157,26 @@ internal static class InvoiceEndpoints
                 db.InvoiceLines.Count(l => l.InvoiceId == i.InvoiceId), i.IssuedAt, i.Remarks))
             .ToPagedAsync(query.Page, query.PageSize, ct);
         return TypedResults.Ok(page);
+    }
+
+    /// <param name="format">credit (default) — Vector's credit invoice form; cash — its cash-invoice format (CustomerInvoice.cs "Cash Invoice Format").</param>
+    private static async Task<Results<FileContentHttpResult, NotFound<ProblemDetails>, ValidationProblem>> PdfAsync(
+        Guid invoiceId, RevenueDbContext db, InvoiceFormDocument document, ICallerPermissions scope, CancellationToken ct, string? format = null)
+    {
+        var cash = format?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "credit" => false,
+            "cash" => true,
+            _ => (bool?)null,
+        };
+        if (cash is null) return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["format"] = ["credit or cash."] });
+        var branchId = await db.Invoices.AsNoTracking().Where(i => i.InvoiceId == invoiceId).Select(i => (Guid?)i.BranchId).SingleOrDefaultAsync(ct);
+        if (branchId is null || !scope.HasAt(RevenuePermissions.ChargeView, branchId.Value))
+            return TypedResults.NotFound(new ProblemDetails { Title = "No such invoice in your branches." });
+        var rendered = await document.InvoiceAsync(invoiceId, cash.Value, ct);
+        return rendered is null
+            ? TypedResults.NotFound(new ProblemDetails { Title = "No such invoice in your branches." })
+            : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);
     }
 
     private static async Task<Results<Ok<InvoiceDetailResponse>, NotFound<ProblemDetails>>> GetAsync(

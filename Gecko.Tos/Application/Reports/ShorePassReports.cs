@@ -4,6 +4,7 @@ using Gecko.Tos.Domain;
 using Gecko.Tos.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using static Gecko.Tos.Application.Reports.GateInOutReport;
+using static Gecko.Tos.Application.Reports.OperationReportKit;
 
 namespace Gecko.Tos.Application.Reports;
 
@@ -98,7 +99,7 @@ internal static class ShorePassReports
             seals.Where(s => IsAgentSeal(s.SealType)).OrderBy(s => s.At).ToLookup(s => s.Move, s => s.SealNo));
     }
 
-    private static string Eta(BranchClock.Branch branch, Row? r) => r?.Eta is { } eta ? $"{Local(branch, eta):dd/MM/yyyy HH:mm}" : "";
+    private static string Eta(BranchClock.Branch branch, Row? r) => r?.Eta is { } eta ? Stamp(Local(branch, eta), "dd/MM/yyyy HH:mm") : "";
 
     /// <summary>Shore Pass #1 — the Evergreen Container Terminal B.2 request form.</summary>
     public static async Task<TabularReport> EvergreenAsync(
@@ -124,7 +125,7 @@ internal static class ShorePassReports
             HeadingRight: [],
             Preamble:
             [
-                new($"เอเย่นต์ {d.Party(first?.LineCode)}          วันที่ {h.PrintedAt:dd/MM/yyyy HH:mm}", 10),
+                new($"เอเย่นต์ {d.Party(first?.LineCode)}          วันที่ {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}", 10),
                 new("IN", 26, Bold: true),
                 new($"บรรทุกลงเรือ {d.Vessel(first)} {Data.Voyage(first)}          เที่ยวเรือ {Eta(h.Branch, first)}", 10),
                 new("ออกใบเสร็จในนาม   S.C.T          รหัสลูกค้า", 10),
@@ -167,7 +168,7 @@ internal static class ShorePassReports
             HeadingRight: [],
             Preamble:
             [
-                new($"วันที่ {h.PrintedAt:dd-MM-yyyy HH:mm}          บริษัท {d.Party(first?.LineCode)}          (  x ) รถยนต์    (     ) รถไฟ", 10),
+                new($"วันที่ {Stamp(h.PrintedAt, "dd-MM-yyyy HH:mm")}          บริษัท {d.Party(first?.LineCode)}          (  x ) รถยนต์    (     ) รถไฟ", 10),
                 new("IN", 26, Bold: true),
                 new($"บรรทุกลงเรือ {d.Vessel(first)}          เที่ยวเรือ {Data.Voyage(first)}          เที่ยวเรือ {Eta(h.Branch, first)}", 10),
                 new("(   x  )  20'  จำนวน                    ตู้   ( x  )  40'  จำนวน                    45'  จำนวน", 10),

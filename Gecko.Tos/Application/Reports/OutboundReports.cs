@@ -22,7 +22,7 @@ internal static class OutboundReports
         Page: ReportPage.A4Landscape,
         MarginCm: 2.54,
         Heading: [new(h.BranchName, 10, Bold: true), new("PTI REPORT", 10, Bold: true)],
-        HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {h.PrintedAt:dd/MM/yyyy HH:mm}")],
+        HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
         Preamble: [],
         PreambleRight: [],
         Columns:
@@ -52,7 +52,7 @@ internal static class OutboundReports
             Page: ReportPage.A4Landscape,
             MarginCm: 2.54,
             Heading: [new(h.BranchName, 10, Bold: true), new("ContainerRepairSummaryList", 10, Bold: true)],
-            HeadingRight: [new($"Print Date: {h.PrintedAt:dd-MM-yyyy HH:mm}")],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd-MM-yyyy HH:mm")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -107,7 +107,7 @@ internal static class OutboundReports
             Page: ReportPage.A4Landscape,
             MarginCm: 0.5,
             Heading: [new(h.BranchName, 10, Bold: true), new("มาตรฐานปล่อยตู้เปล่า CY", 10, Bold: true)],
-            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Print Date: {h.PrintedAt:dd-MM-yyyy HH:mm}")],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Print Date: {Stamp(h.PrintedAt, "dd-MM-yyyy HH:mm")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -194,7 +194,7 @@ internal static class OutboundReports
                 new(h.BranchName, 10, Bold: true), new("<< STOCK REPORT >>", 10, Bold: true),
                 new($"ACTIVITIES DATE: {Day(from)} TO: {Day(to)}"), new($"Agent: {Clean(agentCode)}"),
             ],
-            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy}")],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -302,7 +302,7 @@ internal static class OutboundReports
                 new(Clean(f.BookingType) == "IMPORT" ? "เปลียนชื่อ (IMP UNSTUFFING)" : "(STUFFING EXP CY/CY-IN  และ CY-IN (NON-NOMINATING)", 10, Bold: true),
                 new($"Gate In date from: {Day(from, "dd/MM/yyyy")} To:{Day(to, "dd/MM/yyyy")}"), new($"Agent: {Clean(f.AgentCode)}"),
             ],
-            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {h.PrintedAt:dd/MM/yyyy HH.mm}")],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {Stamp(h.PrintedAt, "dd/MM/yyyy HH.mm")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -389,7 +389,7 @@ internal static class OutboundReports
             MarginCm: 0.5,
             Heading: [new(h.BranchName, 10, Bold: true), new("<<SHORE PASS REPORT>>", 10, Bold: true)],
             HeadingRight: [],
-            Preamble: [new($"DATE  {h.PrintedAt:dd/MM/yyyy}"), new($"DEPOT : {loadingPort?.Trim()}")],
+            Preamble: [new($"DATE  {Stamp(h.PrintedAt, "dd/MM/yyyy")}"), new($"DEPOT : {loadingPort?.Trim()}")],
             PreambleRight: [],
             Columns: [new(1.40639), new(2.35007), new(1.21896), new(4.21097), new(5.18993), new(6.53931), new(2.62347), new(1.88264, "0.00"), new(2.63906)],
             HeaderRows:

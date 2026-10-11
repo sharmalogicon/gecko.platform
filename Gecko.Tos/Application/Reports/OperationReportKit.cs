@@ -63,6 +63,11 @@ internal static class OperationReportKit
 
     public static readonly string[] Months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
+    /// <summary>A date-time as the RDL formats it, in the invariant culture ("/" is a slash whatever the server's locale).</summary>
+    public static string Stamp(DateTimeOffset at, string format) => at.ToString(format, CultureInfo.InvariantCulture);
+
+    public static string Stamp(DateTime at, string format) => at.ToString(format, CultureInfo.InvariantCulture);
+
     public static string Day(DateOnly? day, string format = "dd-MM-yyyy") => day?.ToString(format, CultureInfo.InvariantCulture) ?? "";
 
     /// <summary>A depot-local day, or null.</summary>

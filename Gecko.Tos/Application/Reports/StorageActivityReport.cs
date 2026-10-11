@@ -114,7 +114,7 @@ internal static class StorageActivityReport
             Page: ReportPage.A4Landscape,
             MarginCm: 0.3,
             Heading: [new(branchName, 10, Bold: true), new("<< OUTBOUND CONTAINER STORAGE ACTIVITY >>", 10, Bold: true)],
-            HeadingRight: [new($"Printed By: {printedBy}"), new($"Printed On: {printedAt:dd/MM/yyyy HH:mm}")],
+            HeadingRight: [new($"Printed By: {printedBy}"), new($"Printed On: {Stamp(printedAt, "dd/MM/yyyy HH:mm")}")],
             Preamble:
             [
                 new($"From ETD: {Day(f.From)} To ETD: {Day(f.To)}"),

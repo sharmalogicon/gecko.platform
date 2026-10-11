@@ -147,7 +147,7 @@ internal static class InboundReports
                 new(h.BranchName, 12), new("<<Daily Import FULL IN>>", 12),
                 new($"From Gate In: {Day(from)}   To Gate In: {Day(to)}", 12),
             ],
-            HeadingRight: [new($"Print Date: {h.PrintedAt:dd-MM-yyyy HH:mm}")],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd-MM-yyyy HH:mm")}")],
             Preamble: [],
             PreambleRight: [],
             Columns: columns,
@@ -277,7 +277,7 @@ internal static class InboundReports
             Page: ReportPage.A3Landscape,
             MarginCm: 2,
             Heading: [new(h.BranchName, 10, Bold: true), new("<< SUMMARY GATE IN CONTAINER >>", 10, Bold: true), new($"Year:{year}", 10, Bold: true)],
-            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm}")],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
             Preamble: [],
             PreambleRight: [],
             Columns: [new(1.94438), .. widths.Select(w => new TabularColumn(w, "0;(0);\"\"", CellAlign.Center))],
@@ -359,7 +359,7 @@ internal static class InboundReports
                 new($"ระหว่างวันที่ Gate In :{Day(from)} ถึงวันที่ Gate In :{Day(to)}", 10, Bold: true),
                 new($"Agent : {Clean(agentCode)}", 10, Bold: true),
             ],
-            HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm:ss}")],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm:ss")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -450,7 +450,7 @@ internal static class InboundReports
                 new($"AGENT :{Clean(agentCode)}", 10, Bold: true), new($"Vessel Code :{Clean(vesselCode)}", 10, Bold: true),
                 new($"Voyage No.:{voyageNo?.Trim()}", 10, Bold: true),
             ],
-            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {h.PrintedAt:dd/MM/yyyy}")],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Printed On: {Stamp(h.PrintedAt, "dd/MM/yyyy")}")],
             Preamble: [],
             PreambleRight: [],
             Columns:
@@ -486,7 +486,7 @@ internal static class InboundReports
             new(h.BranchName, 10, Bold: true), new("DAILY UNSTUFFING REPORT ", 10, Bold: true),
             new($"UNSTUFFING DATE FROM : {Day(from)}   TO : {Day(to)}", 10, Bold: true),
         ],
-        HeadingRight: [new($"Print Date: {h.PrintedAt:dd/MM/yyyy HH:mm}")],
+        HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
         Preamble: [],
         PreambleRight: [],
         Columns:
@@ -501,4 +501,145 @@ internal static class InboundReports
         ],
         Rows: [],
         PageLabel: "Page No#");
+
+    // ── TMS.Operation.InBound.ImportContainerList ──
+
+    /// <summary>
+    /// &lt;&lt; CONTAINER LIST REPORT &gt;&gt;, the desktop's "IMPORT Container List" (Report.usp_InBound_ImportContainerList): the IMPORT
+    /// bookings whose vessel's ETA falls on the depot days asked for, a section per agent + vessel + voyage + ETA, each on its
+    /// own page, with every booked box (a booking with no box prints its B/L alone): its full gate-in and gate-out, the truck
+    /// of the gate-out else the gate-in, the gate-in's line and customs seals (else the declared seal), and the section's
+    /// Summary by size / type with Total. Distinct boxes are counted, so the cells add up to the Total. UnStuffing prints
+    /// blank: Gecko records no unstuffing yet (gap D9).
+    /// </summary>
+    public static async Task<TabularReport> ImportContainerListAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? customerCode, string? vesselCode, string? voyageNo, CancellationToken ct)
+    {
+        var start = BranchClock.StartOf(h.Branch, from);
+        var end = BranchClock.StartOf(h.Branch, to.AddDays(1));
+        var bookings = db.Bookings.AsNoTracking()
+            .Where(b => b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "IMPORT" && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => b.LinePartyCode == agent);
+        if (Clean(customerCode) is { } customer) bookings = bookings.Where(b => b.CustomerPartyCode == customer);
+        var lines = await (
+                from b in bookings
+                join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId
+                where c.Eta >= start && c.Eta < end
+                join x in db.BookingContainers.Where(x => x.DeletedAt == null && (x.EndedAt == null || x.EndReason == "COMPLETED"))
+                    on b.BookingId equals x.BookingId into boxes
+                from x in boxes.DefaultIfEmpty()
+                join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId into reqs
+                from r in reqs.DefaultIfEmpty()
+                select new
+                {
+                    b.BookingId, b.LinePartyCode, b.CarrierRef, b.CustomerRef, b.SubBlNo, b.OrderTypeCode, b.CustomerPartyCode, b.PodPortCode,
+                    c.VesselCode, c.OperatorVoyageIn, c.OperatorVoyageOut, c.Eta,
+                    BoxId = x == null ? (Guid?)null : x.BookingContainerId, ContainerNo = x == null ? null : x.ContainerNo,
+                    Declared = x == null ? null : x.DeclaredSealNo, BoxRemarks = x == null ? null : x.Remarks,
+                    Type = r == null ? null : r.EquipmentTypeCode,
+                })
+            .ToListAsync(ct);
+        if (Clean(vesselCode) is { } vessel) lines = lines.Where(l => l.VesselCode == vessel).ToList();
+        if (Clean(voyageNo) is { } voyage) lines = lines.Where(l => l.OperatorVoyageIn == voyage || l.OperatorVoyageOut == voyage).ToList();
+
+        // The boxes' full moves, with their trucks and seals.
+        var boxIds = lines.Select(l => l.BoxId).OfType<Guid>().Distinct().ToList();
+        var full = new List<(Guid Box, Guid Move, string Direction, DateTimeOffset At, string? Type, string Plate, string? Haulier)>();
+        foreach (var slice in boxIds.Chunk(2000))
+            full.AddRange((await (
+                    from g in db.GateTransactions.AsNoTracking()
+                    where slice.Contains(g.BookingContainerId) && g.Status == "COMPLETED" && g.DeletedAt == null && g.FullEmpty == GateRules.Full
+                    join v in db.TruckVisits on g.TruckVisitId equals v.TruckVisitId
+                    select new { g.BookingContainerId, g.GateTransactionId, g.Direction, g.TransactionAt, g.EquipmentTypeCode, v.TruckPlate, v.HaulierPartyCode })
+                .ToListAsync(ct))
+                .Select(g => (g.BookingContainerId, g.GateTransactionId, g.Direction, g.TransactionAt, (string?)g.EquipmentTypeCode, g.TruckPlate, (string?)g.HaulierPartyCode)));
+        var byBox = full.OrderBy(f => f.At).ToLookup(f => f.Box);
+        var seals = await SealsAsync(db, full.Where(f => f.Direction == GateRules.In).Select(f => f.Move), ct);
+
+        var types = await TypesAsync(master, lines.Select(l => l.Type).Concat(full.Select(f => f.Type)), ct);
+        var parties = await master.PartiesAsync(lines.Select(l => l.CustomerPartyCode).Concat(full.Select(f => f.Haulier)).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(lines.Select(l => l.VesselCode).Distinct(), ct);
+        string? Party(string? code) => code is null ? null : parties.GetValueOrDefault(code)?.Name;
+
+        TabularColumn Col(double cm, string? format = null) => new(cm, format);
+        IReadOnlyList<TabularColumn> columns =
+        [
+            Col(0.80698), Col(3.18386), Col(3.43927), Col(2.5), Col(1.29073), Col(2.07667), Col(2.23482, "dd-MM-yyyy"),
+            Col(2.34125, "dd-MM-yyyy"), Col(2.10869, "dd-MM-yyyy"), Col(1.70625), Col(5.80729), Col(1.83854), Col(2.07667),
+            Col(5.55034), Col(3.53188),
+        ];
+        IReadOnlyList<IReadOnlyList<HeaderCell>> headers =
+        [
+            [new("No."), new("Booking BLNo"), new("Sub B/L No."), new("Container No."), new("Size"), new("Status"), new("Gate In "),
+             new("UnStuffing"), new("Gate Out"), new("Plate No."), new("Truck Company"), new("Seal Agent"), new("Seal Customs"),
+             new("Consignee"), new("Remarks")],
+        ];
+
+        var blocks = new List<TabularBlock>();
+        var sections = lines
+            .GroupBy(l => (l.LinePartyCode, l.VesselCode, Voyage: Voyage("IMPORT", l.OperatorVoyageIn, l.OperatorVoyageOut), l.Eta))
+            .OrderBy(s => s.Key.LinePartyCode, StringComparer.Ordinal).ThenBy(s => s.Key.Eta).ThenBy(s => s.Key.VesselCode, StringComparer.Ordinal);
+        foreach (var section in sections)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var rows = new List<TabularRow>();
+            var counted = new List<(string? Size, string? Type, string Box)>();
+            foreach (var l in section.OrderBy(l => BookingBlNo(l.CarrierRef, l.CustomerRef), StringComparer.Ordinal)
+                         .ThenBy(l => l.SubBlNo, StringComparer.Ordinal).ThenBy(l => l.ContainerNo, StringComparer.Ordinal))
+            {
+                var moves = l.BoxId is { } id ? byBox[id].ToList() : [];
+                var gateIn = moves.FirstOrDefault(m => m.Direction == GateRules.In);
+                var gateOut = moves.FirstOrDefault(m => m.Direction == GateRules.Out);
+                var truck = gateOut.Move != Guid.Empty ? gateOut : gateIn;
+                var (size, type) = SizeType(types, gateIn.Type ?? l.Type);
+                if (l.ContainerNo is { Length: > 0 } box && seen.Add(box)) counted.Add((size, type, box));
+                string? Seal(Func<string, bool> kind) => gateIn.Move == Guid.Empty ? null
+                    : seals[gateIn.Move].Where(s => kind(s.SealType)).Select(s => s.SealNo).FirstOrDefault();
+                rows.Add(new TabularRow([
+                    l.ContainerNo is { Length: > 0 } ? seen.Count : null, BookingBlNo(l.CarrierRef, l.CustomerRef), l.SubBlNo, l.ContainerNo,
+                    size is null ? null : $"{size} {type}", l.OrderTypeCode,
+                    gateIn.Move == Guid.Empty ? null : LocalDay(h.Branch, gateIn.At), null,
+                    gateOut.Move == Guid.Empty ? null : LocalDay(h.Branch, gateOut.At),
+                    truck.Move == Guid.Empty ? null : truck.Plate, truck.Move == Guid.Empty ? null : Party(truck.Haulier),
+                    Seal(IsAgentSeal) ?? l.Declared, Seal(s => s == "CUSTOMS"), Party(l.CustomerPartyCode), l.BoxRemarks]));
+            }
+            var first = section.First();
+            blocks.Add(new TabularBlock(null, columns, headers, rows, PageBreakBefore: true,
+                Lines:
+                [
+                    new($"AGENT: {section.Key.LinePartyCode}          VOY: {section.Key.Voyage}          ETA: {Stamp(Local(h.Branch, section.Key.Eta), "dd/MM/yyyy")}"),
+                    new($"VESSEL: {vessels.GetValueOrDefault(section.Key.VesselCode)?.VesselName ?? section.Key.VesselCode}          POD: {first.PodPortCode}"),
+                ]));
+
+            var sizes = counted.Select(c => (c.Size ?? "", c.Type ?? "")).Distinct()
+                .OrderBy(s => s.Item1, StringComparer.Ordinal).ThenBy(s => s.Item2, StringComparer.Ordinal).ToList();
+            blocks.Add(new TabularBlock("Summary",
+                [new TabularColumn(1.25349 * 2.54), .. sizes.Select(_ => new TabularColumn(0.43518 * 2.54, null, CellAlign.Center)),
+                    new TabularColumn(0.45794 * 2.54, null, CellAlign.Center)],
+                [
+                    [new HeaderCell("Container Size"), .. sizes.Select(s => new HeaderCell(s.Item1)), new HeaderCell("Total")],
+                    [new HeaderCell(""), .. sizes.Select(s => new HeaderCell(s.Item2)), new HeaderCell("")],
+                ],
+                [new TabularRow(["TOTAL", .. sizes.Select(s => (object?)counted.Count(c => (c.Size ?? "") == s.Item1 && (c.Type ?? "") == s.Item2)), counted.Count])]));
+        }
+
+        return new TabularReport(
+            FileName: $"ImportContainerList_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 1.27,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true), new("<< CONTAINER LIST REPORT >>", 10, Bold: true),
+                new($"Booking Date From : {Day(from)} To : {Day(to)}", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {ListReport.Text(h.PrintedAt.DateTime, null)}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns: columns,
+            HeaderRows: [],
+            Rows: [],
+            PageLabel: "Page No#",
+            After: blocks);
+    }
 }

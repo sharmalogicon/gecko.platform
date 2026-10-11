@@ -59,11 +59,13 @@ public sealed class OperationReportApiTests(TosApiFactory api)
     }
 
     /// <summary>An IMP CY/CY booking (MAEU, CUS-TAE) with one 20GP box, gated in full two hours ago.</summary>
-    private static async Task ImportGatedInAsync(HttpClient client, string carrierRef, string box, CancellationToken ct)
+    private static async Task ImportGatedInAsync(HttpClient client, string carrierRef, string box, CancellationToken ct,
+        string line = "MAEU", Guid? call = null)
     {
         var booked = await client.PostAsJsonAsync("/api/tos/bookings", new
         {
-            branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+            branchId = SctLcb01, orderTypeCode = "IMP CY/CY", lineCode = line, customerCode = "CUS-TAE", carrierRef, vesselCallId = call,
+            subBlNo = call is null ? null : carrierRef + "-S",
             validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
             requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
             containers = new object[] { new { containerNo = box } },
@@ -549,6 +551,40 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             Assert.Equal([carrierRef, $"ZZ-{box[^4..]}"], three[7..9]);
 
             foreach (var form in new[] { 1, 2, 3 }) await PdfAsync(client, Url(form).Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    [Fact]
+    public async Task Import_container_list_lists_the_box_in_its_vessels_section()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        try
+        {
+            var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>("/api/tos/vessel-calls?pageSize=200", ct))!
+                .Items.Single(c => c.CallRef == "EASTPIONEER-069S");
+            var eta = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(call.Eta, TimeZoneInfo.FindSystemTimeZoneById("Asia/Bangkok")).DateTime);
+            await ImportGatedInAsync(client, carrierRef, box, ct, line: "ONEY", call: call.VesselCallId);
+            var url = $"{Reports}/import-container-list.xlsx?branchId={SctLcb01}&dateFrom={eta:yyyy-MM-dd}&dateTo={eta:yyyy-MM-dd}&agentCode=ONEY&customerCode=CUS-TAE";
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<< CONTAINER LIST REPORT >>");
+            Assert.Contains(rows, r => r[0].StartsWith("AGENT: ONEY", StringComparison.Ordinal) && r[0].EndsWith("ETA: " + eta.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal));
+            Assert.Contains(rows, r => r[0].StartsWith("VESSEL: EASTERN PIONEER", StringComparison.Ordinal));
+            var row = Assert.Single(rows, r => r[3] == box);
+            Assert.Equal([carrierRef, carrierRef + "-S", box, "20 GP", "IMP CY/CY"], row[1..6]);
+            Assert.Equal(GateDay.ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture), row[6]);
+            Assert.Equal(["70-4321", "", $"ZZ-{box[^4..]}"], [row[9], row[10], row[11]]);
+            Assert.Contains(rows, r => r[0] == "Container Size" && r[1] == "20");
+            Assert.Contains(rows, r => r[0] == "TOTAL");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
         }
         finally
         {

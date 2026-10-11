@@ -43,12 +43,16 @@ public sealed record TabularRow(IReadOnlyList<object?> Cells, RowKind Kind = Row
 /// <summary>
 /// A table under the main grid, as an RDL places a second tablix below the first (e.g. the Company listing's
 /// "Summary by Charge Code"): an optional caption above it, its own columns and header rows.
+/// <c>PageBreakBefore</c> starts it on a new page (an RDL group with PageBreak Between); <c>Lines</c> print above the
+/// caption (a group's own heading textboxes, e.g. "AGENT: … VOY: …").
 /// </summary>
 public sealed record TabularBlock(
     string? Caption,
     IReadOnlyList<TabularColumn> Columns,
     IReadOnlyList<IReadOnlyList<HeaderCell>> HeaderRows,
-    IReadOnlyList<TabularRow> Rows);
+    IReadOnlyList<TabularRow> Rows,
+    bool PageBreakBefore = false,
+    IReadOnlyList<ReportText>? Lines = null);
 
 public enum ReportPage { A4Portrait, A4Landscape, A3Landscape }
 
@@ -165,7 +169,9 @@ public sealed record TabularReport(
                 if (!MainIsEmpty) c.Item().Element(x => Grid(x, Main));
                 foreach (var (block, i) in (After ?? []).Select((b, i) => (b, i)))
                 {
-                    if (i > 0 || !MainIsEmpty) c.Item().Height(10);
+                    if (block.PageBreakBefore && (i > 0 || !MainIsEmpty)) c.Item().PageBreak();
+                    else if (i > 0 || !MainIsEmpty) c.Item().Height(10);
+                    if (block.Lines is { Count: > 0 } lines) c.Item().PaddingBottom(4).Column(x => Lines(x, lines, scale));
                     if (block.Caption is { } caption) c.Item().PaddingBottom(2).Text(caption).Bold();
                     // A later table keeps its own width (cm), on the same scale as the grid.
                     c.Item().AlignLeft().Width((float)block.Columns.Sum(x => x.WidthCm) * pointsPerCm).Element(x => Grid(x, block));
@@ -268,7 +274,13 @@ public sealed record TabularReport(
 
         foreach (var block in After ?? [])
         {
+            if (block.PageBreakBefore && r > 1) sheet.PageSetup.AddHorizontalPageBreak(r);
             r++;
+            foreach (var line in block.Lines ?? [])
+            {
+                Line(line, 1);
+                r++;
+            }
             if (block.Caption is { } caption)
             {
                 sheet.Cell(r, 1).Value = caption;

@@ -32,6 +32,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/monthly-incoming-container.{pdf|xlsx}   TMS.Operation.InBound.MonthlyIncomingContainer
 ///   GET /reports/weekly-monthly-statistics.{pdf|xlsx}   TMS.CustomerService.WeeklyMonthlyStatistics ("EXPORT - Monthly/Weekly")
 ///   GET /reports/booking-container-list.{pdf|xlsx}   TMS.CustomerService.BookingContainerList
+///   GET /reports/booking-form.{pdf|xlsx}   TMS.CustomerService.BookingForm
 ///   GET /reports/truck-control.{pdf|xlsx}   TMS.Operation.OutBound.TruckControl
 ///   GET /reports/cy-container-monthly-movement.{pdf|xlsx}   TMS.Operation.OutBound.CYContainerMonthlyMovement
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
@@ -97,6 +98,10 @@ internal static class ListReportEndpoints
                 range: false, check: q => q.BookingBlNo is { Length: > 0 } ? null : InvalidRange(q.DateFrom, q.DateTo))
             .WithSummary("Booking Container List (Vector CustomerService.BookingContainerList): export boxes gone out empty, with seal and vessel")
             .WithDescription("dateFrom/dateTo: the empty gate-out days; not needed (and not applied) when bookingBlNo is given, as on Vector.");
+        reports.MapOperation("/booking-form.{format}",
+                r => CustomerServiceReports.BookingFormAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
+            .WithSummary("Booking form (Vector CustomerService.BookingForm): booked box lines by pick-up day, a 0/1 per size, with vessel and ports")
+            .WithDescription("dateFrom/dateTo: the lines' required (pick-up / stuffing) days.");
         reports.MapOperation("/truck-control.{format}",
                 r => OutboundReports.TruckControlAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.VesselCode, r.Q.VoyageNo, r.Ct))
             .WithSummary("Truck Control (Vector OutBound.TruckControl): export calls by loading port with closings and full gate-in/out counts")

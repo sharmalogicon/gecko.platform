@@ -768,4 +768,35 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Booking_form_lists_the_booked_line_on_its_pick_up_day_with_a_one_in_its_size()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var required = new DateOnly(2026, 12, 22);
+        var url = $"{Reports}/booking-form.xlsx?branchId={SctLcb01}&dateFrom={required:yyyy-MM-dd}&dateTo={required:yyyy-MM-dd}&agentCode=ONEY&bookingType=EXPORT";
+        try
+        {
+            await ExportGatedInAsync(client, carrierRef, box, ct, required);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "<<Booking form EXPORT >>");
+            Assert.Contains(rows, r => r[0] == "Pick up /Stuffing Date" && r[5] == "CY/CFS/CY-IN" && r[6] == "DRY" && r[12] == "REEFER");
+            Assert.Contains(rows, r => r[6] == "20'" && r[11] == "40'FT" && r[14] == "40'RH" && r[15] == "Temp" && r[16] == "Commodity" && r[21] == "Remarks");
+            var row = Assert.Single(rows, r => r[2] == carrierRef);
+            Assert.Equal(["22/12/2026", "FCL"], [row[0], row[5]]);
+            Assert.True(row[1].Length > 0 && row[3].Length > 0, "agent and shipper names print");
+            Assert.Equal(["1", "0", "0", "0", "0", "0", "0", "0", "0"], row[6..15]);
+            Assert.Equal(["EASTERN PIONEER", "069S", "SGSIN"], [row[17], row[18], row[19]]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

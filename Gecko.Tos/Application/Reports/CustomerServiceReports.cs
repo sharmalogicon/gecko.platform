@@ -183,4 +183,122 @@ internal static class CustomerServiceReports
             Rows: grid,
             PageLabel: "Page No#");
     }
+
+    // ── TMS.CustomerService.BookingForm / BookingForm.RepoInForm (shared) ──
+
+    /// <summary>
+    /// The nine size columns the booking forms count (20' 40' 45' 20'OT 40'OT 40'FT dry, 20'R 40'R 40'RH reefer), 0 or 1 for
+    /// one box line. Reefer is master data's flag (Vector's KORAKIT config had 40RH as dry, so its 40'RH was never filled);
+    /// a type master data does not know counts nowhere, as Vector's NULL IsReefer did. Owner 2026-10-11 (counts computed
+    /// correctly): 40' is the dry 40s that are not open-top or flat (the RDL's always-true OR counted OT/FT twice), 40'OT
+    /// tests size 40 (the Booking Form's copy of the 20'OT test never matched), and 40'FT counts Gecko's flat racks (FR)
+    /// as well as FT — Vector's FT test never met its own FR codes.
+    /// </summary>
+    private static int[] SizeCounts(IReadOnlyDictionary<string, EquipmentTypeRef> types, string? code, bool noOpenTop45)
+    {
+        if (code is null || !types.TryGetValue(code, out var known)) return new int[9];
+        var (size, type) = SizeType(types, code);
+        var (dry, reefer) = (!known.IsReefer, known.IsReefer);
+        var flat = type is "FT" or "FR";
+        bool[] hits =
+        [
+            dry && size == "20" && type != "OT",
+            dry && size == "40" && type != "OT" && !flat,
+            dry && size == "45" && (!noOpenTop45 || type != "OT"),
+            dry && size == "20" && type == "OT",
+            dry && size == "40" && type == "OT",
+            dry && size == "40" && flat,
+            reefer && size == "20",
+            reefer && size == "40" && type != "RH",
+            reefer && size == "40" && type == "RH",
+        ];
+        return hits.Select(x => x ? 1 : 0).ToArray();
+    }
+
+    private static readonly string[] SizeHeaders = ["20'", "40'", "45'", "20'OT", "40'OT", "40'FT", "20'R", "40'R", "40'RH"];
+
+    // ── TMS.CustomerService.BookingForm ──
+
+    /// <summary>
+    /// The desktop's "Booking Form" (Report.usp_CustomerService_BookingForm): every box line of the depot's bookings whose
+    /// pick-up / stuffing day (the line's required date) falls in the days asked for — a row per line, nominated or not —
+    /// with the agent (the booking's line), booking no, shipper and forwarder (whatever their roles), CY/CFS/CY-IN (Vector's
+    /// shipment type of the order type, <see cref="ShipmentType"/>), a 0/1 in the size column of its type
+    /// (<see cref="SizeCounts"/>), the reefer set temperature (the line's, else the requirement's), vessel, voyage and the
+    /// discharge / destination ports (codes, as Vector printed them). Cancelled bookings and ended (not completed) lines
+    /// are out; Vector printed cancelled ones. Rows by required day, order no, then line (Vector had no order).
+    /// Commodity and Remarks print blank: they were Vector's booking-text free text, which Gecko does not keep (it has a
+    /// commodity code and a booking remark, neither of which is that text). The 58 cm grid prints on one A3 sheet, scaled.
+    /// </summary>
+    public static async Task<TabularReport> BookingFormAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to,
+        string? agentCode, string? bookingType, string? orderType, CancellationToken ct)
+    {
+        var bookings = db.Bookings.AsNoTracking().Where(b => b.BranchId == h.Branch.BranchId && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => b.LinePartyCode == agent);
+        if (Clean(bookingType) is { } type) bookings = bookings.Where(b => b.BookingTypeCode == type);
+        if (Clean(orderType) is { } order) bookings = bookings.Where(b => b.OrderTypeCode == order);
+        var (first, last) = (from, to);
+        var lines = await (
+                from b in bookings
+                join x in db.BookingContainers on b.BookingId equals x.BookingId
+                join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+                join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId into calls
+                from c in calls.DefaultIfEmpty()
+                where x.DeletedAt == null && (x.EndedAt == null || x.EndReason == "COMPLETED")
+                      && x.RequiredDate != null && x.RequiredDate >= first && x.RequiredDate <= last
+                select new
+                {
+                    RequiredDate = x.RequiredDate!.Value, x.CreatedAt, r.LineNo, r.EquipmentTypeCode, Temp = x.ReeferSetTempC ?? r.ReeferSetTempC,
+                    b.OrderNo, b.LinePartyCode, b.CustomerPartyCode, b.ForwarderPartyCode, b.CarrierRef, b.CustomerRef, b.OrderTypeCode,
+                    b.DirectionCode, b.PodPortCode, b.FpdPortCode,
+                    VesselCode = c == null ? null : c.VesselCode, VoyageIn = c == null ? null : c.OperatorVoyageIn, VoyageOut = c == null ? null : c.OperatorVoyageOut,
+                })
+            .ToListAsync(ct);
+
+        var types = await TypesAsync(master, lines.Select(l => (string?)l.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(lines.Select(l => (string?)l.LinePartyCode).Concat(lines.Select(l => l.CustomerPartyCode))
+            .Concat(lines.Select(l => l.ForwarderPartyCode)).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(lines.Select(l => l.VesselCode).OfType<string>().Distinct(), ct);
+        string? Name(string? code) => code is null ? null : parties.GetValueOrDefault(code)?.Name;
+
+        var rows = lines.OrderBy(l => l.RequiredDate).ThenBy(l => l.OrderNo, StringComparer.Ordinal).ThenBy(l => l.LineNo).ThenBy(l => l.CreatedAt)
+            .Select(l => new TabularRow(
+            [
+                l.RequiredDate, Name(l.LinePartyCode), BookingBlNo(l.CarrierRef, l.CustomerRef), Name(l.CustomerPartyCode), Name(l.ForwarderPartyCode),
+                ShipmentType(l.OrderTypeCode), .. SizeCounts(types, l.EquipmentTypeCode, noOpenTop45: false).Cast<object?>(), l.Temp,
+                null, l.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName : null, Voyage(l.DirectionCode, l.VoyageIn, l.VoyageOut),
+                l.PodPortCode, l.FpdPortCode, null,
+            ])).ToList();
+
+        return new TabularReport(
+            FileName: $"BookingForm_{Day(from, "yyyyMMdd")}-{Day(to, "yyyyMMdd")}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true),
+                new("<<Booking form " + BookingTypeDescription(bookingType) + " >>", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(3.55352, "dd/MM/yyyy"), new(6.05352), new(3.26248), new(7.0854), new(6.27873), new(2.25706),
+                new(1.03998, null, CellAlign.Center), new(1.14581, null, CellAlign.Center), new(1.06644, null, CellAlign.Center),
+                new(1.11936, null, CellAlign.Center), new(1.19873, null, CellAlign.Center), new(1.11936, null, CellAlign.Center),
+                new(1.03998, null, CellAlign.Center), new(0.98706, null, CellAlign.Center), new(1.14581, null, CellAlign.Center),
+                new(1.56915, "0.00"), new(2.78623), new(3.50061), new(2.07186), new(2.49519), new(2.73331), new(4.74415),
+            ],
+            HeaderRows:
+            [
+                [new("Pick up /Stuffing Date"), new("Agent"), new("Booking No."), new("Shipper"), new("Forwarder"), new("CY/CFS/CY-IN"),
+                 new("DRY", ColSpan: 6), new("REEFER", ColSpan: 4), new(""), new(""), new(""), new(""), new(""), new("")],
+                [new(""), new(""), new(""), new(""), new(""), new(""), .. SizeHeaders.Select(s => new HeaderCell(s)), new("Temp"),
+                 new("Commodity"), new("Vessel"), new("Voy"), new("Discharge Port"), new("Destination Port"), new("Remarks")],
+            ],
+            Rows: rows,
+            PageLabel: "Page No.");
+    }
 }

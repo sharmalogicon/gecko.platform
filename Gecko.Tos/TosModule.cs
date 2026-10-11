@@ -69,6 +69,7 @@ public static class TosModule
         endpoints.MapGroup(RoutePrefix)
             .MapVesselCallEndpoints()
             .MapBookingEndpoints()
+            .MapBookingFormEndpoints()
             .MapHoldEndpoints()
             .MapReeferEndpoints()
             .MapGateEndpoints()

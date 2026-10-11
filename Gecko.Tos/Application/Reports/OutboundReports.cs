@@ -1,4 +1,9 @@
 using Gecko.Data.Documents;
+using Gecko.MasterData.Contracts;
+using Gecko.Tos.Domain;
+using Gecko.Tos.Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+using static Gecko.Tos.Application.Reports.GateInOutReport;
 using static Gecko.Tos.Application.Reports.OperationReportKit;
 
 namespace Gecko.Tos.Application.Reports;
@@ -61,6 +66,61 @@ internal static class OutboundReports
                  new("DM Amount"), new("Sub Total")],
             ],
             Rows: [new TabularRow(["TOTAL", null, null, null, null, null, 0m, 0m, 0m], RowKind.Total)],
+            PageLabel: "Page No#");
+    }
+
+    // ── TMS.Operation.OutBound.TruckTurnAround ──
+
+    /// <summary>
+    /// มาตรฐานปล่อยตู้เปล่า CY, the desktop's "Truck Turn Around" (Report.usp_OutBound_TruckTurnAround): every empty gate-out
+    /// of the trucks that arrived on the depot days asked for, by arrival, with the truck's arrival (document contact) and
+    /// exit times and the minutes between (the visit's dwell; blank while the truck is still in). หมายเหตุ prints the agent
+    /// code, as the RDL did. Gecko times the truck visit, so every box on one truck shows the same times. A4 landscape (the
+    /// RDL says portrait but is drawn landscape).
+    /// </summary>
+    public static async Task<TabularReport> TruckTurnAroundAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to, string? agentCode, CancellationToken ct)
+    {
+        var start = BranchClock.StartOf(h.Branch, from);
+        var end = BranchClock.StartOf(h.Branch, to.AddDays(1));
+        var query =
+            from g in db.GateTransactions.AsNoTracking()
+            join v in db.TruckVisits on g.TruckVisitId equals v.TruckVisitId
+            where g.BranchId == h.Branch.BranchId && g.Status == "COMPLETED" && g.DeletedAt == null
+                  && g.Direction == GateRules.Out && g.FullEmpty == GateRules.Empty
+                  && v.DeletedAt == null && v.ArrivedAt >= start && v.ArrivedAt < end
+            select new { g.ContainerNo, g.EquipmentTypeCode, g.LinePartyCode, g.EirNo, v.TruckPlate, v.ArrivedAt, v.GateOutAt, v.DwellMinutes };
+        if (Clean(agentCode) is { } agent) query = query.Where(x => x.LinePartyCode == agent);
+        var moves = (await query.ToListAsync(ct)).OrderBy(x => x.ArrivedAt).ThenBy(x => x.EirNo, StringComparer.Ordinal).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+
+        var rows = moves.Select((m, i) =>
+        {
+            var (size, type) = SizeType(types, m.EquipmentTypeCode);
+            var arrived = Local(h.Branch, m.ArrivedAt);
+            return new TabularRow([i + 1, arrived, m.TruckPlate, arrived, m.GateOutAt is { } o ? Local(h.Branch, o) : null,
+                m.ContainerNo, size, type, m.DwellMinutes ?? (m.GateOutAt is { } x ? (int)(x - m.ArrivedAt).TotalMinutes : null), m.LinePartyCode]);
+        }).ToList();
+
+        return new TabularReport(
+            FileName: $"TruckTurnAround_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A4Landscape,
+            MarginCm: 0.5,
+            Heading: [new(h.BranchName, 10, Bold: true), new("มาตรฐานปล่อยตู้เปล่า CY", 10, Bold: true)],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Print Date: {h.PrintedAt:dd-MM-yyyy HH:mm}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(1.30937), new(2.5, "dd-MM-yyyy"), new(2.5), new(2.79104, "HH:mm"), new(2.5, "HH:mm"), new(2.5), new(1.12417),
+                new(1.65333), new(2.5, "0;(0)"), new(2.5),
+            ],
+            HeaderRows:
+            [
+                [new("ลำดับ"), new("วัน/เดือน/ปี"), new("ทะเบียนรถ"), new("เวลาติดต่อเอกสาร"), new("เวลาออก"), new("เบอร์ตู้"),
+                 new("ขนาด"), new("ประเภท"), new("รวมเวลา"), new("หมายเหตุ")],
+            ],
+            Rows: rows,
             PageLabel: "Page No#");
     }
 }

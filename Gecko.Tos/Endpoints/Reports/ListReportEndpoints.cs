@@ -30,6 +30,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/daily-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.DailyUnStuffing (no lines until unstuffing is recorded)
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
+///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -75,6 +76,9 @@ internal static class ListReportEndpoints
             .WithSummary("PTI REPORT (Vector OutBound.PTI): heading and columns only until Gecko records PTI work orders");
         reports.MapOperation("/container-repair-summary.{format}", r => Task.FromResult(OutboundReports.ContainerRepairSummary(r.Heading, r.From, r.To)))
             .WithSummary("Container Repair Summary (Vector OutBound.ContainerRepairSummaryList): heading, columns and TOTAL until Gecko records repair estimates");
+        reports.MapOperation("/truck-turn-around.{format}",
+                r => OutboundReports.TruckTurnAroundAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("Truck Turn Around (Vector OutBound.TruckTurnAround, มาตรฐานปล่อยตู้เปล่า CY): empty gate-outs with the truck's in/out minutes");
 
         return tos;
     }

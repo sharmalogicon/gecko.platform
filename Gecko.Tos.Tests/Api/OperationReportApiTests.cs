@@ -381,4 +381,35 @@ public sealed class OperationReportApiTests(TosApiFactory api)
         Assert.Equal((lastRowFirst, lastRowCell), (rows[^1][0], rows[^1][cell]));
         await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
     }
+
+    [Fact]
+    public async Task Truck_turn_around_lists_the_empty_gate_out_with_the_trucks_times()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = Today;
+        var url = $"{Reports}/truck-turn-around.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU";
+        try
+        {
+            await EmptyInThenOutAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "มาตรฐานปล่อยตู้เปล่า CY");
+            Assert.Contains(rows, r => r[0] == "ลำดับ" && r[3] == "เวลาติดต่อเอกสาร" && r[9] == "หมายเหตุ");
+            var row = Assert.Single(rows, r => r[5] == box);
+            Assert.Equal(day.ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture), row[1]);
+            Assert.Equal(["70-4322"], row[2..3]);
+            Assert.Equal(["20", "GP"], row[6..8]);
+            Assert.Equal("MAEU", row[9]);
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

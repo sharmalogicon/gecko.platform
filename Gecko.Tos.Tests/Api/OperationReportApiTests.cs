@@ -632,4 +632,36 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Weekly_monthly_statistics_counts_the_empty_gate_out_under_its_agent_order_type_and_day()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = Today;
+        var url = $"{Reports}/weekly-monthly-statistics.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU&orderType=INT%20OUT";
+        try
+        {
+            await EmptyInThenOutAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0].StartsWith("INBOUND  STATISTIC OF", StringComparison.Ordinal));
+            Assert.Contains(rows, r => r[0] == "MAEU" && r[1] == "DATE" && r[3] == "Total");
+            Assert.Contains(rows, r => r[0] == "Order Type" && r[1] == day.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+            Assert.Contains(rows, r => r[0] == "INT OUT" && r[1] == "MTY OUT" && r[2] == "FULL OUT");
+            var dry20 = rows.First(r => r[0] == "20 Dry");
+            Assert.True(int.Parse(dry20[1]) >= 1, "the 20GP empty out counts under MTY OUT");
+            Assert.Equal(dry20[1], dry20[3]);
+            Assert.Contains(rows, r => r[0] == "Total");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

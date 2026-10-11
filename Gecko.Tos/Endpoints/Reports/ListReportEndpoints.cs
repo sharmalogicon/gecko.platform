@@ -30,6 +30,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/daily-unstuffing.{pdf|xlsx}   TMS.Operation.InBound.DailyUnStuffing (no lines until unstuffing is recorded)
 ///   GET /reports/import-container-list.{pdf|xlsx}   TMS.Operation.InBound.ImportContainerList
 ///   GET /reports/monthly-incoming-container.{pdf|xlsx}   TMS.Operation.InBound.MonthlyIncomingContainer
+///   GET /reports/weekly-monthly-statistics.{pdf|xlsx}   TMS.CustomerService.WeeklyMonthlyStatistics ("EXPORT - Monthly/Weekly")
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
@@ -84,6 +85,9 @@ internal static class ListReportEndpoints
                 r => InboundReports.MonthlyIncomingAsync(r.Db, r.Master, r.Heading, r.Q.Year!.Value, r.Q.MovementCode, r.Q.BookingType, r.Ct),
                 range: false, check: YearAndMovement)
             .WithSummary("Monthly Incoming Container Report (Vector InBound.MonthlyIncomingContainer): a year's moves per agent and service by month, size and reefer");
+        reports.MapOperation("/weekly-monthly-statistics.{format}",
+                r => CustomerServiceReports.WeeklyMonthlyAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
+            .WithSummary("EXPORT - Monthly/Weekly (Vector CustomerService.WeeklyMonthlyStatistics): empty and full gate-outs per agent, order type and day");
         reports.MapOperation("/pti.{format}", r => Task.FromResult(OutboundReports.Pti(r.Heading, r.From, r.To)))
             .WithSummary("PTI REPORT (Vector OutBound.PTI): heading and columns only until Gecko records PTI work orders");
         reports.MapOperation("/container-repair-summary.{format}", r => Task.FromResult(OutboundReports.ContainerRepairSummary(r.Heading, r.From, r.To)))

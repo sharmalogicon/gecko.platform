@@ -23,6 +23,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/full-in-yard.{pdf|xlsx}    TMS.Operation.OutBound.FullInYard
 ///   GET /reports/outbound-container-storage-activity.{pdf|xlsx}   TMS.Operation.OutBound.ContainerStorageActivity
 ///   GET /reports/daily-import-full-in.{pdf|xlsx}   TMS.Operation.InBound.DailyImportFullIn
+///   GET /reports/empty-out.{pdf|xlsx}   TMS.Operation.InBound.EmptyOut ("EMPTY OUT" and "INBOUND Empty Out")
 ///
 /// Vector's BranchID is the depot (branchId), its YardLocation the yard (yardId). Read-only;
 /// tos.gate.view at that depot.
@@ -43,8 +44,12 @@ internal static class ListReportEndpoints
         reports.MapGet("/outbound-container-storage-activity.{format}", StorageActivityAsync).RequireBranchPermission(TosPermissions.GateView)
             .WithSummary("Outbound Container Storage Activity (Vector OutBound.ContainerStorageActivity): export boxes by vessel ETA, as PDF or Excel")
             .WithDescription("dateFrom/dateTo: the depot days the vessel's ETA falls in (Vector's FromETD/ToETD).");
-        reports.MapGet("/daily-import-full-in.{format}", DailyImportFullInAsync).RequireBranchPermission(TosPermissions.GateView)
+        reports.MapOperation("/daily-import-full-in.{format}",
+                r => InboundReports.DailyImportFullInAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
             .WithSummary("Daily IMPORT FULL-IN (Vector InBound.DailyImportFullIn): import full gate-ins per agent and day by CY/CYD/CFS and size");
+        reports.MapOperation("/empty-out.{format}",
+                r => InboundReports.EmptyOutAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Ct))
+            .WithSummary("INBOUND EMPTY OUT REPORT (Vector InBound.EmptyOut): every empty gate-out in the days asked for, and its size count");
 
         return tos;
     }
@@ -100,16 +105,20 @@ internal static class ListReportEndpoints
             new StorageActivityFilter(dateFrom!.Value, dateTo!.Value, agentCode, vesselCode, voyageNo, orderType, bookingType), ct), format);
     }
 
-    private static async Task<IResult> DailyImportFullInAsync(
-        string format, TosDbContext db, IMasterDataReferences master, BranchClock clock, IUserDirectory users,
-        ITenantContext caller, ICallerPermissions scope, CancellationToken ct,
-        Guid? branchId = null, DateOnly? dateFrom = null, DateOnly? dateTo = null, string? agentCode = null)
-    {
-        var (context, refused) = await ContextAsync(branchId, format, clock, users, caller, scope, ct);
-        if (refused is not null) return refused;
-        if (InvalidRange(dateFrom, dateTo) is { } bad) return bad;
-        return File(await InboundReports.DailyImportFullInAsync(db, master, context!.Heading, dateFrom!.Value, dateTo!.Value, agentCode, ct), format);
-    }
+    /// <summary>
+    /// An Operation report taking the common query (<see cref="OperationReportQuery"/>): the depot checked, the date range
+    /// required and checked unless <paramref name="range"/> is false, then <paramref name="build"/>'s report as PDF or Excel.
+    /// </summary>
+    private static RouteHandlerBuilder MapOperation(this RouteGroupBuilder reports, string pattern,
+        Func<OperationReportCall, Task<TabularReport>> build, bool range = true) =>
+        reports.MapGet(pattern, async (string format, [AsParameters] OperationReportQuery q, TosDbContext db, IMasterDataReferences master,
+            BranchClock clock, IUserDirectory users, ITenantContext caller, ICallerPermissions scope, CancellationToken ct) =>
+        {
+            var (context, refused) = await ContextAsync(q.BranchId, format, clock, users, caller, scope, ct);
+            if (refused is not null) return refused;
+            if (range && InvalidRange(q.DateFrom, q.DateTo) is { } bad) return bad;
+            return File(await build(new OperationReportCall(db, master, context!.Heading, q, q.DateFrom ?? default, q.DateTo ?? default, ct)), format);
+        }).RequireBranchPermission(TosPermissions.GateView);
 
     private static async Task<IResult> GateInOutAsync(
         string format, TosDbContext db, IMasterDataReferences master, BranchClock clock, IUserDirectory users,
@@ -175,3 +184,27 @@ internal static class ListReportEndpoints
             ? TosSupport.Invalid("fullEmpty", "Use FULL or EMPTY.")
             : null;
 }
+
+/// <summary>
+/// The Operation reports' query: Vector's parameters under one name each (BranchID = branchId; the From/To dates =
+/// dateFrom/dateTo, depot days, both inclusive). Each report reads the ones its RDL takes and ignores the rest.
+/// </summary>
+public sealed class OperationReportQuery
+{
+    public Guid? BranchId { get; init; }
+    public DateOnly? DateFrom { get; init; }
+    public DateOnly? DateTo { get; init; }
+    public string? AgentCode { get; init; }
+    public string? CustomerCode { get; init; }
+    public string? VesselCode { get; init; }
+    public string? VoyageNo { get; init; }
+    public string? BookingType { get; init; }
+    public string? OrderType { get; init; }
+    public string? MovementCode { get; init; }
+    public string? BookingBlNo { get; init; }
+    public string? LoadingPort { get; init; }
+    public int? Year { get; init; }
+}
+
+internal sealed record OperationReportCall(
+    TosDbContext Db, IMasterDataReferences Master, ReportHeading Heading, OperationReportQuery Q, DateOnly From, DateOnly To, CancellationToken Ct);

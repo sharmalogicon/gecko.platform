@@ -79,6 +79,57 @@ public sealed class OperationReportApiTests(TosApiFactory api)
         Assert.True(gated.StatusCode == HttpStatusCode.Created, $"gate in returned {(int)gated.StatusCode}: {await gated.Content.ReadAsStringAsync(ct)}");
     }
 
+    /// <summary>
+    /// An empty box brought in on an INT IN (MAEU) and taken out on an INT OUT by another truck: an empty gate-out now.
+    /// Through the one-call trip Save, as GateOutTripApiTests gates INT IN / INT OUT.
+    /// </summary>
+    private static async Task EmptyInThenOutAsync(HttpClient client, string carrierRef, string box, CancellationToken ct)
+    {
+        foreach (var (orderType, suffix, move, plate) in new (string, string, object, string)[]
+                 {
+                     ("INT IN", "I", new { containerNo = box, direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m }, "70-4321"),
+                     ("INT OUT", "O", new { containerNo = box, direction = "OUT", tripType = "PICK_UP_CONT" }, "70-4322"),
+                 })
+        {
+            var booked = await client.PostAsJsonAsync("/api/tos/bookings", new
+            {
+                branchId = SctLcb01, orderTypeCode = orderType, lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef = carrierRef + suffix,
+                validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+                requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 1 } },
+                containers = new object[] { new { containerNo = box } },
+            }, ct);
+            Assert.True(booked.StatusCode == HttpStatusCode.Created, $"{orderType} booking returned {(int)booked.StatusCode}: {await booked.Content.ReadAsStringAsync(ct)}");
+            using var json = System.Text.Json.JsonDocument.Parse(await booked.Content.ReadAsStringAsync(ct));
+            var place = json.RootElement.GetProperty("containers")[0].GetProperty("bookingContainerId").GetGuid();
+
+            // An empty pick-up is planned when the truck arrives and gated on a second Save of the same visit at the out lane.
+            Guid? visit = null;
+            for (var pass = 0; pass < (DirectionOf(move) == "OUT" ? 2 : 1); pass++)
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, "/api/tos/gate/trips")
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        branchId = SctLcb01, draftId = Guid.NewGuid(), truckVisitId = visit, truck = visit is null ? new { plate } : null,
+                        rows = new[] { new { bookingContainerId = place, move } },
+                    }),
+                };
+                request.Headers.Add(Idempotency.Header, Guid.NewGuid().ToString());
+                var saved = await client.SendAsync(request, ct);
+                var body = await saved.Content.ReadAsStringAsync(ct);
+                Assert.True(saved.StatusCode == HttpStatusCode.Created, $"{orderType} gate returned {(int)saved.StatusCode}: {body}");
+                using var answer = System.Text.Json.JsonDocument.Parse(body);
+                visit = answer.RootElement.GetProperty("truckVisitId").GetGuid();
+                if (answer.RootElement.GetProperty("rows")[0].GetProperty("status").GetString() == "GATED") break;
+            }
+        }
+    }
+
+    private static string DirectionOf(object move) => (string)move.GetType().GetProperty("direction")!.GetValue(move)!;
+
+    /// <summary>The depot day now (the empty-out helper gates at the current time).</summary>
+    private static DateOnly Today => DateOnly.FromDateTime(DateTime.UtcNow.AddHours(7));
+
     /// <summary>The depot day two hours ago (the gate time the helpers use).</summary>
     private static DateOnly GateDay => DateOnly.FromDateTime(DateTime.UtcNow.AddHours(7 - 2));
 
@@ -166,6 +217,41 @@ public sealed class OperationReportApiTests(TosApiFactory api)
         finally
         {
             await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
+
+    [Fact]
+    public async Task Empty_out_lists_every_empty_gate_out_and_counts_it_by_size()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = Today;
+        var url = $"{Reports}/empty-out.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=MAEU";
+        try
+        {
+            await EmptyInThenOutAsync(client, carrierRef, box, ct);
+
+            var rows = await SheetAsync(client, url, ct);
+            Assert.Contains(rows, r => r[0] == "INBOUND EMPTY OUT REPORT");
+            Assert.Contains(rows, r => r[0] == "AGENT:MAEU");
+            Assert.Contains(rows, r => r[..13].SequenceEqual(["Container No", "Size", "Plate No.", "TRUCK COMPANY", "NEXT LOCATION", "Vessel Name",
+                "Voyage No", "Consignee / SHIPPER", "Date", "Time", "Status", "Damage Condition", "Remarks"]));
+            var row = Assert.Single(rows, r => r[0] == box);
+            Assert.Equal(["20GP", "70-4322"], row[1..3]);
+            Assert.Equal(day.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture), row[8]);
+            // SUM counts every move listed, each once.
+            var listed = rows.Skip(rows.FindIndex(r => r[0] == "Container No") + 1).TakeWhile(r => r[0] != "Summary").Count(r => r[0].Length > 0);
+            Assert.Equal(listed.ToString(), rows.Single(r => r[0] == "TOTAL")[15]);
+            Assert.Contains(rows, r => r[0] == "Container Size" && r[1] == "20GP" && r[15] == "SUM");
+            await PdfAsync(client, url.Replace(".xlsx", ".pdf"), ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }

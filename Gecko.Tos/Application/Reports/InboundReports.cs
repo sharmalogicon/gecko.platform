@@ -35,6 +35,9 @@ internal static class InboundReports
         public decimal? GrossKg { get; init; }
         public decimal? VgmKg { get; init; }
         public string? Remarks { get; init; }
+        public Guid? SurveyId { get; init; }
+        public string? NextLocationCode { get; init; }
+        public string? NextPrevLocation { get; init; }
         public Guid BookingId { get; init; }
         public string OrderNo { get; init; } = "";
         public string BookingTypeCode { get; init; } = "";
@@ -76,6 +79,7 @@ internal static class InboundReports
                 ContainerNo = g.ContainerNo, Direction = g.Direction, FullEmpty = g.FullEmpty, MovementCode = g.MovementCode,
                 LineCode = g.LinePartyCode, EquipmentTypeCode = g.EquipmentTypeCode, ConditionCode = g.ConditionCode, EirNo = g.EirNo,
                 GrossKg = g.GrossWeightKg, VgmKg = g.VgmKg, Remarks = g.Remarks,
+                SurveyId = g.SurveyId, NextLocationCode = g.NextLocationCode, NextPrevLocation = b.NextPrevLocation,
                 BookingId = b.BookingId, OrderNo = b.OrderNo, BookingTypeCode = b.BookingTypeCode, OrderTypeCode = b.OrderTypeCode,
                 DirectionCode = b.DirectionCode, CarrierRef = b.CarrierRef, CustomerRef = b.CustomerRef, CustomerCode = b.CustomerPartyCode,
                 PolPortCode = b.PolPortCode, TruckPlate = v.TruckPlate, HaulierCode = v.HaulierPartyCode,
@@ -151,5 +155,88 @@ internal static class InboundReports
             Rows: [],
             PageLabel: "Page No#",
             After: blocks);
+    }
+
+    /// <summary>A move's damage codes from its gate survey, de-duplicated, in line order (Vector printed a row per damage).</summary>
+    private static async Task<ILookup<Guid, string>> DamagesAsync(TosDbContext db, IEnumerable<Guid?> surveyIds, CancellationToken ct)
+    {
+        var ids = surveyIds.OfType<Guid>().Distinct().ToList();
+        var found = new List<(Guid Survey, short Line, string Code)>();
+        foreach (var slice in ids.Chunk(2000))
+            found.AddRange((await db.SurveyDamages.AsNoTracking().Where(d => slice.Contains(d.SurveyId))
+                    .Select(d => new { d.SurveyId, d.LineNo, d.DamageCode }).ToListAsync(ct))
+                .Select(d => (d.SurveyId, d.LineNo, d.DamageCode)));
+        return found.OrderBy(d => d.Line).DistinctBy(d => (d.Survey, d.Code)).ToLookup(d => d.Survey, d => d.Code);
+    }
+
+    // ── TMS.Operation.InBound.EmptyOut ──
+
+    private static readonly string[] EmptyOutSizes =
+        ["20GP", "20HC", "40GP", "40HC", "45HC", "20RF", "40RF", "40RH", "20HG", "40HG", "40OT", "20FR", "40FR", "20TK"];
+
+    /// <summary>
+    /// INBOUND EMPTY OUT REPORT (Report.usp_InBound_EmptyOut; menus "EMPTY OUT" and "INBOUND Empty Out"): every empty gate-out
+    /// on the depot days asked for — whatever the booking type, as on Vector — in gate order, then the RDL's one-row Summary
+    /// over its 14 fixed size/types and SUM. One row per move, its damage codes joined (Vector repeated the move per damage
+    /// and counted each copy). Time is 24-hour (the RDL's hh:mm dropped AM/PM). The RDL has no page header or footer: the
+    /// heading prints once and there is no page number.
+    /// </summary>
+    public static async Task<TabularReport> EmptyOutAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly from, DateOnly to, string? agentCode, CancellationToken ct)
+    {
+        var query = Moves(db, h.Branch, from, to).Where(m => m.Direction == GateRules.Out && m.FullEmpty == GateRules.Empty);
+        if (Clean(agentCode) is { } agent) query = query.Where(m => m.LineCode == agent);
+        var moves = (await query.ToListAsync(ct)).OrderBy(m => m.At).ThenBy(m => m.EirNo, StringComparer.Ordinal).ToList();
+        var types = await TypesAsync(master, moves.Select(m => m.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(moves.Select(m => m.CustomerCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(moves.Select(m => m.VesselCode).OfType<string>().Distinct(), ct);
+        var damages = await DamagesAsync(db, moves.Select(m => m.SurveyId), ct);
+        string SizeOf(Move m)
+        {
+            var (size, type) = SizeType(types, m.EquipmentTypeCode);
+            return $"{size}{type}";
+        }
+
+        var rows = moves.Select(m =>
+        {
+            var at = Local(h.Branch, m.At);
+            return new TabularRow([m.ContainerNo, SizeOf(m), m.TruckPlate, m.HaulierCode, m.NextLocationCode ?? m.NextPrevLocation,
+                m.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName : null, m.Voyage,
+                m.CustomerCode is { } c ? parties.GetValueOrDefault(c)?.Name : null, at, at, m.ConditionCode,
+                m.SurveyId is { } s && damages[s].Any() ? string.Join(", ", damages[s]) : null, m.Remarks]);
+        }).ToList();
+
+        double[] summaryWidths = [2.46472, 1.23125, 1.27453, 1.21751, 1.15208, 1.14917, 1.07125, 0.99188, 1.09234, 1.15599, 1.07125, 1.08479, 1.08479, 1.07125, 0.96542, 1.04479];
+        var summary = new TabularBlock("Summary",
+            summaryWidths.Select((w, i) => new TabularColumn(w, null, i == 0 ? CellAlign.Left : CellAlign.Center)).ToList(),
+            [[new HeaderCell("Container Size"), .. EmptyOutSizes.Select(s => new HeaderCell(s)), new HeaderCell("SUM")]],
+            [new TabularRow(["TOTAL", .. EmptyOutSizes.Select(s => (object?)moves.Count(m => SizeOf(m) == s)), moves.Count])]);
+
+        return new TabularReport(
+            FileName: $"EmptyOut_{from:yyyyMMdd}-{to:yyyyMMdd}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 1.27,
+            Heading: [],
+            HeadingRight: [],
+            Preamble:
+            [
+                new(h.BranchName, 10, Bold: true), new("INBOUND EMPTY OUT REPORT", 10, Bold: true),
+                new($"From Gate Out Date :{Day(from, "dd/MM/yyyy")}     To Gate Out Date : {Day(to, "dd/MM/yyyy")}", 10, Bold: true),
+                new($"AGENT:{Clean(agentCode)}", 10, Bold: true),
+            ],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.32854), new(1.07125), new(1.57974), new(2.43376), new(2.15625), new(3.63771), new(1.38875), new(5.73276),
+                new(1.70625, "dd/MM/yyyy"), new(1.20354, "HH:mm"), new(1.41521), new(2.12959), new(3.92875),
+            ],
+            HeaderRows:
+            [
+                [new("Container No"), new("Size"), new("Plate No."), new("TRUCK COMPANY"), new("NEXT LOCATION"), new("Vessel Name"),
+                 new("Voyage No"), new("Consignee / SHIPPER"), new("Date"), new("Time"), new("Status"), new("Damage Condition"), new("Remarks")],
+            ],
+            Rows: rows,
+            PageLabel: null,
+            After: [summary]);
     }
 }

@@ -88,4 +88,99 @@ internal static class CustomerServiceReports
             PageLabel: "Page No#",
             After: blocks);
     }
+
+    // ── TMS.CustomerService.BookingContainerList ──
+
+    /// <summary>
+    /// The desktop's "Booking Container List" (Report.usp_CustomerService_BookingContainerList): the boxes of EXPORT bookings
+    /// that have gone out empty — on the depot days asked for, unless a booking no is asked (then any day, as on Vector) —
+    /// by booking no then container, with the agent (the booking's agent, else its line), shipper, the booked size / type,
+    /// the seal (declared, else the one recorded at the empty gate-out), the empty gate-out time, vessel, voyage and the
+    /// destination port (final, else discharge). One row per box (its latest empty gate-out); cancelled bookings are out.
+    /// </summary>
+    public static async Task<TabularReport> BookingContainerListAsync(
+        TosDbContext db, IMasterDataReferences master, ReportHeading h, DateOnly? from, DateOnly? to,
+        string? agentCode, string? customerCode, string? vesselCode, string? voyageNo, string? bookingBlNo, CancellationToken ct)
+    {
+        var bookings = db.Bookings.AsNoTracking()
+            .Where(b => b.BranchId == h.Branch.BranchId && b.BookingTypeCode == "EXPORT" && b.Status != "CANCELLED" && b.DeletedAt == null);
+        if (Clean(agentCode) is { } agent) bookings = bookings.Where(b => (b.AgentPartyCode ?? b.LinePartyCode) == agent);
+        if (Clean(customerCode) is { } customer) bookings = bookings.Where(b => b.CustomerPartyCode == customer);
+        var blNo = bookingBlNo?.Trim() is { Length: > 0 } bl ? bl : null;
+        if (blNo is not null) bookings = bookings.Where(b => b.CarrierRef == blNo || b.CustomerRef == blNo || b.SubBlNo == blNo);
+        var outs = db.GateTransactions.Where(g => g.Status == "COMPLETED" && g.DeletedAt == null && g.Direction == GateRules.Out && g.FullEmpty == GateRules.Empty);
+        if (blNo is null && from is { } first && to is { } last)
+        {
+            var (start, end) = (BranchClock.StartOf(h.Branch, first), BranchClock.StartOf(h.Branch, last.AddDays(1)));
+            outs = outs.Where(g => g.TransactionAt >= start && g.TransactionAt < end);
+        }
+        var rows = await (
+                from b in bookings
+                join x in db.BookingContainers on b.BookingId equals x.BookingId
+                join r in db.EquipmentRequirements on x.EquipmentRequirementId equals r.EquipmentRequirementId
+                join g in outs on x.BookingContainerId equals g.BookingContainerId
+                join c in db.VesselCalls on b.VesselCallId equals c.VesselCallId into calls
+                from c in calls.DefaultIfEmpty()
+                where x.DeletedAt == null && x.ContainerNo != null && x.ContainerNo != ""
+                select new
+                {
+                    x.BookingContainerId, ContainerNo = x.ContainerNo!, x.DeclaredSealNo, r.EquipmentTypeCode, g.GateTransactionId, g.TransactionAt,
+                    Agent = b.AgentPartyCode ?? b.LinePartyCode, b.CustomerPartyCode, b.CarrierRef, b.CustomerRef, b.FpdPortCode, b.PodPortCode,
+                    VesselCode = c == null ? null : c.VesselCode, VoyageIn = c == null ? null : c.OperatorVoyageIn, VoyageOut = c == null ? null : c.OperatorVoyageOut,
+                })
+            .ToListAsync(ct);
+        if (Clean(vesselCode) is { } vessel) rows = rows.Where(r => r.VesselCode == vessel).ToList();
+        if (Clean(voyageNo) is { } voyage) rows = rows.Where(r => r.VoyageOut == voyage || r.VoyageIn == voyage).ToList();
+        rows = rows.GroupBy(r => r.BookingContainerId).Select(g => g.MaxBy(r => r.TransactionAt)!).ToList();
+
+        var sealsAt = new List<(Guid Move, DateTimeOffset At, string SealNo, string SealType)>();
+        foreach (var slice in rows.Select(r => r.GateTransactionId).Chunk(2000))
+            sealsAt.AddRange((await db.GateTransactionSeals.AsNoTracking().Where(s => slice.Contains(s.GateTransactionId) && s.DeletedAt == null)
+                    .Select(s => new { s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType }).ToListAsync(ct))
+                .Select(s => (s.GateTransactionId, s.CreatedAt, s.SealNo, s.SealType)));
+        var seals = sealsAt.Where(s => IsAgentSeal(s.SealType)).OrderBy(s => s.At).ToLookup(s => s.Move, s => s.SealNo);
+        var types = await TypesAsync(master, rows.Select(r => (string?)r.EquipmentTypeCode), ct);
+        var parties = await master.PartiesAsync(rows.Select(r => r.CustomerPartyCode).OfType<string>().Distinct(), ct);
+        var vessels = await master.VesselsAsync(rows.Select(r => r.VesselCode).OfType<string>().Distinct(), ct);
+        var ports = await master.PortsAsync(rows.Select(r => r.FpdPortCode ?? r.PodPortCode).OfType<string>().Distinct(), ct);
+
+        var grid = rows.OrderBy(r => BookingBlNo(r.CarrierRef, r.CustomerRef), StringComparer.Ordinal).ThenBy(r => r.ContainerNo, StringComparer.Ordinal)
+            .Select(r =>
+            {
+                var (size, type) = SizeType(types, r.EquipmentTypeCode);
+                var port = r.FpdPortCode ?? r.PodPortCode;
+                return new TabularRow([r.Agent, r.CustomerPartyCode is { } c ? parties.GetValueOrDefault(c)?.Name : null,
+                    BookingBlNo(r.CarrierRef, r.CustomerRef), r.ContainerNo, size, type,
+                    r.DeclaredSealNo ?? seals[r.GateTransactionId].FirstOrDefault(), Local(h.Branch, r.TransactionAt),
+                    r.VesselCode is { } v ? vessels.GetValueOrDefault(v)?.VesselName : null, Voyage("EXPORT", r.VoyageIn, r.VoyageOut),
+                    port is null ? null : ports.GetValueOrDefault(port)?.Name ?? port]);
+            }).ToList();
+
+        var vesselHeading = Clean(vesselCode) is { } asked ? vessels.GetValueOrDefault(asked)?.VesselName ?? asked : "";
+        return new TabularReport(
+            FileName: $"BookingContainerList_{Stamp(h.PrintedAt, "yyyyMMdd-HHmm")}",
+            Page: ReportPage.A3Landscape,
+            MarginCm: 2,
+            Heading:
+            [
+                new(h.BranchName, 10, Bold: true),
+                new($"Agent:{Clean(agentCode)}  Customer :{Clean(customerCode)}  Vessel:{vesselHeading}", 10, Bold: true),
+                new($"Booking Type: EXPORT Booking No:{blNo}", 10, Bold: true),
+            ],
+            HeadingRight: [new($"Printed By: {h.PrintedBy}"), new($"Print Date: {Stamp(h.PrintedAt, "dd/MM/yyyy HH:mm")}")],
+            Preamble: [],
+            PreambleRight: [],
+            Columns:
+            [
+                new(2.26187), new(5.72067), new(2.5), new(2.5), new(0.82021), new(1.12417), new(2.5), new(2.97625, "dd/MM/yyyy HH:mm"),
+                new(6.54186), new(1.73271), new(3.26729),
+            ],
+            HeaderRows:
+            [
+                [new("Agent"), new("Shipper"), new("Booking No."), new("Cntr No."), new("Size"), new("Type"), new("Seal No."),
+                 new("EMPTY GATE OUT DATETIME"), new("Vessel Name"), new("Voy"), new(" Port")],
+            ],
+            Rows: grid,
+            PageLabel: "Page No#");
+    }
 }

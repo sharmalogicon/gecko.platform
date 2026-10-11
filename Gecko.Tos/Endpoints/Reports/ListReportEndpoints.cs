@@ -31,6 +31,7 @@ namespace Gecko.Tos.Endpoints.Reports;
 ///   GET /reports/import-container-list.{pdf|xlsx}   TMS.Operation.InBound.ImportContainerList
 ///   GET /reports/monthly-incoming-container.{pdf|xlsx}   TMS.Operation.InBound.MonthlyIncomingContainer
 ///   GET /reports/weekly-monthly-statistics.{pdf|xlsx}   TMS.CustomerService.WeeklyMonthlyStatistics ("EXPORT - Monthly/Weekly")
+///   GET /reports/booking-container-list.{pdf|xlsx}   TMS.CustomerService.BookingContainerList
 ///   GET /reports/pti.{pdf|xlsx}   TMS.Operation.OutBound.PTI (no lines until PTI work orders are recorded)
 ///   GET /reports/container-repair-summary.{pdf|xlsx}   TMS.Operation.OutBound.ContainerRepairSummaryList (likewise, repair estimates)
 ///   GET /reports/truck-turn-around.{pdf|xlsx}   TMS.Operation.OutBound.TruckTurnAround
@@ -88,6 +89,12 @@ internal static class ListReportEndpoints
         reports.MapOperation("/weekly-monthly-statistics.{format}",
                 r => CustomerServiceReports.WeeklyMonthlyAsync(r.Db, r.Master, r.Heading, r.From, r.To, r.Q.AgentCode, r.Q.BookingType, r.Q.OrderType, r.Ct))
             .WithSummary("EXPORT - Monthly/Weekly (Vector CustomerService.WeeklyMonthlyStatistics): empty and full gate-outs per agent, order type and day");
+        reports.MapOperation("/booking-container-list.{format}",
+                r => CustomerServiceReports.BookingContainerListAsync(r.Db, r.Master, r.Heading, r.Q.DateFrom, r.Q.DateTo,
+                    r.Q.AgentCode, r.Q.CustomerCode, r.Q.VesselCode, r.Q.VoyageNo, r.Q.BookingBlNo, r.Ct),
+                range: false, check: q => q.BookingBlNo is { Length: > 0 } ? null : InvalidRange(q.DateFrom, q.DateTo))
+            .WithSummary("Booking Container List (Vector CustomerService.BookingContainerList): export boxes gone out empty, with seal and vessel")
+            .WithDescription("dateFrom/dateTo: the empty gate-out days; not needed (and not applied) when bookingBlNo is given, as on Vector.");
         reports.MapOperation("/pti.{format}", r => Task.FromResult(OutboundReports.Pti(r.Heading, r.From, r.To)))
             .WithSummary("PTI REPORT (Vector OutBound.PTI): heading and columns only until Gecko records PTI work orders");
         reports.MapOperation("/container-repair-summary.{format}", r => Task.FromResult(OutboundReports.ContainerRepairSummary(r.Heading, r.From, r.To)))

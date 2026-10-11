@@ -664,4 +664,43 @@ public sealed class OperationReportApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    [Fact]
+    public async Task Booking_container_list_lists_the_export_box_that_went_out_empty()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        var day = Today;
+        try
+        {
+            var call = (await client.GetFromJsonAsync<PagedResult<VesselCallSummaryResponse>>("/api/tos/vessel-calls?pageSize=200", ct))!
+                .Items.Single(c => c.CallRef == "EASTPIONEER-069S");
+            await EmptyInThenOutAsync(client, carrierRef, box, ct, line: "ONEY", outOrderType: "EXP CY/CY", outCall: call.VesselCallId);
+
+            foreach (var url in new[]
+            {
+                $"{Reports}/booking-container-list.xlsx?branchId={SctLcb01}&dateFrom={day:yyyy-MM-dd}&dateTo={day:yyyy-MM-dd}&agentCode=ONEY",
+                $"{Reports}/booking-container-list.xlsx?branchId={SctLcb01}&bookingBlNo={carrierRef}O",
+            })
+            {
+                var rows = await SheetAsync(client, url, ct);
+                Assert.Contains(rows, r => r[0] == "Booking Type: EXPORT Booking No:" + (url.Contains("bookingBlNo") ? carrierRef + "O" : ""));
+                Assert.Contains(rows, r => r[0] == "Agent" && r[3] == "Cntr No." && r[10] == " Port");
+                var row = Assert.Single(rows, r => r[3] == box);
+                Assert.Equal(["ONEY", carrierRef + "O", box, "20", "GP", $"ZZ-{box[^4..]}"], [row[0], row[2], row[3], row[4], row[5], row[6]]);
+                Assert.StartsWith(day.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture), row[7], StringComparison.Ordinal);
+                Assert.Equal("EASTERN PIONEER", row[8]);
+            }
+            Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync($"{Reports}/booking-container-list.xlsx?branchId={SctLcb01}", ct)).StatusCode);
+            await PdfAsync(client, $"{Reports}/booking-container-list.pdf?branchId={SctLcb01}&bookingBlNo={carrierRef}O", ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveGateAsync(carrierRef);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

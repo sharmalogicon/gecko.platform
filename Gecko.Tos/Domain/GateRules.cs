@@ -230,6 +230,46 @@ public static class GateRules
     }
 
     /// <summary>
+    /// R12 (gecko_master 34): the step matches the seal keyed at the gate against the box's booked seal. A seal the
+    /// booking does not know refuses the box; a booking with no seal to match is only said (nothing to compare).
+    /// No seal keyed at all is <c>SEAL_REQUIRED</c>'s (the rule needs Check Seal Number).
+    /// </summary>
+    public static GateFinding? SealNotAsBooked(OrderTypeStepRef step, IEnumerable<string> sealNos, string? bookedSeal)
+    {
+        if (!step.SealMustMatch) return null;
+        var keyed = sealNos.Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+        if (keyed.Count == 0) return null;
+        if (bookedSeal is null)
+            return new GateFinding("NO_BOOKED_SEAL", $"{step.MovementCode} matches the seal, but the booking has no seal for this box to match.", GateSeverity.Warn);
+        return keyed.Any(s => string.Equals(s, bookedSeal, StringComparison.OrdinalIgnoreCase))
+            ? null
+            : new GateFinding("SEAL_NOT_AS_BOOKED",
+                $"{step.MovementCode} matches the seal: the booking says {bookedSeal}, the gate has {string.Join(", ", keyed)}. Check the seal, or correct the booking.",
+                GateSeverity.Block);
+    }
+
+    /// <summary>
+    /// R6 (gecko_master 34): the step's box comes in only with its damage survey, recorded with the move — the gate Save's
+    /// row says it surveyed the box (its damages, or none found). <paramref name="surveyed"/> false refuses it.
+    /// </summary>
+    public static GateFinding? SurveyMissing(OrderTypeStepRef? step, string direction, bool surveyed) =>
+        step is { RequireSurvey: true } && direction == In && !surveyed
+            ? new GateFinding("SURVEY_REQUIRED",
+                $"{step.MovementCode} needs the box's damage survey with the gate-in: survey it on the gate screen (its damages, or none found) and Save.",
+                GateSeverity.Block)
+            : null;
+
+    /// <summary>
+    /// R3 (gecko_master 34): a pick-up takes only a box of a grade its order type releases.
+    /// </summary>
+    public static GateFinding? GradeNotReleased(string containerNo, string? gradeCode, OrderTypePlanRef plan) =>
+        plan.RulesOrNone.ReleasesGrade(gradeCode)
+            ? null
+            : new GateFinding("GRADE_NOT_ALLOWED",
+                $"{containerNo} is grade {gradeCode ?? "(none)"}; {plan.OrderTypeCode} releases grade {string.Join(", ", plan.RulesOrNone.ReleaseGradeCodes)} only.",
+                GateSeverity.Block);
+
+    /// <summary>
     /// Gate hours (TIER3_DESIGN_NOTES §1): a move while the depot's gate is shut is
     /// a WARNING, never a refusal (owner decision 2026-09-30) — the clerk is told
     /// when it opens next and may still proceed. A depot with no gate hours

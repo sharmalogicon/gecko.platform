@@ -270,11 +270,13 @@ internal static class GateEndpoints
 
     /// <summary>
     /// The gate move itself — the endpoint above, and each row of the big Save (TripEndpoints), which gives
-    /// every row its own key so a resumed Save answers with the EIRs already recorded.
+    /// every row its own key so a resumed Save answers with the EIRs already recorded. <paramref name="surveyed"/>: the
+    /// Save records the box's damage survey with this move (R6); this endpoint alone records none.
     /// </summary>
     internal static async Task<Results<Created<GateTransactionResponse>, ValidationProblem, ProblemHttpResult>> RecordCoreAsync(
         GateTransactionRequest request, string? key, TosDbContext db, BarrierReader barrier, IMasterDataReferences master,
-        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, IUserDirectory users, CancellationToken ct)
+        BranchClock clock, ITenantContext caller, ICallerPermissions scope, TimeProvider time, IUserDirectory users, CancellationToken ct,
+        bool surveyed = false)
     {
         var branchId = request.BranchId!.Value;
         var way = request.Direction.Clean()!;
@@ -318,6 +320,9 @@ internal static class GateEndpoints
 
         var findings = view.Findings.ToList();
         findings.AddRange(GateRules.Observations(view.StepRules, request.GrossWeightKg, seals.Count));
+        if (GateRules.SealNotAsBooked(view.StepRules, seals.Select(s => s.SealNo), view.Assignment.DeclaredSealNo.Clean()) is { } notAsBooked)
+            findings.Add(notAsBooked);
+        if (GateRules.SurveyMissing(view.StepRules, way, surveyed) is { } unsurveyed) findings.Add(unsurveyed);
         // Another truck's clerk holds this box (Record, GATE_IN_BIG_SAVE §1).
         if (await HeldFindingAsync(db, users, view, request.DraftId, now, ct) is { } held) findings.Add(held);
 
@@ -598,7 +603,7 @@ internal static class GateEndpoints
     /// (<paramref name="walkInStep"/>, WALK_IN_ORDERS_PLAN §3) has no order yet either; its step is its walk-in order type's.
     /// </summary>
     internal static async Task<List<GateFinding>> PrecheckAsync(GateTransactionRequest move, bool blind, BarrierReader barrier,
-        IMasterDataReferences master, TimeProvider time, CancellationToken ct, OrderTypeStepRef? walkInStep = null)
+        IMasterDataReferences master, TimeProvider time, CancellationToken ct, OrderTypeStepRef? walkInStep = null, bool surveyed = false)
     {
         var way = move.Direction.Clean()!;
         var view = await barrier.ReadAsync(move.BranchId!.Value, move.ContainerNo, way, move.TransactionAt ?? time.GetUtcNow(), ct);
@@ -607,6 +612,11 @@ internal static class GateEndpoints
             .ToList();
         if (GateRules.TripTypeContradiction(move.TripType.Clean()!, way) is { } contradiction)
             blocks.Add(new GateFinding("TRIP_TYPE", contradiction, GateSeverity.Block));
+        // R6 / R12 (gecko_master 34), before the money as well as at the move.
+        if (GateRules.SurveyMissing(view.StepRules ?? walkInStep, way, surveyed) is { } unsurveyed) blocks.Add(unsurveyed);
+        if (view.StepRules is { } stepRules
+            && GateRules.SealNotAsBooked(stepRules, (move.Seals ?? []).Select(s => s.SealNo), view.Assignment?.DeclaredSealNo.Clean()) is { Severity: GateSeverity.Block } notAsBooked)
+            blocks.Add(notAsBooked);
 
         string? fullEmpty = view.StepRules?.FullEmpty ?? walkInStep?.FullEmpty;
         var export = view.Booking?.DirectionCode.Contains("EXPORT", StringComparison.OrdinalIgnoreCase) ?? false;

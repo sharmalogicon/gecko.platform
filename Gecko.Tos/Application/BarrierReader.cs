@@ -127,8 +127,11 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             findings.Add(new GateFinding("WRONG_BRANCH",
                 $"{containerNo} is booked at another depot on {booking.OrderNo}. It cannot be gated here.", GateSeverity.Block));
 
+        var plan = (await master.OrderTypePlansAsync([booking.OrderTypeCode], ct)).GetValueOrDefault(booking.OrderTypeCode);
+        // R4 (gecko_master 34): the order type may refuse or allow a box of another owner; else the tenant setting.
         if (GateRules.OwnerMismatch(containerNo, registry?.OwnerPartyId, booking.LinePartyId, booking.LinePartyCode, booking.OrderNo,
-                await master.GetBoolSettingAsync(TosSettingKeys.RefuseOwnerMismatch, branchId, true, ct)) is { } owner)
+                (plan?.RulesOrNone ?? OrderTypeRules.None).RefusesOtherOwner(
+                    await master.GetBoolSettingAsync(TosSettingKeys.RefuseOwnerMismatch, branchId, true, ct))) is { } owner)
             findings.Add(owner);
 
         if (booking.Status != BookingRules.Open)
@@ -144,7 +147,6 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
             .Where(p => p.BookingContainerId == assignment.BookingContainerId && p.Status == "PENDING")
             .OrderBy(p => p.SequenceNo).ToListAsync(ct);
 
-        var plan = (await master.OrderTypePlansAsync([booking.OrderTypeCode], ct)).GetValueOrDefault(booking.OrderTypeCode);
         var rulesBySource = plan?.Steps.ToDictionary(s => s.OrderTypeMovementId) ?? [];
 
         MovementPlan? step = null;
@@ -201,6 +203,9 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
 
                 if (openVisit is not null && GateRules.BeforePreviousMove(containerNo, at, openVisit.LastEventAt) is { } early)
                     findings.Add(early);
+
+                if (openVisit is not null && plan is not null && GateRules.GradeNotReleased(containerNo, openVisit.GradeCode, plan) is { } grade)
+                    findings.Add(grade);
 
                 if (isFull && isExport && booking.VesselCallId is { } sailingOn)
                 {

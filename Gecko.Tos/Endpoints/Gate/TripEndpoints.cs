@@ -166,6 +166,9 @@ internal static class TripEndpoints
                 }
             }
         }
+        for (var i = 0; i < rows.Count; i++)
+            if (rows[i].Surveyed && rows[i].Move?.Direction != GateRules.In)
+                errors.Add($"rows[{i}].surveyed", "A box is surveyed as it comes in (a drop-off).");
         if (errors.Count > 0) return TosSupport.Invalid(errors);
 
         if (save is null)
@@ -264,7 +267,7 @@ internal static class TripEndpoints
         {
             if (doneBefore.Contains($"{key}#{i}") || string.IsNullOrWhiteSpace(rows[i].Move!.ContainerNo)) continue;
             var blocks = await GateEndpoints.PrecheckAsync(Move(rows[i], asHeld, null), rows[i].Blind is not null, barrier, master, time, ct,
-                walkIn[i]?.Plan.WalkInStep);
+                walkIn[i]?.Plan.WalkInStep, Surveyed(rows[i]));
             if (walkIn[i] is { } w) blocks.AddRange(await WalkInFindingsAsync(w, branchId, db, ct));
             if (blocks.Count > 0)
                 refusals.Add(new { index = i, containerNo = ContainerNumber.Normalise(rows[i].Move!.ContainerNo),
@@ -456,15 +459,16 @@ internal static class TripEndpoints
         {
             if (!gateOut && rows[i].Move!.Direction == GateRules.Out) continue;   // a pick-up: planned below, moved at gate out
             var move = Move(rows[i], asHeld, visitId);
-            var recorded = await GateEndpoints.RecordCoreAsync(move, $"{key}#{i}", db, barrier, master, clock, caller, scope, time, users, ct);
+            var recorded = await GateEndpoints.RecordCoreAsync(move, $"{key}#{i}", db, barrier, master, clock, caller, scope, time, users, ct,
+                Surveyed(rows[i]));
             db.ChangeTracker.Clear();
             var coupon = payment?.Coupons.FirstOrDefault(c => c.BookingContainerId == lines[i].BookingContainerId)?.CouponRef;
             if (recorded.Result is Created<GateTransactionResponse> { Value: { } eir })
             {
                 visitId ??= eir.TruckVisitId;
                 visitNo ??= eir.VisitNo;
-                var (surveyId, holds, surveyProblem) = rows[i].Damages is { Count: > 0 } damages
-                    ? await SurveyAsync(eir, move, damages, db, master, caller, scope, time, ct)
+                var (surveyId, holds, surveyProblem) = Surveyed(rows[i])
+                    ? await SurveyAsync(eir, move, rows[i].Damages ?? [], db, master, caller, scope, time, ct)
                     : (null, null, null);
                 IReadOnlyList<GateFindingResponse> said = [.. eir.Findings ?? [], .. new[] { surveyProblem, switched.GetValueOrDefault(i) }.OfType<GateFindingResponse>()];
                 if (gateOut && plans.FirstOrDefault(p => p.BookingContainerId == rows[i].BookingContainerId && p.Status == "PLANNED") is { } plan)
@@ -601,6 +605,9 @@ internal static class TripEndpoints
             : (null, null, new GateFindingResponse("SURVEY_NOT_RECORDED",
                 $"The box is in, but its damage was not recorded: {Why(made.Result).Reason} Record it on the survey screen.", "WARN"));
     }
+
+    /// <summary>The row's box is surveyed with its move (R6): the clerk said so, or listed its damages.</summary>
+    private static bool Surveyed(TripRowRequest row) => row.Surveyed || row.Damages is { Count: > 0 };
 
     /// <summary>A truck carries 1×40' or 2×20' each way: the boxes' lengths in one direction add up to 45 ft at most.</summary>
     private sealed record Aboard(string Direction, string? EquipmentTypeCode);

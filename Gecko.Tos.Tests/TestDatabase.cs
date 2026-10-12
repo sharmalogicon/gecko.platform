@@ -173,6 +173,45 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>Sets an SCT order type's owner_match (gecko_master 34, R4): REFUSE, ALLOW, or null = the tenant setting.</summary>
+    public static async Task SetSctOwnerMatchAsync(string orderTypeCode, string? value)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE gecko_master.commercial.order_type SET owner_match = @value
+             WHERE order_type_code = @code AND deleted_at IS NULL
+               AND tenant_id = (SELECT tenant_id FROM gecko_identity.tenant.tenant WHERE tenant_code = 'SCT' AND deleted_at IS NULL);
+            """;
+        command.Parameters.AddWithValue("@code", orderTypeCode);
+        command.Parameters.AddWithValue("@value", (object?)value ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Sets a step rule of an SCT order type (gecko_master 34): require_survey or seal_must_match (R6, R12), or check_seal_no.</summary>
+    public static async Task SetSctStepRuleAsync(string orderTypeCode, string movementCode, string column, bool value)
+    {
+        if (column is not ("require_survey" or "seal_must_match" or "check_seal_no")) throw new ArgumentException(column);
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE s SET {column} = @value
+              FROM gecko_master.commercial.order_type_movement s
+              JOIN gecko_master.commercial.order_type o ON o.order_type_id = s.order_type_id
+              JOIN gecko_master.commercial.movement m ON m.movement_id = s.movement_id
+             WHERE o.order_type_code = @code AND m.movement_code = @movement AND s.deleted_at IS NULL AND o.deleted_at IS NULL
+               AND o.tenant_id = (SELECT tenant_id FROM gecko_identity.tenant.tenant WHERE tenant_code = 'SCT' AND deleted_at IS NULL);
+            """;
+        command.Parameters.AddWithValue("@code", orderTypeCode);
+        command.Parameters.AddWithValue("@movement", movementCode);
+        command.Parameters.AddWithValue("@value", value);
+        await command.ExecuteNonQueryAsync();
+    }
+
     /// <summary>Soft-deletes test holds (by container number). Test-only — a hold is released, never erased.</summary>
     public static async Task RemoveHoldsAsync(params string[] containerNos)
     {

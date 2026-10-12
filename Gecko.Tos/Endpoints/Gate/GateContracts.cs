@@ -281,7 +281,10 @@ public sealed record TripRowRequest(
     IReadOnlyList<SurveyDamageRequest>? Damages = null,
     [property: MaxLength(20)] string? EquipmentTypeCode = null,
     bool AcceptTypeChange = false,
-    TripWalkInRequest? WalkIn = null);
+    TripWalkInRequest? WalkIn = null,
+    // R6 (gecko_master 34): the clerk surveyed the box as it came in — the Save records its GATE_IN survey with the move,
+    // with these damages or none found. Damages listed imply it.
+    bool Surveyed = false);
 
 /// <summary>
 /// A box of a truck with no paperwork (WALK_IN_ORDERS_PLAN §3, owner 2026-10-12). The clerk's two answers: the move's

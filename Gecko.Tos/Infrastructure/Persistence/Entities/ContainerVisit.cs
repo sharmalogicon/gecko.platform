@@ -39,6 +39,9 @@ public partial class ContainerVisit
 
     public string? PositionText { get; set; }
 
+    /// <summary>gecko_tos 29: what the EMR desk is waiting on for this stay (Vector "Update EMR Remarks").</summary>
+    public string? EmrRemarks { get; set; }
+
     public Guid? CurrentBookingContainerId { get; set; }
 
     public DateTimeOffset LastEventAt { get; set; }

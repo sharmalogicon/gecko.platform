@@ -50,6 +50,7 @@ public static class MasterDataModule
 
         services.AddScoped<TenantSettingReader>();
         services.AddScoped<Contracts.IMasterDataReferences, MasterDataReferences>();
+        services.AddScoped<Contracts.IContainerRenumbering, ContainerRenumbering>();
 
         return services;
     }

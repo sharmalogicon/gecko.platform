@@ -36,6 +36,12 @@ internal static class TosPermissions
     /// <summary>The reefer plug log (gecko_identity 21_reefer_permissions.sql): see it; plug in / out, correct, void.</summary>
     public const string ReeferView = "tos.reefer.view";
     public const string ReeferManage = "tos.reefer.manage";
+
+    /// <summary>A box standing in the yard (gecko_identity 27): change its condition / grade and its EMR remarks (Container Master).</summary>
+    public const string YardManage = "tos.yard.manage";
+
+    /// <summary>MDM's: correcting a container number in the registry moves the box's TOS rows too (CONTAINER_MASTER_FOR_API §3).</summary>
+    public const string EquipmentManage = "mdm.equipment.manage";
 }
 
 /// <summary>

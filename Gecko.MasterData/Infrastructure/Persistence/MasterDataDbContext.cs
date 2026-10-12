@@ -44,6 +44,8 @@ public partial class MasterDataDbContext : DbContext
 
     public virtual DbSet<ContainerCondition> ContainerConditions { get; set; }
 
+    public virtual DbSet<ContainerRenumber> ContainerRenumbers { get; set; }
+
     public virtual DbSet<ContainerGrade> ContainerGrades { get; set; }
 
     public virtual DbSet<ContainerPrefix> ContainerPrefixes { get; set; }
@@ -1059,6 +1061,28 @@ public partial class MasterDataDbContext : DbContext
             entity.Property(e => e.VesselId).HasColumnName("vessel_id");
         });
 
+        modelBuilder.Entity<ContainerRenumber>(entity =>
+        {
+            entity.HasKey(e => e.ContainerRenumberId).HasName("pk_container_renumber");
+            entity.ToTable("container_renumber", "equipment");
+            entity.Property(e => e.ContainerRenumberId)
+                .HasDefaultValueSql("(newsequentialid())", "df_container_renumber__id")
+                .HasColumnName("container_renumber_id");
+            entity.Property(e => e.TenantId).HasColumnName("tenant_id");
+            entity.Property(e => e.ContainerId).HasColumnName("container_id");
+            entity.Property(e => e.OldContainerNo).HasMaxLength(11).IsUnicode(false).HasColumnName("old_container_no");
+            entity.Property(e => e.NewContainerNo).HasMaxLength(11).IsUnicode(false).HasColumnName("new_container_no");
+            entity.Property(e => e.Reason).HasMaxLength(300).HasColumnName("reason");
+            entity.Property(e => e.RenumberedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_container_renumber__at")
+                .HasColumnName("renumbered_at");
+            entity.Property(e => e.RenumberedBy).HasColumnName("renumbered_by");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_container_renumber__created_at")
+                .HasColumnName("created_at");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+        });
+
         modelBuilder.Entity<Container>(entity =>
         {
             entity.HasKey(e => e.ContainerId).HasName("pk_container");
@@ -1140,6 +1164,9 @@ public partial class MasterDataDbContext : DbContext
                 .HasMaxLength(400)
                 .IsUnicode(false)
                 .HasColumnName("fixed_port_codes");
+            entity.Property(e => e.Remarks)
+                .HasMaxLength(1000)
+                .HasColumnName("remarks");
             entity.Property(e => e.RowVersion)
                 .IsRowVersion()
                 .IsConcurrencyToken()

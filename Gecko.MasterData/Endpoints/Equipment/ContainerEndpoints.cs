@@ -1,6 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.Linq.Expressions;
 using Gecko.Data;
+using Gecko.Identity.Contracts;
 using Gecko.MasterData.Application;
 using Gecko.MasterData.Infrastructure.Persistence;
 using Gecko.MasterData.Infrastructure.Persistence.Entities;
@@ -24,7 +25,12 @@ public sealed record ContainerResponse(
     string? ReeferUnitMake, string? ReeferUnitModel,
     string Status, DateTimeOffset? StatusChangedAt, bool IsCheckDigitValid,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string RowVersion,
-    [property: System.Text.Json.Serialization.JsonIgnore] string? FixedPortList = null)
+    [property: System.Text.Json.Serialization.JsonIgnore] string? FixedPortList = null,
+    // gecko_master 35: Vector Container Information's Remarks.
+    string? Remarks = null,
+    Guid? CreatedBy = null, Guid? UpdatedBy = null,
+    // The desktop footer's "Created By NAT": the users' display names (CONTAINER_MASTER_FOR_API §4).
+    string? CreatedByName = null, string? UpdatedByName = null)
 {
     /// <summary>The ports this box is designated to (Vector ContainerFixPortList); empty = any port. Enforced on an export gate-out.</summary>
     public IReadOnlyList<string> FixedPortCodes =>
@@ -61,7 +67,8 @@ public sealed record CreateContainerRequest(
     [property: Range(1, 100000)] decimal? MaxGrossKg = null,
     [property: MaxLength(40)] string? ReeferUnitMake = null,
     [property: MaxLength(40)] string? ReeferUnitModel = null,
-    IReadOnlyList<string>? FixedPortCodes = null);
+    IReadOnlyList<string>? FixedPortCodes = null,
+    [property: MaxLength(1000)] string? Remarks = null);
 
 public sealed record UpdateContainerRequest(
     [property: Required] string RowVersion,
@@ -84,7 +91,19 @@ public sealed record UpdateContainerRequest(
     [property: MaxLength(40)] string? ReeferUnitMake = null,
     [property: MaxLength(40)] string? ReeferUnitModel = null,
     // Like every field of this PUT, what is sent is what is stored: none = the box may go to any port.
-    IReadOnlyList<string>? FixedPortCodes = null);
+    IReadOnlyList<string>? FixedPortCodes = null,
+    // As every field of this PUT: what is sent is stored, none clears it.
+    [property: MaxLength(1000)] string? Remarks = null);
+
+/// <summary>One change to a registry row (CONTAINER_MASTER_FOR_API §4): a field, what it was and what it became.</summary>
+public sealed record ContainerFieldChange(string Field, string? From, string? To);
+
+/// <summary>
+/// One entry of a container's registry history, newest first: CREATED, UPDATED (the fields that changed) or RENUMBERED
+/// (with the reason given). <see cref="By"/> null = a system load.
+/// </summary>
+public sealed record ContainerHistoryEntryResponse(
+    DateTimeOffset At, string Kind, Guid? By, string? ByName, IReadOnlyList<ContainerFieldChange> Changes, string? Reason = null);
 
 /// <summary>
 /// The container REGISTRY — what a box is. Where it is standing right now, what
@@ -127,6 +146,11 @@ internal static class ContainerEndpoints
             .Validate<UpdateContainerRequest>()
             .WithSummary("Update a container (the number itself is immutable)");
 
+        containers.MapGet("/{containerNo}/history", HistoryAsync)
+            .RequirePermission(MasterDataPermissions.EquipmentView)
+            .WithSummary("What changed on a container's registry row, field by field, and its renumbers")
+            .WithDescription("Newest first. Built from the row's temporal history (every PUT) and the renumber audit (gecko_master 35).");
+
         containers.MapDelete("/{containerNo}", DeleteAsync)
             .RequirePermission(MasterDataPermissions.EquipmentManage)
             .WithSummary("Soft-delete a container from the registry");
@@ -135,7 +159,7 @@ internal static class ContainerEndpoints
     }
 
     private static async Task<Ok<PagedResult<ContainerResponse>>> ListAsync(
-        [AsParameters] ListQuery query, MasterDataDbContext db, CancellationToken ct,
+        [AsParameters] ListQuery query, MasterDataDbContext db, IUserDirectory users, CancellationToken ct,
         Guid? equipmentTypeId = null, Guid? ownerPartyId = null, string? ownershipType = null, string? status = null)
     {
         var containers = db.Containers.AsNoTracking();
@@ -152,18 +176,95 @@ internal static class ContainerEndpoints
             containers = containers.Where(c => c.ContainerNo.Contains(search));
         }
 
-        return TypedResults.Ok(await Project(db, containers.OrderBy(c => c.ContainerNo))
-            .ToPagedAsync(query.Page, query.PageSize, ct));
+        var page = await Project(db, containers.OrderBy(c => c.ContainerNo)).ToPagedAsync(query.Page, query.PageSize, ct);
+        return TypedResults.Ok(page with { Items = await NamedAsync(users, page.Items, ct) });
     }
 
     private static async Task<Results<Ok<ContainerResponse>, NotFound>> GetAsync(
-        string containerNo, MasterDataDbContext db, CancellationToken ct)
+        string containerNo, MasterDataDbContext db, IUserDirectory users, CancellationToken ct)
     {
         var number = ContainerNumber.Normalise(containerNo);
         return await Project(db, db.Containers.AsNoTracking().Where(c => c.ContainerNo == number))
             .SingleOrDefaultAsync(ct) is { } container
-            ? TypedResults.Ok(container)
+            ? TypedResults.Ok((await NamedAsync(users, [container], ct)).Single())
             : TypedResults.NotFound();
+    }
+
+    /// <summary>The created-by / updated-by users' display names (Identity), for the footer.</summary>
+    private static async Task<List<ContainerResponse>> NamedAsync(IUserDirectory users, IReadOnlyList<ContainerResponse> rows, CancellationToken ct)
+    {
+        var ids = rows.SelectMany(r => new[] { r.CreatedBy, r.UpdatedBy }).OfType<Guid>().Distinct().ToList();
+        var names = ids.Count == 0 ? new Dictionary<Guid, string>() : await users.DisplayNamesAsync(ids, ct);
+        return rows.Select(r => r with
+        {
+            CreatedByName = r.CreatedBy is { } c ? names.GetValueOrDefault(c) : null,
+            UpdatedByName = r.UpdatedBy is { } u ? names.GetValueOrDefault(u) : null,
+        }).ToList();
+    }
+
+    /// <summary>The fields a registry history entry compares, by name as the screen labels them.</summary>
+    private sealed record Version(DateTime From, Guid? By, string ContainerNo, Guid? EquipmentTypeId, string? IsoCode, Guid? OwnerPartyId,
+        Guid? LessorPartyId, string OwnershipType, string? Material, DateOnly? ManufactureDate, string? Manufacturer, string? CscPlateRef,
+        string? AcepRef, DateOnly? NextExaminationDate, decimal? TareWeightKg, decimal? MaxGrossKg, string? ReeferUnitMake,
+        string? ReeferUnitModel, string Status, string? FixedPortCodes, string? Remarks);
+
+    private static async Task<Results<Ok<List<ContainerHistoryEntryResponse>>, NotFound>> HistoryAsync(
+        string containerNo, MasterDataDbContext db, IUserDirectory users, CancellationToken ct)
+    {
+        var number = ContainerNumber.Normalise(containerNo);
+        var id = await db.Containers.AsNoTracking().Where(c => c.ContainerNo == number).Select(c => (Guid?)c.ContainerId).SingleOrDefaultAsync(ct);
+        if (id is null) return TypedResults.NotFound();
+
+        var versions = await db.Containers.TemporalAll().AsNoTracking()
+            .Where(c => c.ContainerId == id)
+            .OrderBy(c => EF.Property<DateTime>(c, "sys_valid_from"))
+            .Select(c => new Version(EF.Property<DateTime>(c, "sys_valid_from"), c.UpdatedBy ?? c.CreatedBy, c.ContainerNo, c.EquipmentTypeId,
+                c.IsoCode, c.OwnerPartyId, c.LessorPartyId, c.OwnershipType, c.Material, c.ManufactureDate, c.Manufacturer, c.CscPlateRef,
+                c.AcepRef, c.NextExaminationDate, c.TareWeightKg, c.MaxGrossKg, c.ReeferUnitMake, c.ReeferUnitModel, c.Status,
+                c.FixedPortCodes, c.Remarks))
+            .ToListAsync(ct);
+        var renumbers = await db.ContainerRenumbers.AsNoTracking().Where(r => r.ContainerId == id).ToListAsync(ct);
+
+        var typeIds = versions.Select(v => v.EquipmentTypeId).OfType<Guid>().Distinct().ToList();
+        var types = await db.EquipmentTypes.AsNoTracking().Where(t => typeIds.Contains(t.EquipmentTypeId)).ToDictionaryAsync(t => t.EquipmentTypeId, t => t.TypeCode, ct);
+        var partyIds = versions.SelectMany(v => new[] { v.OwnerPartyId, v.LessorPartyId }).OfType<Guid>().Distinct().ToList();
+        var parties = await db.Parties.AsNoTracking().Where(p => partyIds.Contains(p.PartyId)).ToDictionaryAsync(p => p.PartyId, p => p.PartyCode, ct);
+        string? Type(Guid? t) => t is { } x ? types.GetValueOrDefault(x) ?? x.ToString() : null;
+        string? Party(Guid? p) => p is { } x ? parties.GetValueOrDefault(x) ?? x.ToString() : null;
+        static string? Text(object? v) => v switch
+        {
+            null => null,
+            DateOnly d => d.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+            decimal m => m.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
+            _ => v.ToString(),
+        };
+        IEnumerable<(string Field, string? Value)> Fields(Version v) =>
+        [
+            ("typeCode", Type(v.EquipmentTypeId)), ("isoCode", v.IsoCode), ("ownerCode", Party(v.OwnerPartyId)), ("lessorCode", Party(v.LessorPartyId)),
+            ("ownershipType", v.OwnershipType), ("material", v.Material), ("manufactureDate", Text(v.ManufactureDate)), ("manufacturer", v.Manufacturer),
+            ("cscPlateRef", v.CscPlateRef), ("acepRef", v.AcepRef), ("nextExaminationDate", Text(v.NextExaminationDate)),
+            ("tareWeightKg", Text(v.TareWeightKg)), ("maxGrossKg", Text(v.MaxGrossKg)), ("reeferUnitMake", v.ReeferUnitMake),
+            ("reeferUnitModel", v.ReeferUnitModel), ("status", v.Status), ("fixedPortCodes", v.FixedPortCodes), ("remarks", v.Remarks),
+        ];
+
+        var entries = new List<(DateTimeOffset At, string Kind, Guid? By, List<ContainerFieldChange> Changes, string? Reason)>();
+        for (var i = 0; i < versions.Count; i++)
+        {
+            var at = new DateTimeOffset(DateTime.SpecifyKind(versions[i].From, DateTimeKind.Utc));
+            if (i == 0) { entries.Add((at, "CREATED", versions[i].By, [], null)); continue; }
+            var changes = Fields(versions[i - 1]).Zip(Fields(versions[i]))
+                .Where(p => !string.Equals(p.First.Value, p.Second.Value, StringComparison.Ordinal))
+                .Select(p => new ContainerFieldChange(p.First.Field, p.First.Value, p.Second.Value)).ToList();
+            // A renumber is told by its audit row, with its reason; a version that changed nothing else is that renumber.
+            if (changes.Count > 0) entries.Add((at, "UPDATED", versions[i].By, changes, null));
+        }
+        entries.AddRange(renumbers.Select(r => (r.RenumberedAt, "RENUMBERED", r.RenumberedBy,
+            new List<ContainerFieldChange> { new("containerNo", r.OldContainerNo, r.NewContainerNo) }, (string?)r.Reason)));
+
+        var names = await users.DisplayNamesAsync(entries.Select(e => e.By).OfType<Guid>().Distinct(), ct);
+        return TypedResults.Ok(entries.OrderByDescending(e => e.At)
+            .Select(e => new ContainerHistoryEntryResponse(e.At, e.Kind, e.By, e.By is { } b ? names.GetValueOrDefault(b) : null, e.Changes, e.Reason))
+            .ToList());
     }
 
     /// <summary>
@@ -224,7 +325,7 @@ internal static class ContainerEndpoints
 
     private static async Task<Results<CreatedAtRoute<ContainerResponse>, ValidationProblem, ProblemHttpResult>> CreateAsync(
         CreateContainerRequest request, MasterDataDbContext db, ITenantContext caller,
-        TenantSettingReader settings, CancellationToken ct)
+        TenantSettingReader settings, IUserDirectory users, CancellationToken ct)
     {
         var number = ContainerNumber.Normalise(request.ContainerNo);
         var checkDigitValid = ContainerNumber.IsValid(number);
@@ -259,6 +360,7 @@ internal static class ContainerEndpoints
             ReeferUnitMake = request.ReeferUnitMake,
             ReeferUnitModel = request.ReeferUnitModel,
             FixedPortCodes = fixedPorts,
+            Remarks = Clean(request.Remarks),
             Status = "IN_SERVICE",
             StatusChangedAt = DateTimeOffset.UtcNow,
             // Recorded even when the tenant does not enforce it, so a depot that
@@ -271,12 +373,12 @@ internal static class ContainerEndpoints
 
         var response = await Project(db, db.Containers.AsNoTracking().Where(c => c.ContainerId == container.ContainerId))
             .SingleAsync(ct);
-        return TypedResults.CreatedAtRoute(response, "GetContainer", new { containerNo = number });
+        return TypedResults.CreatedAtRoute((await NamedAsync(users, [response], ct)).Single(), "GetContainer", new { containerNo = number });
     }
 
     private static async Task<Results<Ok<ContainerResponse>, NotFound, ValidationProblem, ProblemHttpResult>> UpdateAsync(
         string containerNo, UpdateContainerRequest request, MasterDataDbContext db,
-        TenantSettingReader settings, CancellationToken ct)
+        TenantSettingReader settings, IUserDirectory users, CancellationToken ct)
     {
         var number = ContainerNumber.Normalise(containerNo);
         var container = await db.Containers.SingleOrDefaultAsync(c => c.ContainerNo == number, ct);
@@ -315,11 +417,12 @@ internal static class ContainerEndpoints
         container.MaxGrossKg = request.MaxGrossKg;
         container.ReeferUnitMake = request.ReeferUnitMake;
         container.ReeferUnitModel = request.ReeferUnitModel;
+        container.Remarks = Clean(request.Remarks);
 
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
 
-        return TypedResults.Ok(await Project(db, db.Containers.AsNoTracking().Where(c => c.ContainerId == container.ContainerId))
-            .SingleAsync(ct));
+        var updated = await Project(db, db.Containers.AsNoTracking().Where(c => c.ContainerId == container.ContainerId)).SingleAsync(ct);
+        return TypedResults.Ok((await NamedAsync(users, [updated], ct)).Single());
     }
 
     private static async Task<Results<NoContent, NotFound, ValidationProblem, ProblemHttpResult>> DeleteAsync(
@@ -436,5 +539,8 @@ internal static class ContainerEndpoints
             c.CscPlateRef, c.AcepRef, c.NextExaminationDate,
             c.TareWeightKg, c.MaxGrossKg, c.ReeferUnitMake, c.ReeferUnitModel,
             c.Status, c.StatusChangedAt, c.IsCheckDigitValid,
-            c.CreatedAt, c.UpdatedAt, Convert.ToBase64String(c.RowVersion), c.FixedPortCodes);
+            c.CreatedAt, c.UpdatedAt, Convert.ToBase64String(c.RowVersion), c.FixedPortCodes,
+            c.Remarks, c.CreatedBy, c.UpdatedBy);
+
+    private static string? Clean(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }

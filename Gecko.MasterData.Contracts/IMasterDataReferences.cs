@@ -91,6 +91,9 @@ public interface IMasterDataReferences
 
     Task<IReadOnlyDictionary<string, CodeRef>> ContainerGradesAsync(IEnumerable<string> gradeCodes, CancellationToken ct);
 
+    /// <summary>Container condition codes (MDM equipment.container_condition) with what they mean for the box.</summary>
+    Task<IReadOnlyDictionary<string, ContainerConditionRef>> ContainerConditionsAsync(IEnumerable<string> conditionCodes, CancellationToken ct);
+
     /// <summary>
     /// Hold types WITH what they block and who may lift them. TOS stores the id and
     /// the code on every hold row, but the decision at release time — and at the
@@ -259,6 +262,28 @@ public sealed record OrderTypePlanRef(
     /// <summary>Any step demands a vessel call — the booking must then name one.</summary>
     public bool RequiresVesselCall => Steps.Any(s => s.RequireVesselVoyage);
 }
+
+/// <param name="IsDamaged">Unserviceable AND a damage condition (CODECO damage flag): the condition that puts the depot's damage
+/// hold on a box (owner 2026-10-12) — DM, UC, SC; not CL (cleaning) or WW (serviceable).</param>
+public sealed record ContainerConditionRef(string ConditionCode, string DescriptionEn, bool IsServiceable, bool CodecoDamageFlag, bool IsActive)
+{
+    public bool IsDamaged => !IsServiceable && CodecoDamageFlag;
+}
+
+/// <summary>
+/// Correcting a container number in the registry (CONTAINER_MASTER_FOR_API §3, owner 2026-10-12). TOS moves its own rows to
+/// the new number in a transaction and calls this last, before it commits: a refusal here rolls TOS back.
+/// </summary>
+public interface IContainerRenumbering
+{
+    /// <param name="rowVersion">The registry row's rowVersion as the clerk read it; null skips the check.</param>
+    Task<ContainerRenumberResult> RenumberAsync(string oldContainerNo, string newContainerNo, string reason, string? rowVersion, CancellationToken ct);
+}
+
+public enum ContainerRenumberOutcome { Renumbered, NotFound, NewNumberTaken, Stale }
+
+/// <param name="RowVersion">The registry row's new rowVersion (Renumbered only).</param>
+public sealed record ContainerRenumberResult(ContainerRenumberOutcome Outcome, Guid? ContainerId = null, string? RowVersion = null);
 
 /// <param name="DefaultPaymentTerm">CASH or CREDIT.</param>
 /// <param name="CreditLimit">Null = no limit.</param>

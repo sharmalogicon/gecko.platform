@@ -55,6 +55,7 @@ internal static class ContainerInquiryEndpoints
         public string? GradeCode { get; init; }
         public Guid? YardId { get; init; }
         public string? PositionText { get; init; }
+        public string? EmrRemarks { get; init; }
         public Guid GateInTransactionId { get; init; }
         public DateTimeOffset GateInAt { get; init; }
         public string GateInEirNo { get; init; } = null!;
@@ -108,6 +109,7 @@ internal static class ContainerInquiryEndpoints
                 ContainerVisitId = s.v.ContainerVisitId, BranchId = s.v.BranchId, ContainerNo = s.v.ContainerNo,
                 EquipmentTypeCode = s.v.EquipmentTypeCode, FullEmpty = s.v.FullEmpty, LineCode = s.v.LinePartyCode,
                 ConditionCode = s.v.ConditionCode, GradeCode = s.v.GradeCode, YardId = s.v.YardId, PositionText = s.v.PositionText,
+                EmrRemarks = s.v.EmrRemarks,
                 GateInTransactionId = s.gi.GateTransactionId, GateInAt = s.gi.TransactionAt,
                 GateInEirNo = s.gi.EirNo, GateInMovementCode = s.gi.MovementCode,
                 GateOutTransactionId = s.v.GateOutTransactionId,
@@ -242,7 +244,7 @@ internal static class ContainerInquiryEndpoints
                 r.ConditionCode, r.GradeCode, r.YardId, r.PositionText,
                 r.GateInTransactionId, r.GateInAt, r.GateInEirNo, r.GateInMovementCode,
                 r.GateOutTransactionId, r.GateOutAt, r.GateOutEirNo, r.GateOutMovementCode,
-                days, r.IsHeld, r.BookingId, r.OrderNo, r.CarrierRef, r.SubBlNo, r.LastEventAt);
+                days, r.IsHeld, r.BookingId, r.OrderNo, r.CarrierRef, r.SubBlNo, r.LastEventAt, r.EmrRemarks);
         }).ToList();
     }
 }
@@ -260,7 +262,9 @@ public sealed record ContainerInquiryRowResponse(
     Guid GateInTransactionId, DateTimeOffset GateInAt, string GateInEirNo, string GateInMovementCode,
     Guid? GateOutTransactionId, DateTimeOffset? GateOutAt, string? GateOutEirNo, string? GateOutMovementCode,
     int DaysInYard, bool IsHeld,
-    Guid? BookingId, string? OrderNo, string? CarrierRef, string? SubBlNo, DateTimeOffset LastEventAt);
+    Guid? BookingId, string? OrderNo, string? CarrierRef, string? SubBlNo, DateTimeOffset LastEventAt,
+    // gecko_tos 29: what the EMR desk is waiting on for this stay.
+    string? EmrRemarks = null);
 
 /// <summary>What the master-data registry says the box is; null when it is not registered.</summary>
 public sealed record ContainerInquiryRegistryResponse(

@@ -76,6 +76,7 @@ public static class TosModule
             .MapReservationEndpoints()
             .MapTripEndpoints()
             .MapWalkInEndpoints()
+            .MapContainerMasterEndpoints()
             .MapCorrectionEndpoints()
             .MapContainerStoryEndpoints()
             .MapContainerInquiryEndpoints()

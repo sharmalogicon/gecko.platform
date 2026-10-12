@@ -375,7 +375,7 @@ internal static class TripEndpoints
             var w = walkIn[first]!;
             var raised = await BookingEndpoints.RaiseWalkInOrderAsync(branchId, w.Plan, w.CustomerCode, w.LineCode,
                 group.Select(i => new WalkInBox(walkIn[i]!.ContainerNo, walkIn[i]!.EquipmentTypeCode)).ToList(),
-                request.Truck?.HaulierCode ?? joined?.HaulierPartyCode, rows[first].WalkIn!.Remarks.Clean(), draftId,
+                request.Truck?.HaulierCode ?? joined?.HaulierPartyCode, rows[first].WalkIn!.Remarks?.Trim() is { Length: > 0 } remarks ? remarks : null, draftId,
                 db, master, users, clock, caller, ct);
             db.ChangeTracker.Clear();
             var order = raised.Result switch

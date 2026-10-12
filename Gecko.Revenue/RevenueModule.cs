@@ -66,6 +66,7 @@ public static class RevenueModule
         services.AddScoped<IOutboxHandler, BookingChangedHandler>();
         services.AddScoped<IOutboxHandler, BookingClonedHandler>();
         services.AddScoped<IOutboxHandler, ContainersTransferredHandler>();
+        services.AddScoped<IOutboxHandler, ContainerRenumberedHandler>();
         services.AddScoped<IOutboxHandler, GateEventHandler>();
         services.AddScoped<IOutboxHandler, ReeferSessionHandler>();
 

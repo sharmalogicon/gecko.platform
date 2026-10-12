@@ -44,6 +44,9 @@ public partial class Container
     /// <summary>gecko_master 25: comma-separated port codes the box is designated to; null = any port.</summary>
     public string? FixedPortCodes { get; set; }
 
+    /// <summary>gecko_master 35: Vector Container Information's free-text Remarks.</summary>
+    public string? Remarks { get; set; }
+
     public string Status { get; set; } = null!;
 
     public DateTimeOffset? StatusChangedAt { get; set; }

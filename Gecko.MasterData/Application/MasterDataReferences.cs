@@ -284,6 +284,16 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .ToDictionaryAsync(c => c.CommodityCode, StringComparer.OrdinalIgnoreCase, ct);
     }
 
+    public async Task<IReadOnlyDictionary<string, ContainerConditionRef>> ContainerConditionsAsync(IEnumerable<string> conditionCodes, CancellationToken ct)
+    {
+        var codes = Normalise(conditionCodes);
+        if (codes.Count == 0) return new Dictionary<string, ContainerConditionRef>();
+        return await db.ContainerConditions.AsNoTracking()
+            .Where(c => codes.Contains(c.ConditionCode))
+            .Select(c => new ContainerConditionRef(c.ConditionCode, c.DescriptionEn, c.IsServiceable, c.CodecoDamageFlag, c.IsActive))
+            .ToDictionaryAsync(c => c.ConditionCode, StringComparer.OrdinalIgnoreCase, ct);
+    }
+
     public async Task<IReadOnlyDictionary<string, CodeRef>> ContainerGradesAsync(IEnumerable<string> gradeCodes, CancellationToken ct)
     {
         var codes = Normalise(gradeCodes);

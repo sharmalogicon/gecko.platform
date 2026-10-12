@@ -196,6 +196,47 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
         }
     }
 
+    /// <summary>
+    /// CONTAINER_MASTER_FOR_API §4 (owner 2026-10-12): the registry's Remarks, who created / last changed the row by name, and
+    /// a history of what each PUT changed, field by field.
+    /// </summary>
+    [Fact]
+    public async Task Remarks_are_kept_the_footer_names_the_users_and_the_history_lists_each_change()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var number = await NewValidContainerNoAsync(sct, ct);
+
+        var created = await CreateAsync(sct, number, ct);
+        try
+        {
+            Assert.False(string.IsNullOrEmpty(created.CreatedByName));
+
+            var put = await sct.PutAsJsonAsync($"{Base}/{number}", new
+            {
+                rowVersion = created.RowVersion, ownershipType = "LINE_OWNED", status = "IN_SERVICE",
+                tareWeightKg = 2200m, remarks = "  Door seal replaced 2026-10  ",
+            }, ct);
+            Assert.True(put.StatusCode == HttpStatusCode.OK, await put.Content.ReadAsStringAsync(ct));
+            var updated = (await put.Content.ReadFromJsonAsync<ContainerRow>(ct))!;
+            Assert.Equal("Door seal replaced 2026-10", updated.Remarks);
+            Assert.False(string.IsNullOrEmpty(updated.UpdatedByName));
+
+            var history = (await sct.GetFromJsonAsync<List<HistoryEntry>>($"{Base}/{number}/history", ct))!;
+            Assert.Equal(["UPDATED", "CREATED"], history.Select(h => h.Kind));
+            var changes = history[0].Changes;
+            Assert.Contains(changes, c => c is { Field: "tareWeightKg", From: null, To: "2200" });
+            Assert.Contains(changes, c => c is { Field: "remarks", To: "Door seal replaced 2026-10" });
+            Assert.False(string.IsNullOrEmpty(history[0].ByName));
+
+            Assert.Equal(HttpStatusCode.NotFound, (await sct.GetAsync($"{Base}/ZZZU0000000/history", ct)).StatusCode);
+        }
+        finally
+        {
+            await RowVersions.DeleteCurrentAsync(sct, $"{Base}/{number}", ct);
+        }
+    }
+
     [Fact]
     public async Task A_wrong_check_digit_is_refused_when_the_tenant_enforces_it()
     {
@@ -376,7 +417,10 @@ public sealed class ContainerApiTests(MasterDataApiFactory api)
         Guid ContainerId, string ContainerNo, string Prefix, Guid? EquipmentTypeId, string? TypeCode,
         string? IsoCode, Guid? OwnerPartyId, string? OwnerCode, Guid? LessorPartyId, string? LessorCode,
         string OwnershipType, string Status, DateTimeOffset? StatusChangedAt, bool IsCheckDigitValid, string RowVersion,
-        List<string>? FixedPortCodes = null);
+        List<string>? FixedPortCodes = null, string? Remarks = null, string? CreatedByName = null, string? UpdatedByName = null);
+
+    private sealed record Change(string Field, string? From, string? To);
+    private sealed record HistoryEntry(DateTimeOffset At, string Kind, Guid? By, string? ByName, List<Change> Changes, string? Reason);
 
     private sealed record Validation(
         string ContainerNo, bool IsWellFormed, bool IsCheckDigitValid, int? ExpectedCheckDigit,

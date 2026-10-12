@@ -101,6 +101,10 @@ internal sealed class BarrierReader(TosDbContext db, IMasterDataReferences maste
         IEnumerable<GateFinding> Yard(string? stepFullEmpty) => GateRules.Yard(containerNo, direction, stepFullEmpty,
             openVisit is not null, openVisit?.BranchId == branchId, yardBranchCode, openVisit?.FullEmpty);
 
+        // Owner 2026-10-12: what the EMR desk is waiting on is read at the gate before the box leaves — said, never a refusal.
+        if (direction == GateRules.Out && openVisit?.EmrRemarks is { Length: > 0 } emr)
+            findings.Add(new GateFinding("EMR_REMARKS", $"EMR: {emr}", GateSeverity.Info));
+
 
         if (assignment is null)
         {

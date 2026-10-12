@@ -173,6 +173,39 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>Soft-deletes test boxes from the MDM container registry (and their renumber audit rows). Test-only.</summary>
+    public static async Task RemoveRegistryAsync(params string[] containerNos)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gecko_master.equipment.container_renumber
+             WHERE old_container_no IN (SELECT value FROM STRING_SPLIT(@numbers, ',')) OR new_container_no IN (SELECT value FROM STRING_SPLIT(@numbers, ','));
+            UPDATE gecko_master.equipment.container SET deleted_at = SYSUTCDATETIME() AT TIME ZONE 'UTC'
+             WHERE container_no IN (SELECT value FROM STRING_SPLIT(@numbers, ',')) AND deleted_at IS NULL;
+            """;
+        command.Parameters.AddWithValue("@numbers", string.Join(',', containerNos));
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Revenue's rows for a box (its copy, stays, charges): what a renumber moves by the outbox.</summary>
+    public static async Task<int> RevenueRowsAsync(string containerNo)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            SELECT (SELECT COUNT(*) FROM gecko_revenue.projection.booking_plan_container WHERE container_no = @no)
+                 + (SELECT COUNT(*) FROM gecko_revenue.projection.container_stay WHERE container_no = @no)
+                 + (SELECT COUNT(*) FROM gecko_revenue.billing.charge WHERE container_no = @no);
+            """;
+        command.Parameters.AddWithValue("@no", containerNo);
+        return (int)(await command.ExecuteScalarAsync())!;
+    }
+
     /// <summary>Sets an SCT customer's default payment term and credit limit (MDM party.customer_extension) — restore it after.</summary>
     public static async Task SetSctCustomerCreditAsync(string partyCode, string term, decimal? creditLimit, string? currency)
     {

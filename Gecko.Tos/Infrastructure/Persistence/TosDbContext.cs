@@ -572,6 +572,10 @@ public partial class TosDbContext : DbContext
                 .IsUnique()
                 .HasFilter("([gate_out_transaction_id] IS NULL AND [deleted_at] IS NULL)");
 
+            entity.Property(e => e.EmrRemarks)
+                .HasMaxLength(500)
+                .HasColumnName("emr_remarks");
+
             entity.Property(e => e.ContainerVisitId)
                 .HasDefaultValueSql("(newsequentialid())", "df_container_visit__id")
                 .HasColumnName("container_visit_id");

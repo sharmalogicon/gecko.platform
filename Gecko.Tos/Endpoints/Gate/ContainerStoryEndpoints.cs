@@ -123,7 +123,8 @@ internal static class ContainerStoryEndpoints
                 s.v.GateOutTransactionId, s.OutEir, s.OutAt,
                 Math.Max(days, 0), open, view?.IsHeld == true, s.v.CurrentBookingContainerId, s.v.LastEventAt,
                 events[s.v.ContainerVisitId].Select(e => new ContainerStoryEventResponse(
-                    e.VisitEventId, e.EventType, e.FromValue, e.ToValue, e.EventAt, e.EventBy, e.ReferenceId, e.Remarks)).ToList());
+                    e.VisitEventId, e.EventType, e.FromValue, e.ToValue, e.EventAt, e.EventBy, e.ReferenceId, e.Remarks)).ToList(),
+                s.v.EmrRemarks);
         }).ToList();
 
         var bookingRows = bookings.Select(r => new ContainerStoryBookingResponse(
@@ -148,7 +149,9 @@ public sealed record ContainerStoryVisitResponse(
     Guid GateInTransactionId, string? GateInEirNo, string? GateInMovementCode, DateTimeOffset? GateInAt,
     Guid? GateOutTransactionId, string? GateOutEirNo, DateTimeOffset? GateOutAt,
     int DaysInYard, bool IsInYard, bool IsHeld, Guid? CurrentBookingContainerId, DateTimeOffset LastEventAt,
-    IReadOnlyList<ContainerStoryEventResponse> Events);
+    IReadOnlyList<ContainerStoryEventResponse> Events,
+    // gecko_tos 29: what the EMR desk is waiting on for this stay.
+    string? EmrRemarks = null);
 
 public sealed record ContainerStoryEventResponse(
     long VisitEventId, string EventType, string? FromValue, string? ToValue,

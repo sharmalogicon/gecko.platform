@@ -1,3 +1,4 @@
+using Gecko.SharedKernel;
 using System.Globalization;
 using System.Linq.Expressions;
 using Gecko.MasterData.Contracts;
@@ -12,8 +13,11 @@ namespace Gecko.MasterData.Application;
 /// Uses this module's request-scoped, RLS-bound context: the same tenant the
 /// caller is acting for, and nothing else.
 /// </summary>
-internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSettingReader settings) : IMasterDataReferences
+internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSettingReader settings, ITenantContext caller) : IMasterDataReferences
 {
+    public Task<IReadOnlyList<string>> EnsureRegisteredAsync(IReadOnlyCollection<UnregisteredBox> boxes, CancellationToken ct) =>
+        new ContainerRegistration(db, caller).EnsureRegisteredAsync(boxes, ct);
+
     private static List<string> Normalise(IEnumerable<string> codes) =>
         codes.Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim().ToUpperInvariant()).Distinct().ToList();
 

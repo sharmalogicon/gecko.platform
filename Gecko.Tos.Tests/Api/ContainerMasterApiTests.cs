@@ -120,6 +120,33 @@ public sealed class ContainerMasterApiTests(TosApiFactory api)
         }
     }
 
+    /// <summary>Owner 2026-10-12: a box the depot handles and the registry does not know is registered, as Vector's gate did.</summary>
+    [Fact]
+    public async Task A_box_first_seen_at_the_gate_is_registered_with_its_type_and_line()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var tag = NewTag();
+        var box = NewBox();
+        try
+        {
+            Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($"/api/master/containers/{box}", ct)).StatusCode);
+            await DropOffAsync(client, box, tag, ct);
+
+            using var registered = JsonDocument.Parse(await client.GetStringAsync($"/api/master/containers/{box}", ct));
+            var row = registered.RootElement;
+            Assert.Equal(("20GP", "MAEU", "LINE_OWNED", "IN_SERVICE"),
+                (row.GetProperty("typeCode").GetString(), row.GetProperty("ownerCode").GetString(),
+                 row.GetProperty("ownershipType").GetString(), row.GetProperty("status").GetString()));
+        }
+        finally
+        {
+            await TestDatabase.RemoveWalkInAsync(tag);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
+            await TestDatabase.RemoveRegistryAsync(box);
+        }
+    }
+
     [Fact]
     public async Task A_corrected_number_moves_the_registry_row_its_stay_booking_EIR_and_Revenues_rows()
     {

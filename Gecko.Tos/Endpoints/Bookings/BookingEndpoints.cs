@@ -1400,6 +1400,12 @@ internal static class BookingEndpoints
                     Status = "PENDING",
                 });
         await db.SaveChangesAsync(ct);
+        // Owner 2026-10-12: a box put on a booking that the registry does not know is registered (as Vector did).
+        var unknown = toAdd.Where(a => a.Box.ContainerNo is not null && a.Box.ContainerId is null).ToList();
+        if (unknown.Count > 0)
+            foreach (var (_, box) in unknown)
+                await Gate.GateEndpoints.RegisterAsync(master, box.ContainerNo!,
+                    requirements.FirstOrDefault(r => r.EquipmentRequirementId == box.EquipmentRequirementId)?.EquipmentTypeCode, booking.LinePartyCode, ct);
         return new AssignResult(null, toAdd, replayed, errors, warnings);
     }
 

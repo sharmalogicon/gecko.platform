@@ -575,8 +575,22 @@ internal static class GateEndpoints
         }
         await tx.CommitAsync(ct);
 
+        // Owner 2026-10-12: a box that came in and is not registered is registered now (Vector's gate filled Master.Container).
+        if (way == GateRules.In && view.Registry is null)
+            await RegisterAsync(master, view.ContainerNo, view.Requirement?.EquipmentTypeCode, view.Booking.LinePartyCode, ct);
+
         var response = await ProjectAsync(db, transaction.GateTransactionId, containerVisitId, completed, ct, findings);
         return TypedResults.Created($"/api/tos/gate/transactions/{transaction.GateTransactionId}", response);
+    }
+
+    /// <summary>
+    /// Registers a box the registry does not know (owner 2026-10-12). Never fails the move or the booking that caused it: the
+    /// box can be registered by hand later, and a missing registry row refuses nothing.
+    /// </summary>
+    internal static async Task RegisterAsync(IMasterDataReferences master, string containerNo, string? typeCode, string? lineCode, CancellationToken ct)
+    {
+        try { await master.EnsureRegisteredAsync([new UnregisteredBox(containerNo, typeCode, lineCode)], ct); }
+        catch (Exception e) when (e is not OperationCanceledException) { }
     }
 
     /// <summary>The EIR an earlier request with this key recorded, answered as that request was (201); a 422 for another body; null when the key is new.</summary>

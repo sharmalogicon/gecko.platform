@@ -76,6 +76,14 @@ public interface IMasterDataReferences
     Task<IReadOnlyList<OrderTypePlanRef>> WalkInOrderTypesAsync(CancellationToken ct);
 
     /// <summary>
+    /// Owner 2026-10-12: a box the depot handles is registered, as Vector's gate filled Master.Container. TOS calls this when
+    /// a box is first put on a booking or comes in at the gate; a number already registered is left exactly as it is.
+    /// The one write on this interface: every caller of the gate and the booking already holds it.
+    /// </summary>
+    /// <returns>The numbers registered by this call (the rest were already known, or malformed).</returns>
+    Task<IReadOnlyList<string>> EnsureRegisteredAsync(IReadOnlyCollection<UnregisteredBox> boxes, CancellationToken ct);
+
+    /// <summary>
     /// Customers' payment terms (MDM party.customer_extension): what the payment rule of an order type reads (gecko_master 34,
     /// R2). A party with no customer extension is absent: it pays cash.
     /// </summary>
@@ -279,6 +287,10 @@ public interface IContainerRenumbering
     /// <param name="rowVersion">The registry row's rowVersion as the clerk read it; null skips the check.</param>
     Task<ContainerRenumberResult> RenumberAsync(string oldContainerNo, string newContainerNo, string reason, string? rowVersion, CancellationToken ct);
 }
+
+/// <param name="EquipmentTypeCode">The type the depot handled it as (booking line / gate); null = unknown.</param>
+/// <param name="LinePartyCode">The line it was handled for: recorded as its owner (Vector's OwnerCode); null = unknown.</param>
+public sealed record UnregisteredBox(string ContainerNo, string? EquipmentTypeCode, string? LinePartyCode);
 
 public enum ContainerRenumberOutcome { Renumbered, NotFound, NewNumberTaken, Stale }
 

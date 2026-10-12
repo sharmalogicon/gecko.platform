@@ -94,6 +94,10 @@ internal static class TestDatabase
             DECLARE @now DATETIMEOFFSET(7) = SYSUTCDATETIME() AT TIME ZONE 'UTC';
             DECLARE @b TABLE (id UNIQUEIDENTIFIER);
             INSERT @b SELECT booking_id FROM booking.booking WHERE carrier_ref LIKE @prefix + '%' AND deleted_at IS NULL;
+            -- Boxes the depot registered automatically when the test first booked or gated them (owner 2026-10-12).
+            UPDATE gecko_master.equipment.container SET deleted_at = @now
+             WHERE deleted_at IS NULL AND remarks = N'Registered automatically when the depot first handled it.'
+               AND container_no IN (SELECT container_no FROM booking.booking_container WHERE booking_id IN (SELECT id FROM @b));
             UPDATE booking.movement_plan SET deleted_at = @now WHERE deleted_at IS NULL AND booking_container_id IN
                 (SELECT booking_container_id FROM booking.booking_container WHERE booking_id IN (SELECT id FROM @b));
             UPDATE booking.booking_container     SET deleted_at = @now WHERE deleted_at IS NULL AND booking_id IN (SELECT id FROM @b);

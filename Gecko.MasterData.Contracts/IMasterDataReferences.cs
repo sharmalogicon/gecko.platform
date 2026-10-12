@@ -75,6 +75,12 @@ public interface IMasterDataReferences
     /// </summary>
     Task<IReadOnlyList<OrderTypePlanRef>> WalkInOrderTypesAsync(CancellationToken ct);
 
+    /// <summary>
+    /// Customers' payment terms (MDM party.customer_extension): what the payment rule of an order type reads (gecko_master 34,
+    /// R2). A party with no customer extension is absent: it pays cash.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, CustomerCreditRef>> CustomerCreditAsync(IEnumerable<string> partyCodes, CancellationToken ct);
+
     /// <summary>The container registry, by ISO 6346 number. A number not in the registry is simply absent.</summary>
     Task<IReadOnlyDictionary<string, ContainerRef>> ContainersAsync(IEnumerable<string> containerNos, CancellationToken ct);
 
@@ -252,6 +258,13 @@ public sealed record OrderTypePlanRef(
 
     /// <summary>Any step demands a vessel call — the booking must then name one.</summary>
     public bool RequiresVesselCall => Steps.Any(s => s.RequireVesselVoyage);
+}
+
+/// <param name="DefaultPaymentTerm">CASH or CREDIT.</param>
+/// <param name="CreditLimit">Null = no limit.</param>
+public sealed record CustomerCreditRef(string PartyCode, string DefaultPaymentTerm, short? CreditTermDays, decimal? CreditLimit, string? CreditLimitCurrency)
+{
+    public bool IsOnCredit => string.Equals(DefaultPaymentTerm, "CREDIT", StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Gecko.Data;
+using Gecko.Revenue.Endpoints.Window;
 using Gecko.SharedKernel;
 using Gecko.Tos.Endpoints.Bookings;
 using Gecko.Tos.Endpoints.Gate;
@@ -237,6 +238,76 @@ public sealed class WalkInApiTests(TosApiFactory api)
             await TestDatabase.SetSctOrderTypeRuleAsync("WALK MTY OUT", "release_grade_codes", null);
             await TestDatabase.RemoveWalkInAsync(tag);
             await TestDatabase.RemoveBoxReservationsAsync(boxA, boxB);
+        }
+    }
+
+    private static Task<WindowBookingResponse?> PreviewAsync(HttpClient client, string orderTypeCode, string customer, CancellationToken ct) =>
+        client.GetFromJsonAsync<WindowBookingResponse>(
+            $"/api/revenue/window/preview?branchId={SctLcb01}&orderTypeCode={Uri.EscapeDataString(orderTypeCode)}&lineCode=MAEU&customerCode={customer}&equipmentTypeCode=20GP", ct);
+
+    /// <summary>
+    /// R2 (owner 2026-10-12): the walk-in fixture's rule is CREDIT_FOR_CREDIT_CUSTOMERS. A credit customer owes nothing at the
+    /// window (its gate charge is billed later); a cash customer pays it; CREDIT_WITHIN_LIMIT switches a credit customer at its
+    /// limit to cash, never refuses it.
+    /// </summary>
+    [Fact]
+    public async Task The_payment_rule_bills_a_credit_customer_and_takes_cash_from_the_others()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        try
+        {
+            var credit = (await PreviewAsync(client, "WALK MTY IN", "CUS-TAE", ct))!;
+            Assert.Equal(0m, credit.Total);
+            var box = Assert.Single(credit.Boxes);
+            Assert.Contains(box.BilledLater ?? [], l => l is { ChargeCode: "GATETRIP", PaymentTermCode: "CREDIT" });
+            Assert.Contains(box.Tried, t => t.Outcome == "CUSTOMER_ON_CREDIT");
+
+            await TestDatabase.SetSctCustomerCreditAsync("CUS-CEM", "CASH", null, null);
+            var cash = (await PreviewAsync(client, "WALK MTY IN", "CUS-CEM", ct))!;
+            Assert.True(cash.Total > 0);
+            Assert.Contains(cash.Boxes.Single().Due, l => l is { ChargeCode: "GATETRIP", PaymentTermCode: "CASH" });
+
+            await TestDatabase.SetSctOrderTypeRuleAsync("WALK MTY IN", "payment_rule", "CREDIT_WITHIN_LIMIT");
+            await TestDatabase.SetSctCustomerCreditAsync("CUS-ESL", "CREDIT", 0m, "THB");
+            var atLimit = (await PreviewAsync(client, "WALK MTY IN", "CUS-ESL", ct))!;
+            Assert.True(atLimit.Total > 0);
+            Assert.Contains(atLimit.Boxes.Single().Tried, t => t.Note != null && t.Note.Contains("limit"));
+        }
+        finally
+        {
+            await TestDatabase.SetSctCustomerCreditAsync("CUS-CEM", "CREDIT", 1000000m, "THB");
+            await TestDatabase.SetSctCustomerCreditAsync("CUS-ESL", "CREDIT", 2000000m, "THB");
+            await TestDatabase.SetSctOrderTypeRuleAsync("WALK MTY IN", "payment_rule", "CREDIT_FOR_CREDIT_CUSTOMERS");
+        }
+    }
+
+    /// <summary>A credit customer's walk-in truck passes a barrier that demands a coupon: nothing is paid, the coupon is automatic.</summary>
+    [Fact]
+    public async Task A_credit_customers_walk_in_truck_is_gated_with_no_cash_taken()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var tag = NewTag();
+        var box = NewBox();
+        await TestDatabase.RequireCouponAtAsync(SctLcb01, true);
+        try
+        {
+            var saved = await SavedAsync(client, Guid.NewGuid().ToString(), new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-6363" },
+                rows = new[] { DropOff(box, "EMPTY", tag) },
+                payment = new { payments = Array.Empty<object>(), expectedTotal = 0m },
+            }, ct);
+            var row = saved.Rows.Single();
+            Assert.True(row.Status == "GATED", $"{row.Status}: {row.Reason}");
+            Assert.True(saved.Receipt is null || saved.Receipt.Total == 0m);
+        }
+        finally
+        {
+            await TestDatabase.RequireCouponAtAsync(SctLcb01, null);
+            await TestDatabase.RemoveWalkInAsync(tag);
+            await TestDatabase.RemoveBoxReservationsAsync(box);
         }
     }
 

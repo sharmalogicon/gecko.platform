@@ -186,6 +186,18 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .ToDictionaryAsync(l => l.Code, StringComparer.OrdinalIgnoreCase, ct);
     }
 
+    public async Task<IReadOnlyDictionary<string, CustomerCreditRef>> CustomerCreditAsync(IEnumerable<string> partyCodes, CancellationToken ct)
+    {
+        var codes = Normalise(partyCodes);
+        if (codes.Count == 0) return new Dictionary<string, CustomerCreditRef>();
+        return await (
+                from p in db.Parties.AsNoTracking()
+                join e in db.CustomerExtensions on p.PartyId equals e.PartyId
+                where codes.Contains(p.PartyCode)
+                select new CustomerCreditRef(p.PartyCode, e.DefaultPaymentTerm, e.CreditTermDays, e.CreditLimit, e.CreditLimitCurrency))
+            .ToDictionaryAsync(c => c.PartyCode, StringComparer.OrdinalIgnoreCase, ct);
+    }
+
     public async Task<IReadOnlyList<OrderTypePlanRef>> WalkInOrderTypesAsync(CancellationToken ct)
     {
         var codes = await db.OrderTypes.AsNoTracking().Where(o => o.IsWalkIn && o.IsActive).Select(o => o.OrderTypeCode).ToListAsync(ct);

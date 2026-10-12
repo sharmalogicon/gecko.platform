@@ -121,7 +121,7 @@ internal static class WindowEndpoints
                 .Select(c => new SettledChargeResponse(c.ChargeId, c.ChargeCode, c.Status, c.Amount + c.TaxAmount, c.CouponRef, c.ServiceTo, c.WaiveReason))
                 .ToList(),
             (b.Quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
-                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" ? t.Trail.FirstOrDefault() : null)).ToList(),
+                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" or "CUSTOMER_ON_CREDIT" or "CUSTOMER_PAYS_CASH" or "CREDIT_LIMIT_REACHED" ? t.Trail.FirstOrDefault() : null)).ToList(),
             b.Quote?.Total ?? 0, b.Note,
             (b.Quote?.BilledLater ?? []).Select(ToResponse).ToList(),
             b.Rules is { } r && CashQuoter.OffersVas(r),
@@ -219,7 +219,7 @@ internal static class WindowEndpoints
             Guid.Empty, box.ContainerNo, box.EquipmentTypeCode, first.MovementCode, first.Direction, first.IsBillable,
             null, null, lines.Select(ToResponse).ToList(), [],
             (quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
-                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" ? t.Trail.FirstOrDefault() : null)).ToList(),
+                t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" or "CUSTOMER_ON_CREDIT" or "CUSTOMER_PAYS_CASH" or "CREDIT_LIMIT_REACHED" ? t.Trail.FirstOrDefault() : null)).ToList(),
             quote?.Total ?? 0, note, later.Select(ToResponse).ToList(), CashQuoter.OffersVas(first),
             (quote?.NoPrice ?? []).Select(ToResponse).ToList(),
             (quote?.VasMenu ?? []).Select(ToResponse).ToList());

@@ -449,6 +449,24 @@ internal static class TripEndpoints
             var refs = payment.Coupons.Select(c => c.CouponRef).ToList();
             await CatchUpAsync(wake, async () =>
                 await db.GateAuthorizations.AsNoTracking().CountAsync(a => refs.Contains(a.CouponRef), ct) >= refs.Count, ct);
+
+            // An order this Save raised whose box owes no cash here (a credit customer's walk-in, R2): Revenue gives it the
+            // automatic coupon when it hears of the order, by the outbox — wait for it as for the paid ones.
+            var unpaid = rows.Select((r, i) => (r, i))
+                .Where(x => x.r.Move!.Direction == GateRules.In && raisedNow.Contains(lines[x.i].BookingId)
+                            && payment.Coupons.All(c => c.BookingContainerId != lines[x.i].BookingContainerId))
+                .Select(x => (lines[x.i].BookingId, lines[x.i].ContainerNo)).ToList();
+            if (unpaid.Count > 0)
+            {
+                var orders = unpaid.Select(u => u.BookingId).Distinct().ToList();
+                await CatchUpAsync(wake, async () =>
+                {
+                    var issued = await db.GateAuthorizations.AsNoTracking()
+                        .Where(a => orders.Contains(a.BookingId) && a.ConsumedAt == null && a.RevokedAt == null)
+                        .Select(a => new { a.BookingId, a.ContainerNo }).ToListAsync(ct);
+                    return unpaid.All(u => issued.Any(a => a.BookingId == u.BookingId && a.ContainerNo == u.ContainerNo));
+                }, ct);
+            }
         }
 
         // ── 4. the moves: drop-offs before pick-ups, one EIR each ───────────

@@ -155,10 +155,10 @@ internal static class TestDatabase
         await RemoveBookingsAsync(tag);
     }
 
-    /// <summary>Sets one rule of an SCT walk-in fixture order type (gecko_master dev_12): max_boxes_per_truck or release_grade_codes. Null = off.</summary>
+    /// <summary>Sets one rule of an SCT walk-in fixture order type (gecko_master dev_12): max_boxes_per_truck, release_grade_codes or payment_rule. Null = off.</summary>
     public static async Task SetSctOrderTypeRuleAsync(string orderTypeCode, string column, object? value)
     {
-        if (column is not ("max_boxes_per_truck" or "release_grade_codes")) throw new ArgumentException(column);
+        if (column is not ("max_boxes_per_truck" or "release_grade_codes" or "payment_rule")) throw new ArgumentException(column);
         await using var connection = new SqlConnection(AdminConnection);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
@@ -170,6 +170,27 @@ internal static class TestDatabase
             """;
         command.Parameters.AddWithValue("@code", orderTypeCode);
         command.Parameters.AddWithValue("@value", value ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Sets an SCT customer's default payment term and credit limit (MDM party.customer_extension) — restore it after.</summary>
+    public static async Task SetSctCustomerCreditAsync(string partyCode, string term, decimal? creditLimit, string? currency)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE e SET default_payment_term = @term, credit_limit = @limit, credit_limit_currency = @currency
+              FROM gecko_master.party.customer_extension e
+              JOIN gecko_master.party.party p ON p.party_id = e.party_id
+             WHERE p.party_code = @code AND p.deleted_at IS NULL
+               AND p.tenant_id = (SELECT tenant_id FROM gecko_identity.tenant.tenant WHERE tenant_code = 'SCT' AND deleted_at IS NULL);
+            """;
+        command.Parameters.AddWithValue("@code", partyCode);
+        command.Parameters.AddWithValue("@term", term);
+        command.Parameters.AddWithValue("@limit", (object?)creditLimit ?? DBNull.Value);
+        command.Parameters.AddWithValue("@currency", (object?)currency ?? DBNull.Value);
         await command.ExecuteNonQueryAsync();
     }
 

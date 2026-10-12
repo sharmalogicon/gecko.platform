@@ -141,6 +141,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 {
     private const string Cash = "CASH";
     private const string Credit = "CREDIT";
+    private const string Customer = "CUSTOMER";
     /// <summary>lookup.billing_unit "Per truck trip": the gate charge, levied once per truck visit (owner 2026-10-01, §7.1).</summary>
     public const string PerTrip = "PER_TRIP";
     public const string TruckCategoryList = "TRUCK_CATEGORY";
@@ -250,9 +251,12 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             .ToDictionary(v => (v.ChargeCode, v.BillTo, v.PaymentTermCode));
         var perTrip = variants.Values.Where(v => v.BillingUnitCode == PerTrip).Select(v => v.ChargeCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // The order type's payment rule (gecko_master 34, R2): which of the CUSTOMER's lines it pays here and which are billed.
+        var customerTerm = await CustomerTermAsync(plan, now, tried, ct);
+
         // The haulier's own terms (§3 c): matched on (movement, charge), they only
-        // ever turn a CASH line into credit — a native credit line stays credit.
-        var haulierTerms = terms.HaulierCode is { } haulier
+        // ever turn a CASH line into credit — a native credit line stays credit. CASH_ONLY: none.
+        var haulierTerms = terms.HaulierCode is { } haulier && customerTerm.Rule != OrderTypeRules.CashOnly
             ? (await master.HaulierChargeTermsAsync(haulier, plan.OrderTypeCode, ct))
                 .Where(t => string.Equals(t.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase))
                 .ToDictionary(t => t.ChargeCode, t => t.PaymentTermCode, StringComparer.OrdinalIgnoreCase)
@@ -269,6 +273,24 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
         foreach (var (item, kind) in cashMenu)
         {
+            // R2: a customer on credit is billed for its lines, never asked for cash at the window.
+            if (customerTerm.Term == Credit && item.BillTo == Customer)
+            {
+                if (item.PaymentTermCode == Cash)
+                {
+                    tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Cash, "CUSTOMER_ON_CREDIT", null, [customerTerm.Why!]));
+                    continue;
+                }
+                if (WaivedOnStatement(item.ChargeCode, item.BillTo, Credit) || CarriedElsewhere(item.ChargeCode) is not null)
+                {
+                    tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "SETTLED", null, ["Waived on the booking statement, or carried by another box of the truck."]));
+                    continue;
+                }
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "CUSTOMER_ON_CREDIT", null, [customerTerm.Why!]));
+                if (!await PriceAsync(item, kind, Credit, byHaulier: false, later))
+                    await PriceAsync(item, kind, Cash, byHaulier: false, later, billAs: Credit);
+                continue;
+            }
             if (settled.FirstOrDefault(s => s.ChargeCode == item.ChargeCode && s.BillTo == item.BillTo && s.PaymentTermCode == Cash) is { } prepaid)
             {
                 // Paid before the gate — at the window or on a cash bill (owner 2026-10-08): the gate shows where.
@@ -313,6 +335,12 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
 
         foreach (var (item, kind) in creditMenu)
         {
+            // R2: a customer who pays cash is not billed on the credit side of a charge it pays in cash.
+            if (customerTerm.Term == Cash && item.BillTo == Customer)
+            {
+                tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "CUSTOMER_PAYS_CASH", null, [customerTerm.Why!]));
+                continue;
+            }
             if (WaivedOnStatement(item.ChargeCode, item.BillTo, Credit))
             {
                 tried.Add(new TriedVariant(item.ChargeCode, item.BillTo, Credit, "SETTLED", null, ["Waived on the booking statement."]));
@@ -512,6 +540,57 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     }
 
     /// <summary>gate.gate_charge_only_order_types — a JSON array of order type codes; anything unreadable is "none".</summary>
+    /// <summary>
+    /// R2 (gecko_master 34, owner 2026-10-12): the term of the booking's CUSTOMER lines under its order type's payment rule.
+    /// Null term = no rule, as before. CASH_ONLY: cash. CREDIT_FOR_CREDIT_CUSTOMERS: a customer whose default term is CREDIT
+    /// is billed, everyone else pays cash. CREDIT_WITHIN_LIMIT: the same, but a credit customer whose open credit has reached
+    /// its limit pays cash (owner: switch to cash, never refuse the truck).
+    /// </summary>
+    private async Task<(string? Rule, string? Term, string? Why)> CustomerTermAsync(BookingPlan plan, DateTimeOffset now, List<TriedVariant> tried, CancellationToken ct)
+    {
+        var rule = (await master.OrderTypePlansAsync([plan.OrderTypeCode], ct)).GetValueOrDefault(plan.OrderTypeCode)?.RulesOrNone.PaymentRule;
+        if (rule is null) return (null, null, null);
+        if (rule == OrderTypeRules.CashOnly) return (rule, Cash, $"{plan.OrderTypeCode} is paid in cash (payment rule CASH_ONLY).");
+
+        var customer = plan.CustomerPartyCode;
+        var credit = customer is null ? null : (await master.CustomerCreditAsync([customer], ct)).GetValueOrDefault(customer);
+        if (credit is not { IsOnCredit: true })
+            return (rule, Cash, $"{customer ?? "The customer"} pays cash ({plan.OrderTypeCode}: credit for credit customers only).");
+        if (rule == OrderTypeRules.CreditWithinLimit && credit.CreditLimit is { } limit)
+        {
+            var open = await OpenCreditAsync(credit, now, ct);
+            if (open >= limit)
+            {
+                var why = $"{customer} has {open:N2} open on credit, at or over its credit limit of {limit:N2}: cash this time (owner 2026-10-12).";
+                // Said once on the quote, so the clerk can tell the driver why a credit customer pays.
+                tried.Add(new TriedVariant("CREDIT_LIMIT", Customer, Cash, "CREDIT_LIMIT_REACHED", open, [why]));
+                return (rule, Cash, why);
+            }
+        }
+        return (rule, Credit, $"{customer} is a credit customer ({plan.OrderTypeCode}: {rule}): billed, not paid at the window.");
+    }
+
+    /// <summary>
+    /// A customer's open credit, as far as Gecko knows it: credit charges earned and not yet invoiced, and credit invoices
+    /// issued and not yet due (issued within the customer's credit days, 30 when none). Gecko does not record what an invoice
+    /// is paid with, so one past its due date counts as settled. In the limit's currency (all, when it names none).
+    /// </summary>
+    private async Task<decimal> OpenCreditAsync(CustomerCreditRef credit, DateTimeOffset now, CancellationToken ct)
+    {
+        var currency = credit.CreditLimitCurrency;
+        var unbilled = await db.Charges.AsNoTracking()
+            .Where(c => c.PayerPartyCode == credit.PartyCode && c.PaymentTermCode == Credit
+                        && (c.Status == ChargeStatus.Earned || c.Status == ChargeStatus.Unbilled)
+                        && (currency == null || c.CurrencyCode == currency))
+            .SumAsync(c => (decimal?)(c.Amount + c.TaxAmount), ct) ?? 0;
+        var since = now.AddDays(-(credit.CreditTermDays ?? 30));
+        var invoiced = await db.Invoices.AsNoTracking()
+            .Where(i => i.PayerPartyCode == credit.PartyCode && i.InvoiceType == Credit && i.Status == "ISSUED" && i.IssuedAt >= since
+                        && (currency == null || i.CurrencyCode == currency))
+            .SumAsync(i => (decimal?)i.TotalAmount, ct) ?? 0;
+        return unbilled + invoiced;
+    }
+
     private async Task<IReadOnlySet<string>> GateChargeOnlyOrderTypesAsync(Guid branchId, CancellationToken ct)
     {
         var raw = await master.GetStringSettingAsync(RevenueSettingKeys.GateChargeOnlyOrderTypes, branchId, ct);

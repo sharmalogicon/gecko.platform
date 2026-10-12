@@ -76,8 +76,8 @@ internal static class TripEndpoints
         for (var i = 0; i < rows.Count; i++)
         {
             var row = rows[i];
-            if ((row.BookingContainerId is null) == (row.Blind is null))
-                errors.Add($"rows[{i}]", "Either a booked box (bookingContainerId) or a box on no order (blind), not both.");
+            if (new object?[] { row.BookingContainerId, row.Blind, row.WalkIn }.Count(x => x is not null) != 1)
+                errors.Add($"rows[{i}]", "One of: a booked box (bookingContainerId), a walk-in truck's box (walkIn), or a box on no order (blind).");
             if (row.Move is null) { errors.Add($"rows[{i}].move", "The gate fields of this box."); continue; }
             var invalid = new List<ValidationResult>();
             var move = Move(row, request, null);
@@ -124,6 +124,9 @@ internal static class TripEndpoints
         if (joined is null && request.Truck is null && !errors.ContainsKey("truckVisitId"))
             errors.Add("truck", "Name the truck, or the open visit it is on (truckVisitId).");
 
+        // ── walk-in rows (WALK_IN_ORDERS_PLAN §3): the order type the clerk's two answers name, the box's type and line ──
+        var walkIn = await WalkInRowsAsync(rows, branchId, db, master, errors, ct);
+
         // ── gate out (owner 2026-10-06; Vector GateOut.cs): the truck in front of the clerk releases what it came for ──
         var gateOut = request.TruckVisitId is not null;
         var releasedHere = await db.GateTransactions.AsNoTracking()   // a resumed gate-out: rows this key already released
@@ -135,7 +138,7 @@ internal static class TripEndpoints
         if (gateOut && joined is not null)
             for (var i = 0; i < rows.Count; i++)
             {
-                if (rows[i].Move?.Direction != GateRules.Out || rows[i].Blind is not null)
+                if (rows[i].Move?.Direction != GateRules.Out || rows[i].Blind is not null || rows[i].WalkIn is not null)
                     errors.Add($"rows[{i}]", "At gate out a row releases a box this truck came to collect (planned at gate in). A drop-off is recorded at gate in.");
                 else if (!plans.Any(p => p.BookingContainerId == rows[i].BookingContainerId))
                     errors.Add($"rows[{i}].bookingContainerId", $"Not a pick-up planned for {joined.TruckPlate} ({joined.VisitNo}) at gate in.");
@@ -260,7 +263,9 @@ internal static class TripEndpoints
         for (var i = 0; i < rows.Count; i++)
         {
             if (doneBefore.Contains($"{key}#{i}") || string.IsNullOrWhiteSpace(rows[i].Move!.ContainerNo)) continue;
-            var blocks = await GateEndpoints.PrecheckAsync(Move(rows[i], asHeld, null), rows[i].Blind is not null, barrier, master, time, ct);
+            var blocks = await GateEndpoints.PrecheckAsync(Move(rows[i], asHeld, null), rows[i].Blind is not null, barrier, master, time, ct,
+                walkIn[i]?.Plan.WalkInStep);
+            if (walkIn[i] is { } w) blocks.AddRange(await WalkInFindingsAsync(w, branchId, db, ct));
             if (blocks.Count > 0)
                 refusals.Add(new { index = i, containerNo = ContainerNumber.Normalise(rows[i].Move!.ContainerNo),
                     findings = blocks.Select(f => new GateFindingResponse(f.Code, f.Message, f.Severity.ToString().ToUpperInvariant())).ToList() });
@@ -276,7 +281,7 @@ internal static class TripEndpoints
             .Where(g => g.TruckVisitId == joined.TruckVisitId && g.Status == "COMPLETED"
                         && !(g.IdempotencyKey != null && g.IdempotencyKey.StartsWith(key + "#")))
             .Select(g => new Aboard(g.Direction, g.EquipmentTypeCode)).ToListAsync(ct);
-        if (await FeetAsync(db, master, rows, aboard, ct) is { } feet) return await StopAsync(feet);
+        if (await FeetAsync(db, master, rows, walkIn, aboard, ct) is { } feet) return await StopAsync(feet);
 
         // ── 1d. the booked boxes, before any blind order is raised ──────────
         var lines = new (Guid BookingContainerId, Guid BookingId, string OrderNo, string ContainerNo)[rows.Count];
@@ -357,6 +362,36 @@ internal static class TripEndpoints
             if (raised.Result is CreatedAtRoute<BookingDetailResponse>) raisedNow.Add(order.Booking.BookingId);
             var box = order.Containers.Single(c => c.EndedAt is null);
             lines[i] = (box.BookingContainerId, order.Booking.BookingId, order.Booking.OrderNo, box.ContainerNo!);
+        }
+
+        // ── 2b. walk-in orders: ONE booking per order type × customer × line on this truck (the same boxes answer with the same order) ──
+        foreach (var group in Enumerable.Range(0, rows.Count).Where(i => walkIn[i] is not null)
+                     .GroupBy(i => (walkIn[i]!.Plan.OrderTypeCode, walkIn[i]!.CustomerCode, walkIn[i]!.LineCode)))
+        {
+            var first = group.First();
+            var w = walkIn[first]!;
+            var raised = await BookingEndpoints.RaiseWalkInOrderAsync(branchId, w.Plan, w.CustomerCode, w.LineCode,
+                group.Select(i => new WalkInBox(walkIn[i]!.ContainerNo, walkIn[i]!.EquipmentTypeCode)).ToList(),
+                request.Truck?.HaulierCode ?? joined?.HaulierPartyCode, rows[first].WalkIn!.Remarks.Clean(), draftId,
+                db, master, users, clock, caller, ct);
+            db.ChangeTracker.Clear();
+            var order = raised.Result switch
+            {
+                CreatedAtRoute<BookingDetailResponse> c => c.Value,
+                Ok<BookingDetailResponse> o => o.Value,
+                _ => null,
+            };
+            if (order is null)
+            {
+                await UndoAsync("Gate Save stopped before payment.");
+                return Prefixed(raised.Result, $"rows[{first}].walkIn");
+            }
+            if (raised.Result is CreatedAtRoute<BookingDetailResponse>) raisedNow.Add(order.Booking.BookingId);
+            foreach (var i in group)
+            {
+                var box = order.Containers.Single(c => c.EndedAt is null && c.ContainerNo == walkIn[i]!.ContainerNo);
+                lines[i] = (box.BookingContainerId, order.Booking.BookingId, order.Booking.OrderNo, box.ContainerNo!);
+            }
         }
 
         // ── 3. the money: one receipt for the truck ─────────────────────────
@@ -571,7 +606,7 @@ internal static class TripEndpoints
     private sealed record Aboard(string Direction, string? EquipmentTypeCode);
 
     private static async Task<ValidationProblem?> FeetAsync(TosDbContext db, IMasterDataReferences master, IReadOnlyList<TripRowRequest> rows,
-        IReadOnlyList<Aboard> aboard, CancellationToken ct)
+        IReadOnlyList<WalkInRow?> walkIn, IReadOnlyList<Aboard> aboard, CancellationToken ct)
     {
         var lineIds = rows.Select(r => r.BookingContainerId).OfType<Guid>().ToList();
         var booked = await (
@@ -581,7 +616,8 @@ internal static class TripEndpoints
         var blindNumbers = rows.Where(r => r.Blind is not null && r.Blind.EquipmentTypeCode is null)
             .Select(r => ContainerNumber.Normalise(r.Blind!.ContainerNo ?? "")).ToList();
         var registry = blindNumbers.Count == 0 ? new Dictionary<string, ContainerRef>() : (await master.ContainersAsync(blindNumbers, ct)).ToDictionary();
-        string? TypeOf(TripRowRequest r) => r.BookingContainerId is { } id ? r.EquipmentTypeCode.Clean() ?? booked.GetValueOrDefault(id)
+        string? TypeOf(TripRowRequest r, int i) => walkIn[i] is { } w ? w.EquipmentTypeCode
+            : r.BookingContainerId is { } id ? r.EquipmentTypeCode.Clean() ?? booked.GetValueOrDefault(id)
             : r.Blind?.EquipmentTypeCode?.Trim().ToUpperInvariant() ?? registry.GetValueOrDefault(ContainerNumber.Normalise(r.Blind?.ContainerNo ?? ""))?.EquipmentTypeCode;
         var types = rows.Select(TypeOf).ToList();
         var sizes = await master.EquipmentTypesAsync(types.Concat(aboard.Select(a => a.EquipmentTypeCode)).OfType<string>().Distinct(), ct);
@@ -600,6 +636,91 @@ internal static class TripEndpoints
                 });
         }
         return null;
+    }
+
+    /// <summary>A walk-in row resolved (WALK_IN_ORDERS_PLAN §3): its walk-in order type, customer, the box's line and type.</summary>
+    private sealed record WalkInRow(OrderTypePlanRef Plan, string CustomerCode, string LineCode, string EquipmentTypeCode, string ContainerNo, string Direction);
+
+    /// <summary>
+    /// Each walk-in row's walk-in order type (by the move's direction and the clerk's Empty / Full), customer, and the box's
+    /// line and type: a drop-off's as keyed, else the registry's; a pick-up's from the yard. R5: a walk-in order type's cap
+    /// on boxes per truck. Problems go into <paramref name="errors"/> under the row; a row with one is null.
+    /// </summary>
+    private static async Task<WalkInRow?[]> WalkInRowsAsync(IReadOnlyList<TripRowRequest> rows, Guid branchId, TosDbContext db,
+        IMasterDataReferences master, Dictionary<string, List<string>> errors, CancellationToken ct)
+    {
+        var resolved = new WalkInRow?[rows.Count];
+        if (!rows.Any(r => r.WalkIn is not null)) return resolved;
+
+        var offered = await master.WalkInOrderTypesAsync(ct);
+        var numbers = rows.Where(r => r.WalkIn is not null).Select(r => ContainerNumber.Normalise(r.Move?.ContainerNo ?? "")).Where(n => n.Length > 0).ToList();
+        var registry = await master.ContainersAsync(numbers, ct);
+        var yard = await db.VwContainerInYards.AsNoTracking().Where(v => v.BranchId == branchId && numbers.Contains(v.ContainerNo))
+            .Select(v => new { v.ContainerNo, v.EquipmentTypeCode, v.LinePartyCode }).ToListAsync(ct);
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (rows[i].WalkIn is not { } w || rows[i].Move is not { } move) continue;
+            var at = $"rows[{i}].walkIn";
+            var number = ContainerNumber.Normalise(move.ContainerNo ?? "");
+            var way = move.Direction.Clean()?.ToUpperInvariant();
+            var load = w.FullEmpty.Clean()?.ToUpperInvariant();
+            if (number.Length == 0) { errors.Add($"rows[{i}].move.containerNo", "A walk-in truck's box is named at the gate: key its number."); continue; }
+            if (load is not (GateRules.Full or GateRules.Empty)) { errors.Add($"{at}.fullEmpty", "EMPTY or FULL: what the truck drops off or picks up."); continue; }
+            if (way is not (GateRules.In or GateRules.Out)) continue;   // the move's own validation says so
+            var plan = offered.FirstOrDefault(p => p.WalkInStep!.Direction == way && p.WalkInStep.FullEmpty == load);
+            if (plan is null)
+            {
+                errors.Add($"{at}.fullEmpty", $"This depot has no walk-in order type for a {load} {(way == GateRules.In ? "drop-off" : "pick-up")}. Set one up in master data (order type rules).");
+                continue;
+            }
+            if (w.CustomerCode.Clean()?.ToUpperInvariant() is not { } customer) { errors.Add($"{at}.customerCode", "Whose truck is it? A walk-in order is made out to the customer."); continue; }
+
+            var known = registry.GetValueOrDefault(number);
+            var standing = yard.FirstOrDefault(v => v.ContainerNo == number);
+            if (way == GateRules.Out && standing is null) { errors.Add($"rows[{i}].move.containerNo", $"{number} is not in the yard at this depot."); continue; }
+            var type = way == GateRules.Out ? standing!.EquipmentTypeCode ?? known?.EquipmentTypeCode
+                : w.EquipmentTypeCode.Clean()?.ToUpperInvariant() ?? known?.EquipmentTypeCode;
+            var line = way == GateRules.Out ? standing!.LinePartyCode : w.LineCode.Clean()?.ToUpperInvariant() ?? known?.OwnerPartyCode;
+            if (type is null) errors.Add($"{at}.equipmentTypeCode", $"{number} is not in the registry: say what type of box it is.");
+            if (line is null) errors.Add($"{at}.lineCode", $"Whose box is {number}? Name its line: the registry has no owner for it.");
+            if (type is null || line is null) continue;
+            resolved[i] = new WalkInRow(plan, customer, line, type, number, way);
+        }
+
+        foreach (var g in resolved.OfType<WalkInRow>().GroupBy(r => r.Plan.OrderTypeCode))
+            if (g.First().Plan.RulesOrNone.MaxBoxesPerTruck is { } cap && g.Count() > cap)
+                errors.Add("rows", $"{g.Key} takes at most {cap} box(es) per truck (master data); this truck has {g.Count()}.");
+        return resolved;
+    }
+
+    /// <summary>
+    /// What refuses a walk-in box before any money is taken, beside the barrier's own findings: a box on an open order moves
+    /// on that order (unless it is this walk-in order, raised by an earlier try of this Save); a pick-up takes a box that is
+    /// as full or empty as the clerk said, of a grade the walk-in order type releases (R3).
+    /// </summary>
+    private static async Task<List<GateFinding>> WalkInFindingsAsync(WalkInRow row, Guid branchId, TosDbContext db, CancellationToken ct)
+    {
+        var findings = new List<GateFinding>();
+        var order = await (
+            from x in db.BookingContainers.AsNoTracking()
+            join b in db.Bookings on x.BookingId equals b.BookingId
+            where x.ContainerNo == row.ContainerNo && x.EndedAt == null && x.DeletedAt == null
+            select new { b.OrderNo, b.OrderTypeCode, b.Source, b.Status, b.BranchId }).FirstOrDefaultAsync(ct);
+        if (order is not null && !(order.Source == BookingEndpoints.WalkInSource && order.OrderTypeCode == row.Plan.OrderTypeCode
+                                   && order.Status == BookingRules.Open && order.BranchId == branchId))
+            findings.Add(new GateFinding("ON_AN_ORDER", $"{row.ContainerNo} is on {order.OrderNo} ({order.OrderTypeCode}). It moves on that order, not as a walk-in.", GateSeverity.Block));
+        if (row.Direction != GateRules.Out) return findings;
+
+        var standing = await db.VwContainerInYards.AsNoTracking().Where(v => v.BranchId == branchId && v.ContainerNo == row.ContainerNo)
+            .Select(v => new { v.FullEmpty, v.GradeCode }).FirstOrDefaultAsync(ct);
+        var step = row.Plan.WalkInStep!;
+        if (standing is not null && standing.FullEmpty != step.FullEmpty)
+            findings.Add(new GateFinding("LOAD_MISMATCH", $"{row.ContainerNo} is {standing.FullEmpty} in the yard; this is a {step.FullEmpty} pick-up.", GateSeverity.Block));
+        if (standing is not null && !row.Plan.RulesOrNone.ReleasesGrade(standing.GradeCode))
+            findings.Add(new GateFinding("GRADE_NOT_ALLOWED",
+                $"{row.ContainerNo} is grade {standing.GradeCode ?? "(none)"}; {row.Plan.OrderTypeCode} releases grade {string.Join(", ", row.Plan.RulesOrNone.ReleaseGradeCodes)} only.",
+                GateSeverity.Block));
+        return findings;
     }
 
     /// <summary>The row's move as the gate records it: this depot, this draft, and the truck — named on the first box, then its visit.</summary>

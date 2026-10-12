@@ -594,21 +594,23 @@ internal static class GateEndpoints
     /// <summary>
     /// What would refuse this move, read before any money is taken (GATE_IN_COMPLETION_PLAN A1): the barrier's
     /// BLOCK findings except "not paid yet" (NO_COUPON), and the trip's mandatory fields. A blind row has no
-    /// order yet, so NO_ASSIGNMENT is expected and its step is BLIND GATE IN's first.
+    /// order yet, so NO_ASSIGNMENT is expected and its step is BLIND GATE IN's first. A walk-in row
+    /// (<paramref name="walkInStep"/>, WALK_IN_ORDERS_PLAN §3) has no order yet either; its step is its walk-in order type's.
     /// </summary>
     internal static async Task<List<GateFinding>> PrecheckAsync(GateTransactionRequest move, bool blind, BarrierReader barrier,
-        IMasterDataReferences master, TimeProvider time, CancellationToken ct)
+        IMasterDataReferences master, TimeProvider time, CancellationToken ct, OrderTypeStepRef? walkInStep = null)
     {
         var way = move.Direction.Clean()!;
         var view = await barrier.ReadAsync(move.BranchId!.Value, move.ContainerNo, way, move.TransactionAt ?? time.GetUtcNow(), ct);
         var blocks = view.Findings
-            .Where(f => f.Severity == GateSeverity.Block && f.Code != "NO_COUPON" && !(blind && f.Code == "NO_ASSIGNMENT"))
+            .Where(f => f.Severity == GateSeverity.Block && f.Code != "NO_COUPON" && !((blind || walkInStep is not null) && f.Code == "NO_ASSIGNMENT"))
             .ToList();
         if (GateRules.TripTypeContradiction(move.TripType.Clean()!, way) is { } contradiction)
             blocks.Add(new GateFinding("TRIP_TYPE", contradiction, GateSeverity.Block));
 
-        string? fullEmpty = view.StepRules?.FullEmpty;
+        string? fullEmpty = view.StepRules?.FullEmpty ?? walkInStep?.FullEmpty;
         var export = view.Booking?.DirectionCode.Contains("EXPORT", StringComparison.OrdinalIgnoreCase) ?? false;
+        if (walkInStep is not null) blind = false;   // a walk-in order type says FULL or EMPTY itself
         if (fullEmpty is null && blind)
             fullEmpty = (await master.OrderTypePlansAsync(["BLIND GATE IN"], ct)).GetValueOrDefault("BLIND GATE IN")?
                 .Steps.OrderBy(s => s.SequenceNo).FirstOrDefault()?.FullEmpty;

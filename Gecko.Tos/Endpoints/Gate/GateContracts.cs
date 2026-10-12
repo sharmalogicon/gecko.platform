@@ -210,6 +210,25 @@ public sealed record BookableBoxResponse(
 public sealed record BookableStepResponse(Guid MovementPlanId, short SequenceNo, string MovementCode, string Direction, string FullEmpty);
 
 /// <summary>
+/// A walk-in order type the gate offers (WALK_IN_ORDERS_PLAN §3): the clerk answers Drop off / Pick up
+/// (<see cref="Direction"/> IN / OUT) and Empty / Full (<see cref="FullEmpty"/>), and this is the order type those two
+/// answers name. <see cref="MaxBoxesPerTruck"/> null = no cap; <see cref="PaymentRule"/> as in master data (null = the
+/// charge rows decide).
+/// </summary>
+public sealed record WalkInOrderTypeResponse(
+    string OrderTypeCode, string? Description, string? DescriptionLocal, string Direction, string FullEmpty, string MovementCode,
+    short? MaxBoxesPerTruck, string? PaymentRule, IReadOnlyList<string> ReleaseGradeCodes);
+
+/// <summary>
+/// A box in the yard a walk-in truck may pick up (WALK_IN_ORDERS_PLAN §3.2): on no open order, not held by another
+/// truck's clerk, and of a grade the walk-in order type releases. <see cref="IsHeld"/> = a hold stands on it; the
+/// barrier decides whether it may leave.
+/// </summary>
+public sealed record WalkInBoxResponse(
+    string ContainerNo, string? EquipmentTypeCode, string LineCode, string FullEmpty, string? GradeCode, string? ConditionCode,
+    string? PositionText, DateTimeOffset GateInAt, int? DaysInYard, bool IsHeld);
+
+/// <summary>
 /// One gate VAS an order type offers (GATE_IN_COMPLETION_PLAN A3): the clerk ticks it on an EMPTY drop-off or a
 /// pick-up, and the Save prices it (<c>vas</c>). <see cref="PaymentTermCode"/> null = CASH or CREDIT, as the
 /// truck's terms say. <see cref="OfferedOnMovements"/>: this order type's steps where it can be ticked.
@@ -246,7 +265,8 @@ public sealed record TripSaveRequest(
     Guid? TruckVisitId = null);
 
 /// <summary>
-/// One box: a booked one (<see cref="BookingContainerId"/>) or one on no order (<see cref="Blind"/>, a BLIND GATE IN),
+/// One box: a booked one (<see cref="BookingContainerId"/>), a walk-in truck's (<see cref="WalkIn"/>, WALK_IN_ORDERS_PLAN §3),
+/// or one on no order (<see cref="Blind"/>, a BLIND GATE IN — kept for one release; the gate screen sends <see cref="WalkIn"/>),
 /// and its gate fields as on <c>POST /gate/transactions</c> (<see cref="Move"/>; its branch, draft and truck are the Save's).
 /// <see cref="Damages"/> (A4, a drop-off only): saved with the move as its GATE_IN survey, with the move's condition and
 /// grade (Vector GateIn.cs:1091, 2079); an unserviceable code puts on the depot's damage hold.
@@ -260,7 +280,23 @@ public sealed record TripRowRequest(
     GateTransactionRequest? Move = null,
     IReadOnlyList<SurveyDamageRequest>? Damages = null,
     [property: MaxLength(20)] string? EquipmentTypeCode = null,
-    bool AcceptTypeChange = false);
+    bool AcceptTypeChange = false,
+    TripWalkInRequest? WalkIn = null);
+
+/// <summary>
+/// A box of a truck with no paperwork (WALK_IN_ORDERS_PLAN §3, owner 2026-10-12). The clerk's two answers: the move's
+/// direction (IN = drop off, OUT = pick up) and <see cref="FullEmpty"/>; together they name the tenant's walk-in order
+/// type. The Save raises ONE booking of it for the truck's boxes of one customer and line. The box is the move's
+/// container number (a pick-up names a yard box: GET /gate/walk-in-boxes).
+/// <see cref="LineCode"/> (a drop-off): the box's line, else the registry owner's. A pick-up takes the yard box's line.
+/// <see cref="EquipmentTypeCode"/> (a drop-off): the box's type, else the registry's. A pick-up takes the yard box's type.
+/// </summary>
+public sealed record TripWalkInRequest(
+    [property: MaxLength(10)] string? FullEmpty,
+    [property: MaxLength(30)] string? CustomerCode,
+    [property: MaxLength(30)] string? LineCode = null,
+    [property: MaxLength(20)] string? EquipmentTypeCode = null,
+    [property: MaxLength(1000)] string? Remarks = null);
 
 public sealed record TripBlindRequest(
     [property: Required, MaxLength(11)] string? ContainerNo,

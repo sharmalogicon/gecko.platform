@@ -72,6 +72,9 @@ public sealed record BookingDetailResponse(
 /// nothing to move is not a booking) and, optionally, pre-advised boxes (an
 /// import D/O lists them — Q9).
 /// </summary>
+/// <summary>One box of a walk-in truck's order: its number and the type it is (WALK_IN_ORDERS_PLAN §3.3).</summary>
+public sealed record WalkInBox(string ContainerNo, string EquipmentTypeCode);
+
 public sealed record SaveBookingRequest(
     [property: Required] Guid? BranchId,
     [property: Required, MaxLength(50)] string OrderTypeCode,

@@ -175,6 +175,9 @@ internal static class BookingEndpoints
         // Vector BookingEntry.cs:1773: a BLIND GATE IN booking is made by the gate, never by hand.
         if (string.Equals(request.OrderTypeCode.Clean(), BlindGateIn, StringComparison.Ordinal))
             errors.Add("orderTypeCode", $"{BlindGateIn} bookings are made by the gate itself, not by hand.");
+        // WALK_IN_ORDERS_PLAN §3.6: a walk-in order type's booking is raised by the gate Save, one per truck.
+        else if (header?.Plan.RulesOrNone.IsWalkIn == true)
+            errors.Add("orderTypeCode", $"{header.Plan.OrderTypeCode} is a walk-in order type: the gate raises its booking for the truck, not by hand.");
 
         // 403, not 404: the caller named the branch, so refusing it by name tells them
         // nothing they did not already type.
@@ -315,7 +318,7 @@ internal static class BookingEndpoints
             BranchId = branchId,
             OrderNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.Booking, branchId, header.Branch.BranchCode, clock.LocalNow(header.Branch), ct),
             Status = BookingRules.Open,
-            Source = "WALK_IN",
+            Source = WalkInSource,
         };
         ApplyHeader(booking, save, header);
         db.Bookings.Add(booking);
@@ -327,6 +330,75 @@ internal static class BookingEndpoints
         await db.SaveChangesAsync(ct);
 
         var assigned = await AssignBoxesAsync(db, master, caller, booking, header.Plan, [line], [new AssignContainerItem(containerNo)], "GATE", partial: false, ct);
+        if (assigned.Problem?.Invalid is { } invalid) return invalid;
+        if (assigned.Problem?.Refused is { } refused) return refused;
+
+        await BookingEvents.QueueChangedAsync(db, booking.BookingId, "CREATED", DateTimeOffset.UtcNow, ct);
+        await tx.CommitAsync(ct);
+        return TypedResults.CreatedAtRoute((await DetailAsync(db, clock, master, users, booking.BookingId, ct))!, "GetBooking", new { id = booking.BookingId });
+    }
+
+    /// <summary>
+    /// A walk-in truck's order (WALK_IN_ORDERS_PLAN §3.3, owner 2026-10-12): ONE booking of the walk-in order type for the
+    /// truck's boxes of one customer and line, with a requirement line per type and the boxes assigned, in one
+    /// transaction — raised by the gate Save, never by hand. A retry naming the same boxes gets the order they are
+    /// already on (200). No B/L (the truck has no paperwork); the customer is required, as on every booking.
+    /// </summary>
+    internal static async Task<Results<CreatedAtRoute<BookingDetailResponse>, Ok<BookingDetailResponse>, ValidationProblem, ProblemHttpResult>> RaiseWalkInOrderAsync(
+        Guid branchId, OrderTypePlanRef plan, string customerCode, string lineCode, IReadOnlyList<WalkInBox> boxes, string? haulierCode, string? remarks,
+        Guid draftId, TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock, ITenantContext caller, CancellationToken ct)
+    {
+        var numbers = boxes.Select(b => b.ContainerNo).ToList();
+        var prior = await (
+            from x in db.BookingContainers.AsNoTracking()
+            join b in db.Bookings on x.BookingId equals b.BookingId
+            where x.ContainerNo != null && numbers.Contains(x.ContainerNo) && x.EndedAt == null
+            select new { b.BookingId, b.OrderTypeCode, b.BranchId, b.Status, b.Source }).ToListAsync(ct);
+        if (prior.Count == numbers.Count && prior.Select(p => p.BookingId).Distinct().Count() == 1
+            && prior[0] is { Status: BookingRules.Open, Source: WalkInSource } same && same.OrderTypeCode == plan.OrderTypeCode && same.BranchId == branchId)
+            return TypedResults.Ok((await DetailAsync(db, clock, master, users, same.BookingId, ct))!);
+
+        foreach (var number in numbers)
+            if (await BoxReservations.HeldByOtherAsync(db, null, number, draftId, DateTimeOffset.UtcNow, ct) is { } held)
+            {
+                var name = (await users.DisplayNamesAsync([held.ReservedBy], ct)).GetValueOrDefault(held.ReservedBy);
+                return TosSupport.Conflict(BoxReservations.Finding(held, name).Message, "Pick another box, or ask that clerk to remove it from their truck.");
+            }
+
+        var save = new SaveBookingRequest(branchId, plan.OrderTypeCode, lineCode, CustomerCode: customerCode, HaulierCode: haulierCode, Remarks: remarks);
+        var errors = new Dictionary<string, List<string>>();
+        var header = await ResolveHeaderAsync(db, master, clock, save, errors, ct);
+        var types = boxes.Select(b => b.EquipmentTypeCode).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToList();
+        var requirements = await ResolveRequirementsAsync(master,
+            types.Select(t => new RequirementItem(t, (short)boxes.Count(b => string.Equals(b.EquipmentTypeCode, t, StringComparison.OrdinalIgnoreCase)))).ToList(),
+            errors, ct);
+        if (errors.Count > 0 || header is null) return TosSupport.Invalid(errors);
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var booking = new Booking
+        {
+            TenantId = caller.TenantId(),
+            BranchId = branchId,
+            OrderNo = await TosNumberSeries.NextAsync(db, TosNumberSeries.Booking, branchId, header.Branch.BranchCode, clock.LocalNow(header.Branch), ct),
+            Status = BookingRules.Open,
+            Source = WalkInSource,
+        };
+        ApplyHeader(booking, save, header);
+        db.Bookings.Add(booking);
+        await db.SaveChangesAsync(ct);
+
+        var lines = requirements.Select((r, i) =>
+        {
+            var line = new EquipmentRequirement { TenantId = booking.TenantId, BookingId = booking.BookingId, LineNo = (short)(i + 1) };
+            ApplyRequirement(line, r);
+            return line;
+        }).ToList();
+        db.EquipmentRequirements.AddRange(lines);
+        await db.SaveChangesAsync(ct);
+
+        var items = boxes.Select(b => new AssignContainerItem(b.ContainerNo,
+            LineNo: (short)(types.FindIndex(t => string.Equals(t, b.EquipmentTypeCode, StringComparison.OrdinalIgnoreCase)) + 1))).ToList();
+        var assigned = await AssignBoxesAsync(db, master, caller, booking, header.Plan, lines, items, "GATE", partial: false, ct);
         if (assigned.Problem?.Invalid is { } invalid) return invalid;
         if (assigned.Problem?.Refused is { } refused) return refused;
 
@@ -989,7 +1061,8 @@ internal static class BookingEndpoints
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         await LockAsync(db, bookingId, ct);
         var booking = await db.Bookings.SingleOrDefaultAsync(b => b.BookingId == bookingId, ct);
-        if (booking is null || booking.Status != BookingRules.Open || booking.OrderTypeCode != BlindGateIn) return;
+        // Only an order the gate raised (BLIND GATE IN, a walk-in truck's: source WALK_IN), and only before any move.
+        if (booking is null || booking.Status != BookingRules.Open || (booking.OrderTypeCode != BlindGateIn && booking.Source != WalkInSource)) return;
         var boxes = await db.BookingContainers.Where(x => x.BookingId == bookingId).ToListAsync(ct);
         var boxIds = boxes.Select(b => b.BookingContainerId).ToList();
         var steps = await db.MovementPlans.Where(m => boxIds.Contains(m.BookingContainerId)).ToListAsync(ct);
@@ -1437,7 +1510,8 @@ internal static class BookingEndpoints
 
         // Vector BookingEntry.cs:168-207, 2548 — what the desktop makes mandatory (owner 2026-10-03).
         // Vector GateIn.cs:146: on BLIND GATE IN (raised by the gate) the B/L stops being mandatory.
-        if (request.CarrierRef.Clean() is null && plan?.OrderTypeCode != BlindGateIn)
+        // A walk-in truck (gecko_master 34) has no paperwork either.
+        if (request.CarrierRef.Clean() is null && plan?.OrderTypeCode != BlindGateIn && plan?.RulesOrNone.IsWalkIn != true)
             errors.Add("carrierRef", "The B/L or booking number is required.");
         foreach (var (field, message) in BookingRules.MissingHeaderFields(plan?.BookingTypeCode, scheduled,
                      hasCustomer: request.CustomerCode.Clean() is not null,
@@ -1497,6 +1571,8 @@ internal static class BookingEndpoints
     }
 
     private const string BlindGateIn = "BLIND GATE IN";
+    /// <summary>booking.source of an order the gate raised for a truck with no paperwork (BLIND GATE IN, walk-in).</summary>
+    internal const string WalkInSource = "WALK_IN";
     private const string LateGateNeedsOverride =
         "Only a user who may override cut-offs (tos.cutoff.override) can allow a late gate-in on a booking.";
 

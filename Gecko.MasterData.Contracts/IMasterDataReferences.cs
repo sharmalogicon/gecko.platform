@@ -69,6 +69,12 @@ public interface IMasterDataReferences
     /// </summary>
     Task<IReadOnlyDictionary<string, OrderTypePlanRef>> OrderTypePlansAsync(IEnumerable<string> orderTypeCodes, CancellationToken ct);
 
+    /// <summary>
+    /// The tenant's active walk-in order types (gecko_master 34, R1) that the gate can use: one step, a drop-off or a
+    /// pick-up of a full or an empty box. The gate picks one by that step's direction and full/empty.
+    /// </summary>
+    Task<IReadOnlyList<OrderTypePlanRef>> WalkInOrderTypesAsync(CancellationToken ct);
+
     /// <summary>The container registry, by ISO 6346 number. A number not in the registry is simply absent.</summary>
     Task<IReadOnlyDictionary<string, ContainerRef>> ContainersAsync(IEnumerable<string> containerNos, CancellationToken ct);
 
@@ -233,10 +239,16 @@ public sealed record OrderTypePlanRef(
     IReadOnlyList<OrderTypeStepRef> Steps,
     // gecko_master 27: a booking of this order type needs a vessel call and real ports.
     bool RequiresVesselSchedule = false,
-    OrderTypeRules? Rules = null)
+    OrderTypeRules? Rules = null,
+    string? DescriptionEn = null,
+    string? DescriptionLocal = null)
 {
     /// <summary>The order type's rules; none set is what the gate did before gecko_master 34.</summary>
     public OrderTypeRules RulesOrNone => Rules ?? OrderTypeRules.None;
+
+    /// <summary>A walk-in order type's one step (R1); null when this is not a usable walk-in order type.</summary>
+    public OrderTypeStepRef? WalkInStep =>
+        RulesOrNone.IsWalkIn && Steps.Count == 1 && Steps[0] is { Direction: "IN" or "OUT", FullEmpty: "FULL" or "EMPTY" } step ? step : null;
 
     /// <summary>Any step demands a vessel call — the booking must then name one.</summary>
     public bool RequiresVesselCall => Steps.Any(s => s.RequireVesselVoyage);

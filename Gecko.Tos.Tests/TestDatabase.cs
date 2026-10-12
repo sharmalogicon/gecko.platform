@@ -131,6 +131,48 @@ internal static class TestDatabase
         await RemoveBookingsAsync(tag);
     }
 
+    /// <summary>
+    /// For walk-in bookings (WALK_IN_ORDERS_PLAN §3): the gate raises them with no carrier reference, so a test marks them
+    /// with its tag in the remarks; they get a throwaway carrier_ref here and go the usual way, gate rows and window first.
+    /// </summary>
+    public static async Task RemoveWalkInAsync(string remarksTag)
+    {
+        var tag = $"ZZDEL-{Guid.NewGuid():N}"[..20];
+        await using (var connection = new SqlConnection(AdminConnection))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+                UPDATE booking.booking SET carrier_ref = @tag + RIGHT(CONVERT(VARCHAR(36), booking_id), 12)
+                 WHERE remarks = @ref AND carrier_ref IS NULL AND deleted_at IS NULL;
+                """;
+            command.Parameters.AddWithValue("@tag", tag);
+            command.Parameters.AddWithValue("@ref", remarksTag);
+            await command.ExecuteNonQueryAsync();
+        }
+        await RemoveGateAsync(tag);
+        await RemoveBookingsAsync(tag);
+    }
+
+    /// <summary>Sets one rule of an SCT walk-in fixture order type (gecko_master dev_12): max_boxes_per_truck or release_grade_codes. Null = off.</summary>
+    public static async Task SetSctOrderTypeRuleAsync(string orderTypeCode, string column, object? value)
+    {
+        if (column is not ("max_boxes_per_truck" or "release_grade_codes")) throw new ArgumentException(column);
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE gecko_master.commercial.order_type SET {column} = @value
+             WHERE order_type_code = @code AND deleted_at IS NULL
+               AND tenant_id = (SELECT tenant_id FROM gecko_identity.tenant.tenant WHERE tenant_code = 'SCT' AND deleted_at IS NULL);
+            """;
+        command.Parameters.AddWithValue("@code", orderTypeCode);
+        command.Parameters.AddWithValue("@value", value ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
     /// <summary>Soft-deletes test holds (by container number). Test-only — a hold is released, never erased.</summary>
     public static async Task RemoveHoldsAsync(params string[] containerNos)
     {

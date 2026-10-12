@@ -186,6 +186,13 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .ToDictionaryAsync(l => l.Code, StringComparer.OrdinalIgnoreCase, ct);
     }
 
+    public async Task<IReadOnlyList<OrderTypePlanRef>> WalkInOrderTypesAsync(CancellationToken ct)
+    {
+        var codes = await db.OrderTypes.AsNoTracking().Where(o => o.IsWalkIn && o.IsActive).Select(o => o.OrderTypeCode).ToListAsync(ct);
+        return codes.Count == 0 ? []
+            : (await OrderTypePlansAsync(codes, ct)).Values.Where(p => p.WalkInStep is not null).OrderBy(p => p.OrderTypeCode, StringComparer.Ordinal).ToList();
+    }
+
     public async Task<IReadOnlyDictionary<string, OrderTypePlanRef>> OrderTypePlansAsync(IEnumerable<string> orderTypeCodes, CancellationToken ct)
     {
         var codes = Normalise(orderTypeCodes);
@@ -194,7 +201,7 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             .Select(o => new
             {
                 o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode, o.BookingTypeCode, o.RequiresVesselSchedule,
-                o.IsWalkIn, o.PaymentRule, o.ReleaseGradeCodes, o.OwnerMatch, o.MaxBoxesPerTruck,
+                o.IsWalkIn, o.PaymentRule, o.ReleaseGradeCodes, o.OwnerMatch, o.MaxBoxesPerTruck, o.DescriptionEn, o.DescriptionLocal,
             })
             .ToListAsync(ct);
         var ids = orderTypes.Select(o => o.OrderTypeId).ToList();
@@ -218,7 +225,8 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
             o => o.OrderTypeCode,
             o => new OrderTypePlanRef(o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode,
                 o.BookingTypeCode, steps[o.OrderTypeId].ToList(), o.RequiresVesselSchedule,
-                new OrderTypeRules(o.IsWalkIn, o.PaymentRule, CodeList(o.ReleaseGradeCodes), o.OwnerMatch, o.MaxBoxesPerTruck)),
+                new OrderTypeRules(o.IsWalkIn, o.PaymentRule, CodeList(o.ReleaseGradeCodes), o.OwnerMatch, o.MaxBoxesPerTruck),
+                o.DescriptionEn, o.DescriptionLocal),
             StringComparer.OrdinalIgnoreCase);
     }
 

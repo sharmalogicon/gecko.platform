@@ -17,6 +17,9 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
     private static List<string> Normalise(IEnumerable<string> codes) =>
         codes.Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim().ToUpperInvariant()).Distinct().ToList();
 
+    /// <summary>A comma list column (gecko_master 25 fixed ports, 34 release grades) as its codes; null = none.</summary>
+    private static List<string> CodeList(string? list) => Normalise((list ?? "").Split(','));
+
     public async Task<IReadOnlyDictionary<string, BranchRef>> BranchesAsync(IEnumerable<Guid> branchIds, CancellationToken ct)
     {
         var ids = branchIds.Distinct().ToList();
@@ -188,7 +191,11 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
         var codes = Normalise(orderTypeCodes);
         var orderTypes = await db.OrderTypes.AsNoTracking()
             .Where(o => codes.Contains(o.OrderTypeCode))
-            .Select(o => new { o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode, o.BookingTypeCode, o.RequiresVesselSchedule })
+            .Select(o => new
+            {
+                o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode, o.BookingTypeCode, o.RequiresVesselSchedule,
+                o.IsWalkIn, o.PaymentRule, o.ReleaseGradeCodes, o.OwnerMatch, o.MaxBoxesPerTruck,
+            })
             .ToListAsync(ct);
         var ids = orderTypes.Select(o => o.OrderTypeId).ToList();
 
@@ -203,14 +210,15 @@ internal sealed class MasterDataReferences(MasterDataDbContext db, TenantSetting
                     Step = new OrderTypeStepRef(otm.OrderTypeMovementId, otm.MovementId, m.MovementCode, otm.SequenceNo,
                         otm.IsRequired, otm.IsBillable, otm.CheckSealNo, otm.CheckGrossWeight, otm.RequireVesselVoyage,
                         otm.AllowDamagedRelease, otm.SkipEdi,
-                        m.Direction, m.FullEmpty, m.RequiresSurvey, m.ChangesYardPosition),
+                        m.Direction, m.FullEmpty, m.RequiresSurvey, m.ChangesYardPosition, otm.RequireSurvey, otm.SealMustMatch),
                 }).ToListAsync(ct))
             .ToLookup(x => x.OrderTypeId, x => x.Step);
 
         return orderTypes.ToDictionary(
             o => o.OrderTypeCode,
             o => new OrderTypePlanRef(o.OrderTypeId, o.OrderTypeCode, o.IsActive, o.DirectionCode, o.CargoClassCode,
-                o.BookingTypeCode, steps[o.OrderTypeId].ToList(), o.RequiresVesselSchedule),
+                o.BookingTypeCode, steps[o.OrderTypeId].ToList(), o.RequiresVesselSchedule,
+                new OrderTypeRules(o.IsWalkIn, o.PaymentRule, CodeList(o.ReleaseGradeCodes), o.OwnerMatch, o.MaxBoxesPerTruck)),
             StringComparer.OrdinalIgnoreCase);
     }
 

@@ -232,10 +232,47 @@ public sealed record OrderTypePlanRef(
     string DirectionCode, string CargoClassCode, string? BookingTypeCode,
     IReadOnlyList<OrderTypeStepRef> Steps,
     // gecko_master 27: a booking of this order type needs a vessel call and real ports.
-    bool RequiresVesselSchedule = false)
+    bool RequiresVesselSchedule = false,
+    OrderTypeRules? Rules = null)
 {
+    /// <summary>The order type's rules; none set is what the gate did before gecko_master 34.</summary>
+    public OrderTypeRules RulesOrNone => Rules ?? OrderTypeRules.None;
+
     /// <summary>Any step demands a vessel call — the booking must then name one.</summary>
     public bool RequiresVesselCall => Steps.Any(s => s.RequireVesselVoyage);
+}
+
+/// <summary>
+/// The order type's own rules (gecko_master 34, WALK_IN_ORDERS_PLAN §2). Each one off / null is what the gate did before.
+/// </summary>
+/// <param name="IsWalkIn">R1: a truck may come with no paperwork; the gate raises one booking of this order type for it.</param>
+/// <param name="PaymentRule">R2: <see cref="CashOnly"/>, <see cref="CreditForCreditCustomers"/> or <see cref="CreditWithinLimit"/>;
+/// null = the charge rows decide.</param>
+/// <param name="ReleaseGradeCodes">R3: the grades a pick-up may take; empty = any.</param>
+/// <param name="OwnerMatch">R4: REFUSE or ALLOW a box of another owner; null = the tenant setting gate.refuse_owner_mismatch.</param>
+/// <param name="MaxBoxesPerTruck">R5: walk-in boxes of this order type on one truck; null = no cap.</param>
+public sealed record OrderTypeRules(
+    bool IsWalkIn, string? PaymentRule, IReadOnlyList<string> ReleaseGradeCodes, string? OwnerMatch, short? MaxBoxesPerTruck)
+{
+    public const string CashOnly = "CASH_ONLY";
+    public const string CreditForCreditCustomers = "CREDIT_FOR_CREDIT_CUSTOMERS";
+    public const string CreditWithinLimit = "CREDIT_WITHIN_LIMIT";
+    public const string Refuse = "REFUSE";
+    public const string Allow = "ALLOW";
+
+    public static readonly OrderTypeRules None = new(false, null, [], null, null);
+
+    /// <summary>R3: whether a pick-up may take a box of <paramref name="gradeCode"/> (no list = any; a list and no grade = no).</summary>
+    public bool ReleasesGrade(string? gradeCode) =>
+        ReleaseGradeCodes.Count == 0 || (gradeCode is not null && ReleaseGradeCodes.Contains(gradeCode, StringComparer.OrdinalIgnoreCase));
+
+    /// <summary>R4 over the tenant setting: whether a box of another owner is refused (true) or only warned about.</summary>
+    public bool RefusesOtherOwner(bool tenantSetting) => OwnerMatch switch
+    {
+        Refuse => true,
+        Allow => false,
+        _ => tenantSetting,
+    };
 }
 
 /// <summary>
@@ -247,7 +284,9 @@ public sealed record OrderTypePlanRef(
 public sealed record OrderTypeStepRef(
     Guid OrderTypeMovementId, Guid MovementId, string MovementCode, short SequenceNo, bool IsRequired, bool IsBillable,
     bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, bool AllowDamagedRelease, bool SkipEdi,
-    string Direction, string FullEmpty, bool RequiresSurvey, bool ChangesYardPosition);
+    string Direction, string FullEmpty, bool RequiresSurvey, bool ChangesYardPosition,
+    // gecko_master 34: R6 a damage survey of the box on the same truck visit before its gate-in; R12 the keyed seal is a booked one.
+    bool RequireSurvey = false, bool SealMustMatch = false);
 
 /// <summary><see cref="EquipmentTypeCode"/> is null when the registry row was entered without a type.</summary>
 /// <param name="FixedPortCodes">The ports the box is designated to (gecko_master 25); empty = any port.</param>

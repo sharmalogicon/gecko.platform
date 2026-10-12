@@ -16,7 +16,25 @@ namespace Gecko.MasterData.Endpoints.Commercial;
 public sealed record OrderTypeResponse(
     Guid OrderTypeId, string OrderTypeCode, string DescriptionEn, string? DescriptionLocal,
     string DirectionCode, Guid? ServiceTypeId, string? ServiceCode, string CargoClassCode,
-    string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false);
+    string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false,
+    OrderTypeRulesItem? Rules = null);
+
+/// <summary>
+/// The order type's rules (gecko_master 34, WALK_IN_ORDERS_PLAN §2) — the form's Rules panel. Each one off / null is
+/// what the gate did before they existed.
+/// </summary>
+/// <param name="IsWalkIn">R1: a truck may come with no paperwork; the gate raises one booking of this order type for it.
+/// Such an order type has one step, and at most one walk-in order type per step direction × full/empty is active.</param>
+/// <param name="PaymentRule">R2: CASH_ONLY, CREDIT_FOR_CREDIT_CUSTOMERS or CREDIT_WITHIN_LIMIT; null = the charge rows decide.</param>
+/// <param name="ReleaseGradeCodes">R3: container grades a pick-up may take; empty = any.</param>
+/// <param name="OwnerMatch">R4: REFUSE or ALLOW a box of another owner than the booking's line; null = the tenant setting.</param>
+/// <param name="MaxBoxesPerTruck">R5: walk-in boxes of this order type on one truck; null = no cap.</param>
+public sealed record OrderTypeRulesItem(
+    bool IsWalkIn = false,
+    [property: MaxLength(30)] string? PaymentRule = null,
+    IReadOnlyList<string>? ReleaseGradeCodes = null,
+    [property: MaxLength(10)] string? OwnerMatch = null,
+    [property: Range(1, 99)] short? MaxBoxesPerTruck = null);
 
 public sealed record OrderTypeDetailResponse(
     OrderTypeResponse OrderType,
@@ -31,7 +49,7 @@ public sealed record OrderTypeMovementResponse(
     Guid OrderTypeMovementId, Guid MovementId, string MovementCode, string MovementDescription,
     short SequenceNo, bool IsRequired, bool IsBillable,
     bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, bool AllowDamagedRelease, bool SkipEdi,
-    string? PudoMode);
+    string? PudoMode, bool RequireSurvey = false, bool SealMustMatch = false);
 
 public sealed record OrderTypeChargeResponse(
     Guid OrderTypeChargeId, Guid ChargeCodeId, string ChargeCode, string ChargeDescription,
@@ -55,7 +73,9 @@ public sealed record SaveOrderTypeRequest(
     string? RowVersion = null,
     // gecko_master 27: on = a booking needs a vessel call and real ports; off = no vessel / port validation.
     // Null = leave as it is (off on create).
-    bool? RequiresVesselSchedule = null);
+    bool? RequiresVesselSchedule = null,
+    // gecko_master 34: the whole Rules panel. Null = leave the rules as they are (none on create).
+    OrderTypeRulesItem? Rules = null);
 
 public sealed record OrderTypeMovementItem(
     [property: Required, MaxLength(20)] string MovementCode,
@@ -67,7 +87,10 @@ public sealed record OrderTypeMovementItem(
     bool RequireVesselVoyage = false,
     bool AllowDamagedRelease = false,
     bool SkipEdi = false,
-    [property: MaxLength(20)] string? PudoMode = null);
+    [property: MaxLength(20)] string? PudoMode = null,
+    // gecko_master 34: R6 a damage survey on the same truck visit before the gate-in; R12 the keyed seal is a booked one.
+    bool RequireSurvey = false,
+    bool SealMustMatch = false);
 
 /// <summary>The whole sequence, plus the order type's rowVersion: replacing the steps is an edit of the order type.</summary>
 public sealed record ReplaceOrderTypeMovementsRequest(
@@ -161,6 +184,7 @@ internal static class OrderTypeEndpoints
     {
         var code = request.OrderTypeCode.ToUpperInvariant();
         if (await ValidateAsync(db, request, ct) is { } problem) return problem;
+        if (request.Rules is { } rules && await ValidateRulesAsync(db, null, rules, ct) is { } invalidRules) return invalidRules;
         if (await db.OrderTypes.AnyAsync(o => o.OrderTypeCode == code, ct))
             return MasterDataSupport.Conflict($"Order type '{code}' already exists.");
 
@@ -186,6 +210,7 @@ internal static class OrderTypeEndpoints
             && await db.OrderTypeMovements.AnyAsync(m => m.OrderTypeId == orderType.OrderTypeId && m.RequireVesselVoyage, ct))
             return MasterDataSupport.InvalidReference("requiresVesselSchedule",
                 "A step of this order type requires the vessel/voyage at the gate; untick that step first.");
+        if (request.Rules is { } rules && await ValidateRulesAsync(db, orderType, rules, ct) is { } invalidRules) return invalidRules;
 
         await ApplyAsync(db, orderType, request, ct);
         if (await db.SaveOrConflictAsync(ct) is { } conflict) return conflict;
@@ -232,7 +257,14 @@ internal static class OrderTypeEndpoints
                 errors.Add(i, "pudoMode", $"'{m.PudoMode}' is not a PICKUP_DROPOFF_MODE.");
             if (m.RequireVesselVoyage && !orderType.RequiresVesselSchedule)
                 errors.Add(i, "requireVesselVoyage", $"{orderType.OrderTypeCode} does not require a vessel schedule; tick that on the order type first.");
+            if (m.SealMustMatch && !m.CheckSealNo)
+                errors.Add(i, "sealMustMatch", "Tick Check Seal Number too: the seal is matched only where the gate records one.");
         }
+        if (orderType.IsWalkIn && rows.Count != 1)
+            errors.Add(null, null, $"{orderType.OrderTypeCode} is a walk-in order type: it has exactly one step (the truck's drop-off or pick-up).");
+        else if (orderType.IsWalkIn && errors.Count == 0
+                 && await WalkInStepProblemAsync(db, orderType.OrderTypeId, movements.Single(x => x.MovementCode == rows[0].MovementCode).MovementId, ct) is { } taken)
+            errors.Add(0, "movementCode", taken);
 
         // 1, 2, 3 with no gaps: the gate walks the sequence, and a hole in it means
         // a step that silently never runs.
@@ -282,6 +314,8 @@ internal static class OrderTypeEndpoints
                 AllowDamagedRelease = m.AllowDamagedRelease,
                 SkipEdi = m.SkipEdi,
                 PudoMode = m.PudoMode,
+                RequireSurvey = m.RequireSurvey,
+                SealMustMatch = m.SealMustMatch,
             });
         }
 
@@ -412,6 +446,14 @@ internal static class OrderTypeEndpoints
                                   ?? (string.IsNullOrEmpty(orderType.DirectionCode) ? "DOMESTIC" : orderType.DirectionCode);
         orderType.CargoClassCode = request.CargoClassCode.ToUpperInvariant();
         if (request.RequiresVesselSchedule is { } requires) orderType.RequiresVesselSchedule = requires;
+        if (request.Rules is { } rules)
+        {
+            orderType.IsWalkIn = rules.IsWalkIn;
+            orderType.PaymentRule = Upper(rules.PaymentRule);
+            orderType.ReleaseGradeCodes = GradeList(rules.ReleaseGradeCodes) is { Count: > 0 } grades ? string.Join(",", grades) : null;
+            orderType.OwnerMatch = Upper(rules.OwnerMatch);
+            orderType.MaxBoxesPerTruck = rules.MaxBoxesPerTruck;
+        }
         orderType.IsActive = request.IsActive;
         orderType.ServiceTypeId = request.ServiceCode is null
             ? null
@@ -461,6 +503,65 @@ internal static class OrderTypeEndpoints
         return null;
     }
 
+    private static readonly string[] PaymentRules = ["CASH_ONLY", "CREDIT_FOR_CREDIT_CUSTOMERS", "CREDIT_WITHIN_LIMIT"];
+    private static readonly string[] OwnerMatches = ["REFUSE", "ALLOW"];
+
+    private static string? Upper(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToUpperInvariant();
+
+    private static List<string> GradeList(IReadOnlyList<string>? codes) =>
+        (codes ?? []).Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim().ToUpperInvariant()).Distinct().Order().ToList();
+
+    /// <summary>
+    /// The Rules panel (gecko_master 34). <paramref name="orderType"/> is null on create (no steps yet). A walk-in order
+    /// type has at most one step, and no other active walk-in order type may have a step of the same direction and
+    /// full/empty: the gate finds the order type by those two answers, so two would be a coin toss.
+    /// </summary>
+    private static async Task<ValidationProblem?> ValidateRulesAsync(MasterDataDbContext db, OrderType? orderType, OrderTypeRulesItem rules, CancellationToken ct)
+    {
+        if (Upper(rules.PaymentRule) is { } payment && !PaymentRules.Contains(payment))
+            return MasterDataSupport.InvalidReference("rules.paymentRule", $"'{payment}' is not a payment rule: {string.Join(", ", PaymentRules)}, or none.");
+        if (Upper(rules.OwnerMatch) is { } owner && !OwnerMatches.Contains(owner))
+            return MasterDataSupport.InvalidReference("rules.ownerMatch", $"'{owner}' is not REFUSE or ALLOW (or none: the tenant setting).");
+        var grades = GradeList(rules.ReleaseGradeCodes);
+        if (grades.Count > 0)
+        {
+            var known = await db.ContainerGrades.AsNoTracking().Where(g => grades.Contains(g.GradeCode) && g.IsActive).Select(g => g.GradeCode).ToListAsync(ct);
+            if (grades.Except(known, StringComparer.OrdinalIgnoreCase).ToList() is { Count: > 0 } unknown)
+                return MasterDataSupport.InvalidReference("rules.releaseGradeCodes", $"Unknown container grade(s): {string.Join(", ", unknown)}.");
+            if (string.Join(",", grades).Length > 200)
+                return MasterDataSupport.InvalidReference("rules.releaseGradeCodes", "Too many grades: the list holds up to 200 characters.");
+        }
+        if (!rules.IsWalkIn || orderType is null) return null;
+
+        var steps = await db.OrderTypeMovements.AsNoTracking().Where(m => m.OrderTypeId == orderType.OrderTypeId).Select(m => m.MovementId).ToListAsync(ct);
+        if (steps.Count > 1)
+            return MasterDataSupport.InvalidReference("rules.isWalkIn",
+                $"{orderType.OrderTypeCode} has {steps.Count} steps. A walk-in order type has exactly one (the truck's drop-off or pick-up).");
+        if (steps.Count == 1 && await WalkInStepProblemAsync(db, orderType.OrderTypeId, steps[0], ct) is { } taken)
+            return MasterDataSupport.InvalidReference("rules.isWalkIn", taken);
+        return null;
+    }
+
+    /// <summary>
+    /// Why this step cannot be a walk-in order type's, as a message; null when it can: the step must be a gate drop-off or
+    /// pick-up of a full or an empty box, and no other active walk-in order type may have one that goes the same way with the same load.
+    /// </summary>
+    private static async Task<string?> WalkInStepProblemAsync(MasterDataDbContext db, Guid orderTypeId, Guid movementId, CancellationToken ct)
+    {
+        var mine = await db.Movements.AsNoTracking().Where(m => m.MovementId == movementId).Select(m => new { m.MovementCode, m.Direction, m.FullEmpty }).SingleAsync(ct);
+        if (mine.Direction is not ("IN" or "OUT") || mine.FullEmpty is not ("FULL" or "EMPTY"))
+            return $"{mine.MovementCode} is not a gate drop-off or pick-up of a full or an empty box, so a walk-in truck cannot use it.";
+        var other = await (
+            from o in db.OrderTypes.AsNoTracking()
+            join s in db.OrderTypeMovements on o.OrderTypeId equals s.OrderTypeId
+            join m in db.Movements on s.MovementId equals m.MovementId
+            where o.OrderTypeId != orderTypeId && o.IsWalkIn && o.IsActive && m.Direction == mine.Direction && m.FullEmpty == mine.FullEmpty
+            select o.OrderTypeCode).FirstOrDefaultAsync(ct);
+        return other is null ? null
+            : $"{other} is already the walk-in order type for a {mine.FullEmpty} {(mine.Direction == "IN" ? "drop-off" : "pick-up")}. " +
+              "The gate picks the order type by those two answers, so only one may be active.";
+    }
+
     private static async Task<IReadOnlyList<OrderTypeMovementResponse>> MovementsOfAsync(
         MasterDataDbContext db, Guid orderTypeId, CancellationToken ct) =>
         await (
@@ -471,7 +572,7 @@ internal static class OrderTypeEndpoints
                 otm.OrderTypeMovementId, otm.MovementId, m.MovementCode, m.DescriptionEn,
                 otm.SequenceNo, otm.IsRequired, otm.IsBillable,
                 otm.CheckSealNo, otm.CheckGrossWeight, otm.RequireVesselVoyage,
-                otm.AllowDamagedRelease, otm.SkipEdi, otm.PudoMode)
+                otm.AllowDamagedRelease, otm.SkipEdi, otm.PudoMode, otm.RequireSurvey, otm.SealMustMatch)
         ).ToListAsync(ct);
 
     private static async Task<IReadOnlyList<OrderTypeChargeResponse>> ChargesOfAsync(
@@ -496,5 +597,8 @@ internal static class OrderTypeEndpoints
         select new OrderTypeResponse(
             o.OrderTypeId, o.OrderTypeCode, o.DescriptionEn, o.DescriptionLocal, o.DirectionCode,
             o.ServiceTypeId, s == null ? null : s.ServiceCode, o.CargoClassCode, o.BookingTypeCode,
-            o.IsActive, Convert.ToBase64String(o.RowVersion), o.RequiresVesselSchedule);
+            o.IsActive, Convert.ToBase64String(o.RowVersion), o.RequiresVesselSchedule,
+            new OrderTypeRulesItem(o.IsWalkIn, o.PaymentRule,
+                o.ReleaseGradeCodes == null ? Array.Empty<string>() : o.ReleaseGradeCodes.Split(',', StringSplitOptions.None),
+                o.OwnerMatch, o.MaxBoxesPerTruck));
 }

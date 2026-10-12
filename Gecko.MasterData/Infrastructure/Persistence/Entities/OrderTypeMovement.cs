@@ -29,6 +29,12 @@ public partial class OrderTypeMovement
 
     public bool SkipEdi { get; set; }
 
+    /// <summary>gecko_master 34 (R6): the gate-in needs a damage survey of the box on the same truck visit.</summary>
+    public bool RequireSurvey { get; set; }
+
+    /// <summary>gecko_master 34 (R12): the seal keyed at the gate must be one of the box's booked seals.</summary>
+    public bool SealMustMatch { get; set; }
+
     public string? PudoMode { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }

@@ -324,6 +324,113 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
         Assert.Contains("LIFTIN", v.ChargeCodes.Select(c => c.Code));
     }
 
+    /// <summary>
+    /// WALK_IN_ORDERS_PLAN §2 (owner 2026-10-12): the Rules panel round-trips; a header save without rules keeps them;
+    /// each bad value lands on its field.
+    /// </summary>
+    [Fact]
+    public async Task The_rules_panel_is_saved_read_back_and_kept_by_a_header_save_without_rules()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var code = NewCode();
+        var url = Url(code);
+        try
+        {
+            var created = await Read<Detail>(await sct.PostAsJsonAsync(OrderTypes, new
+            {
+                orderTypeCode = code, descriptionEn = "Rules", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL",
+                rules = new { paymentRule = "credit_within_limit", releaseGradeCodes = new[] { "a", " A " }, ownerMatch = "ALLOW", maxBoxesPerTruck = 2 },
+            }, ct), HttpStatusCode.Created, ct);
+            var rules = created.OrderType.Rules!;
+            Assert.Equal((false, "CREDIT_WITHIN_LIMIT", "ALLOW", (short?)2), (rules.IsWalkIn, rules.PaymentRule, rules.OwnerMatch, rules.MaxBoxesPerTruck));
+            Assert.Equal(["A"], rules.ReleaseGradeCodes);
+
+            // A header save that leaves the rules out keeps them (an older screen must not wipe them).
+            var renamed = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Renamed", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL", rowVersion = created.OrderType.RowVersion,
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.Equal(("CREDIT_WITHIN_LIMIT", (short?)2), (renamed.Rules!.PaymentRule, renamed.Rules.MaxBoxesPerTruck));
+
+            // Sending the panel replaces it: empty = every rule off.
+            var cleared = await Read<OrderType>(await sct.PutAsJsonAsync(url, new
+            {
+                orderTypeCode = code, descriptionEn = "Renamed", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL", rowVersion = renamed.RowVersion,
+                rules = new { },
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.Equal((false, null, null, null), (cleared.Rules!.IsWalkIn, cleared.Rules.PaymentRule, cleared.Rules.OwnerMatch, cleared.Rules.MaxBoxesPerTruck));
+            Assert.Empty(cleared.Rules.ReleaseGradeCodes);
+
+            object Bad(object rules) => new
+            {
+                orderTypeCode = code, descriptionEn = "Renamed", cargoClassCode = "GENERAL", bookingTypeCode = "INTERNAL", rowVersion = cleared.RowVersion, rules,
+            };
+            await ExpectFieldAsync(await sct.PutAsJsonAsync(url, Bad(new { paymentRule = "SOMETIMES" }), ct), "rules.paymentRule", ct);
+            await ExpectFieldAsync(await sct.PutAsJsonAsync(url, Bad(new { ownerMatch = "MAYBE" }), ct), "rules.ownerMatch", ct);
+            await ExpectFieldAsync(await sct.PutAsJsonAsync(url, Bad(new { releaseGradeCodes = new[] { "ZZNOPE" } }), ct), "rules.releaseGradeCodes", ct);
+
+            // R12 needs the seal check it matches against.
+            await ExpectFieldAsync(await sct.PutAsJsonAsync($"{url}/movements", new
+            {
+                rowVersion = cleared.RowVersion,
+                movements = new object[] { new { movementCode = "GOF", sequenceNo = 1, sealMustMatch = true } },
+            }, ct), "movements[0].sealMustMatch", ct);
+            var sealed_ = await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements", new
+            {
+                rowVersion = cleared.RowVersion,
+                movements = new object[] { new { movementCode = "GOF", sequenceNo = 1, checkSealNo = true, sealMustMatch = true, requireSurvey = true } },
+            }, ct), HttpStatusCode.OK, ct);
+            Assert.True(sealed_.Movements.Single() is { CheckSealNo: true, SealMustMatch: true, RequireSurvey: true });
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, url, ct); }
+    }
+
+    /// <summary>
+    /// R1: a walk-in order type has one gate step, and the gate finds it by that step's direction and full/empty, so no two
+    /// active walk-in order types may share them. dev_12 makes WALK MTY IN SCT's walk-in empty drop-off.
+    /// </summary>
+    [Fact]
+    public async Task A_walk_in_order_type_has_one_gate_step_and_no_twin()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+        var code = NewCode();
+        var url = Url(code);
+        object Header(string rowVersion, bool walkIn) => new
+        {
+            orderTypeCode = code, descriptionEn = "Walk-in", cargoClassCode = "EMPTY", bookingTypeCode = "INTERNAL", rowVersion,
+            rules = new { isWalkIn = walkIn },
+        };
+        try
+        {
+            var created = await Read<Detail>(await sct.PostAsJsonAsync(OrderTypes, new
+            {
+                orderTypeCode = code, descriptionEn = "Walk-in", cargoClassCode = "EMPTY", bookingTypeCode = "INTERNAL",
+            }, ct), HttpStatusCode.Created, ct);
+            var twoSteps = await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements", new
+            {
+                rowVersion = created.OrderType.RowVersion,
+                movements = new object[] { new { movementCode = "GIE", sequenceNo = 1 }, new { movementCode = "GOE", sequenceNo = 2 } },
+            }, ct), HttpStatusCode.OK, ct);
+            await ExpectFieldAsync(await sct.PutAsJsonAsync(url, Header(twoSteps.OrderType.RowVersion, true), ct), "rules.isWalkIn", ct);
+
+            // One step, but an empty drop-off: WALK MTY IN already is SCT's.
+            var oneStep = await Read<Detail>(await sct.PutAsJsonAsync($"{url}/movements", new
+            {
+                rowVersion = twoSteps.OrderType.RowVersion, movements = new object[] { new { movementCode = "GIE", sequenceNo = 1 } },
+            }, ct), HttpStatusCode.OK, ct);
+            var twin = await sct.PutAsJsonAsync(url, Header(oneStep.OrderType.RowVersion, true), ct);
+            await ExpectFieldAsync(twin, "rules.isWalkIn", ct);
+            Assert.Contains("WALK MTY IN", await twin.Content.ReadAsStringAsync(ct));
+
+            // Off, it saves.
+            var walkInLater = await Read<OrderType>(await sct.PutAsJsonAsync(url, Header(oneStep.OrderType.RowVersion, false), ct), HttpStatusCode.OK, ct);
+            Assert.False(walkInLater.Rules!.IsWalkIn);
+        }
+        finally { await RowVersions.DeleteCurrentAsync(sct, url, ct); }
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     private static async Task<T> Read<T>(HttpResponseMessage response, HttpStatusCode expected, CancellationToken ct)
@@ -344,8 +451,11 @@ public sealed class OrderTypeApiTests(MasterDataApiFactory api)
     }
 
     private sealed record OrderType(Guid OrderTypeId, string OrderTypeCode, string DescriptionEn, string DirectionCode,
-        string? ServiceCode, string CargoClassCode, string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false);
-    private sealed record Step(string MovementCode, short SequenceNo, bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, string? PudoMode);
+        string? ServiceCode, string CargoClassCode, string? BookingTypeCode, bool IsActive, string RowVersion, bool RequiresVesselSchedule = false,
+        Rules? Rules = null);
+    private sealed record Rules(bool IsWalkIn, string? PaymentRule, List<string> ReleaseGradeCodes, string? OwnerMatch, short? MaxBoxesPerTruck);
+    private sealed record Step(string MovementCode, short SequenceNo, bool CheckSealNo, bool CheckGrossWeight, bool RequireVesselVoyage, string? PudoMode,
+        bool RequireSurvey = false, bool SealMustMatch = false);
     private sealed record Charge(string ChargeCode, string? MovementCode, string PaymentTo, string? PaymentTermCode, bool IsValueAddedService);
     private sealed record Detail(OrderType OrderType, List<Step> Movements, List<Charge> Charges);
 

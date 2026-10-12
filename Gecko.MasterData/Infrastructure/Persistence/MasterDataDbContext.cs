@@ -2818,6 +2818,20 @@ public partial class MasterDataDbContext : DbContext
                 .IsUnicode(false)
                 .HasColumnName("booking_type_code");
             entity.Property(e => e.RequiresVesselSchedule).HasColumnName("requires_vessel_schedule");
+            entity.Property(e => e.IsWalkIn).HasColumnName("is_walk_in");
+            entity.Property(e => e.PaymentRule)
+                .HasMaxLength(30)
+                .IsUnicode(false)
+                .HasColumnName("payment_rule");
+            entity.Property(e => e.ReleaseGradeCodes)
+                .HasMaxLength(200)
+                .IsUnicode(false)
+                .HasColumnName("release_grade_codes");
+            entity.Property(e => e.OwnerMatch)
+                .HasMaxLength(10)
+                .IsUnicode(false)
+                .HasColumnName("owner_match");
+            entity.Property(e => e.MaxBoxesPerTruck).HasColumnName("max_boxes_per_truck");
             entity.Property(e => e.CargoClassCode)
                 .HasMaxLength(20)
                 .IsUnicode(false)
@@ -2984,6 +2998,8 @@ public partial class MasterDataDbContext : DbContext
                 .HasColumnName("row_version");
             entity.Property(e => e.SequenceNo).HasColumnName("sequence_no");
             entity.Property(e => e.SkipEdi).HasColumnName("skip_edi");
+            entity.Property(e => e.RequireSurvey).HasColumnName("require_survey");
+            entity.Property(e => e.SealMustMatch).HasColumnName("seal_must_match");
             entity.Property(e => e.TenantId).HasColumnName("tenant_id");
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("((sysutcdatetime() AT TIME ZONE 'UTC'))", "df_otm__updated_at")

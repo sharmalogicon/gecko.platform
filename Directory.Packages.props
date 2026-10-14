@@ -3,6 +3,8 @@
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <AspNetCoreVersion>10.0.12</AspNetCoreVersion>
+    <!-- Lets the pins below override vulnerable transitive versions. -->
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
   <ItemGroup>
     <!-- data -->
@@ -18,6 +20,8 @@
     <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="$(AspNetCoreVersion)" />
     <!-- security -->
     <PackageVersion Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+    <!-- Transitive via Microsoft.Data.SqlClient; 9.0.11 is CVE-2026-84008 (GHSA-846f-f764-76mx). -->
+    <PackageVersion Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
     <!-- tests -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageVersion Include="xunit.v3" Version="3.0.1" />

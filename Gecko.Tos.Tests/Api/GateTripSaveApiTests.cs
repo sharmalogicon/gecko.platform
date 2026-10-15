@@ -310,6 +310,48 @@ public sealed class GateTripSaveApiTests(TosApiFactory api)
     }
 
     /// <summary>
+    /// A Save refused before any money is taken has not spent its key: the clerk fixes the row (keys the seal, here
+    /// the hold is lifted and the driver named) and saves again, and the screen still holds the same key. That resend
+    /// is a different request, and it must go through — not come back 422 "already used with a different request".
+    /// </summary>
+    [Fact]
+    public async Task A_Save_refused_before_payment_leaves_its_key_free_for_the_corrected_Save()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        Guid? shiftId = null;
+        await TestDatabase.RequireCouponAtAsync(SctLcb01, true);
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, box, ct);
+            await DropOffAsync(client, box, ct);
+            shiftId = await OpenDrawerAsync(client, ct);
+            var quote = await PickUpQuoteAsync(client, booking.Booking.OrderNo, ct);
+            var hold = await client.PostAsJsonAsync("/api/tos/holds", new { containerNo = box, holdCode = "CUSTOMS", reason = "Red line" }, ct);
+            Assert.Equal(HttpStatusCode.Created, hold.StatusCode);
+
+            var key = Guid.NewGuid().ToString();
+            var draftId = Guid.NewGuid();
+            object Body(string? driverName) => new
+            {
+                branchId = SctLcb01, draftId,
+                truck = new { plate = "70-8887", driverName },
+                rows = new[] { PickUp(booking.Containers.Single().BookingContainerId, box) },
+                payment = new { payments = new[] { new { channel = "CASH", amount = quote.Total } }, expectedTotal = quote.Total },
+            };
+            var refused = await SaveAsync(client, key, Body(null), ct);
+            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+
+            await TestDatabase.RemoveHoldsAsync(box);
+            var corrected = await SaveAsync(client, key, Body("Somchai P."), ct);
+            Assert.True(corrected.StatusCode == HttpStatusCode.Created, $"save returned {(int)corrected.StatusCode}: {await corrected.Content.ReadAsStringAsync(ct)}");
+        }
+        finally { await CleanAsync(carrierRef, shiftId, box); }
+    }
+
+    /// <summary>
     /// A2: the money could not be taken, so the blind order the Save raised is cancelled: no orphan. The gate Save opens
     /// the clerk's drawer itself (owner 2026-10-07), so what fails here is the total: the clerk saw a price that is not the one due.
     /// </summary>

@@ -65,7 +65,23 @@ internal static class TripEndpoints
         var save = await db.TripSaves.SingleOrDefaultAsync(t => t.IdempotencyKey == key, ct);
         if (save is not null)
         {
-            if (!Idempotency.SameRequest(save.IdempotencyHash, hash)) return Idempotency.DifferentRequest(key);
+            if (!Idempotency.SameRequest(save.IdempotencyHash, hash))
+            {
+                // A Save refused before the money (a seal not keyed, a hold) took nothing and gated nothing: its key is
+                // not spent. The clerk fixes the row and saves again with the key the screen still holds — that is the
+                // corrected Save, not a client bug, so it takes the key over. Once paid or gated, the key is the old Save's.
+                var spent = save.Status != "IN_PROGRESS" || save.ReceiptId is not null
+                    || await db.GateTransactions.AnyAsync(g => g.IdempotencyKey != null && g.IdempotencyKey.StartsWith(key + "#"), ct);
+                if (spent) return Idempotency.DifferentRequest(key);
+                save.IdempotencyHash = hash;
+                save.UpdatedAt = time.GetUtcNow();
+                save.UpdatedBy = caller.UserId();
+                try { await db.SaveChangesAsync(ct); }
+                catch (DbUpdateConcurrencyException)
+                {
+                    return TosSupport.Conflict($"A Save with {Idempotency.Header} {key} is already running.", "Repeat it in a moment.");
+                }
+            }
             if (save.Status == "DONE")
                 return TypedResults.Created($"/api/tos/gate/trips/{save.TripSaveId}", JsonSerializer.Deserialize<TripSaveResponse>(save.ResultJson!, Json)!);
         }

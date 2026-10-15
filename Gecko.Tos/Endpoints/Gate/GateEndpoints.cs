@@ -141,8 +141,11 @@ internal static class GateEndpoints
             .OrderBy(v => v.ChargeCode).ThenBy(v => v.BillTo).ThenBy(v => v.PaymentTermCode)
             .Select(v => new GateVasResponse(v.ChargeCode, names.GetValueOrDefault(v.ChargeCode)?.DescriptionEn ?? v.ChargeCode,
                 names.GetValueOrDefault(v.ChargeCode)?.DescriptionLocal, v.BillTo, v.PaymentTermCode,
-                "An EMPTY drop-off or a pick-up",
-                v.MovementCode is null ? offered : offered.Where(m => string.Equals(m, v.MovementCode, StringComparison.OrdinalIgnoreCase)).ToList()))
+                v.MovementCode is null ? "An EMPTY drop-off or a pick-up" : $"On {v.MovementCode}",
+                // Named on a movement: offered there, whatever it is — a full drop-off too (owner 2026-10-15).
+                v.MovementCode is null ? offered
+                    : plan.Steps.Where(s => string.Equals(s.MovementCode, v.MovementCode, StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(s => s.SequenceNo).Select(s => s.MovementCode).ToList()))
             .ToList());
     }
 

@@ -133,6 +133,41 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
 
     // ── S1: the cash window ──────────────────────────────────────────────────
 
+    /// <summary>
+    /// A gate VAS the order type names on a FULL drop-off is offered there (owner 2026-10-15: KORAKIT's S-010..S-013
+    /// on FULL IN CUSTOMER's FULL_IN), and charged only when ticked. A VAS named on no movement keeps Vector's rule
+    /// (GateIn.cs:961-990): an empty drop-off or a pick-up only — so VASSEAL is still not offered here.
+    /// </summary>
+    [Fact]
+    public async Task A_VAS_named_on_a_full_drop_off_is_offered_there_and_charged_when_ticked()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = NewRef();
+        var box = NewBox();
+        await TestDatabase.VasOnGateTestFullInAsync(add: true);
+        try
+        {
+            var booking = await BookAsync(client, carrierRef, [box], ct);
+            var orderNo = booking.Booking.OrderNo;
+
+            var arriving = (await QuoteWhenAsync(client, orderNo, q => q.Boxes.Single().NextMovementCode == "FULL_IN", "Revenue to see the booking", ct)).Boxes.Single();
+            Assert.True(arriving.VasOffered);
+            var wash = Assert.Single(arriving.VasMenu!);
+            Assert.Equal(("VASWASH", false, 214.00m), (wash.ChargeCode, wash.Ticked, wash.Total));
+            Assert.DoesNotContain(arriving.Due, d => d.Kind == "VAS");
+
+            var ticked = (await QuoteAsync(client, orderNo, ct, "&vas=VASWASH")).Boxes.Single();
+            Assert.Equal(200.00m, Assert.Single(ticked.Due, d => d.Kind == "VAS" && d.ChargeCode == "VASWASH").Amount);
+            await ExpectFieldAsync(await client.GetAsync(QuoteUrl(orderNo, "&vas=VASSEAL"), ct), "vas", ct);
+        }
+        finally
+        {
+            await TestDatabase.VasOnGateTestFullInAsync(add: false);
+            await CleanAsync(carrierRef, null);
+        }
+    }
+
     [Fact]
     public async Task The_truck_category_the_haulier_term_the_VAS_and_the_gate_charge_only_rule_shape_the_window_quote()
     {

@@ -107,7 +107,7 @@ internal static class WindowEndpoints
         var boxes = await window.QuoteBoxesAsync(context, only, paidUntil, ct, terms, carriedBy);
         if (only is not null && only.Any(id => boxes.All(b => b.Box.BookingContainerId != id)))
             return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", only.Where(id => boxes.All(b => b.Box.BookingContainerId != id)))}.");
-        if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
+        if (WindowService.VasNotOffered(terms, boxes.Select(b => b.Quote?.VasMenu)) is { } vasProblem) return vasProblem;
         var settled = await db.Charges.AsNoTracking()
             .Where(c => c.BookingId == plan.BookingId && c.Source == ChargeSource.Window && c.Status != ChargeStatus.Cancelled)
             .ToListAsync(ct);
@@ -124,7 +124,7 @@ internal static class WindowEndpoints
                 t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" or "CUSTOMER_ON_CREDIT" or "CUSTOMER_PAYS_CASH" or "CREDIT_LIMIT_REACHED" ? t.Trail.FirstOrDefault() : null)).ToList(),
             b.Quote?.Total ?? 0, b.Note,
             (b.Quote?.BilledLater ?? []).Select(ToResponse).ToList(),
-            b.Rules is { } r && CashQuoter.OffersVas(r),
+            b.Quote?.VasMenu is { Count: > 0 },
             (b.Quote?.NoPrice ?? []).Select(ToResponse).ToList(),
             (b.Quote?.VasMenu ?? []).Select(ToResponse).ToList())).ToList();
 
@@ -200,8 +200,6 @@ internal static class WindowEndpoints
         if (context is null) return RevenueSupport.Invalid("branchId", "Unknown depot.");
         var (terms, invalid) = await window.GateTermsAsync(context, truckCategoryCode, haulierCode, vas, ct);
         if (invalid is not null) return invalid;
-        if (terms.Vas is { Count: > 0 } && !(first.IsBillable && CashQuoter.OffersVas(first)))
-            return RevenueSupport.Invalid("vas", "Gate VAS is offered on an empty drop-off or a pick-up only; this box is not one.");
         var (carriedBy, notABooking, payOtherFirst) = await window.TruckCarrierAsync(context, terms, sameTruckAs, ct);
         if (notABooking is not null) return notABooking;
         if (payOtherFirst is not null) return payOtherFirst;
@@ -209,6 +207,7 @@ internal static class WindowEndpoints
         var quote = first.IsBillable
             ? await quoter.QuoteAsync(plan, box, first, context.Branch, null, context.Now, ct, terms with { TripChargeCarriedBy = carriedBy })
             : null;
+        if (WindowService.VasNotOffered(terms, [quote?.VasMenu]) is { } vasProblem) return vasProblem;
         var note = quote is null ? $"{first.MovementCode} is not billable."
             : quote.NoPrice.Count > 0 ? $"No tariff prices {string.Join(", ", quote.NoPrice.Select(l => l.ChargeCode))} at {first.MovementCode} (contract or standard tariff): not charged."
             : quote.Lines.Count > 0 ? null
@@ -220,7 +219,7 @@ internal static class WindowEndpoints
             null, null, lines.Select(ToResponse).ToList(), [],
             (quote?.Tried ?? []).Select(t => new TriedVariantResponse(t.ChargeCode, t.BillTo, t.Outcome, t.Amount, t.PaymentTermCode,
                 t.Outcome is "PER_TRIP_ON_OTHER_BOX" or "GATE_CHARGE_ONLY" or "HAULIER_CREDIT" or "SETTLED" or "CUSTOMER_ON_CREDIT" or "CUSTOMER_PAYS_CASH" or "CREDIT_LIMIT_REACHED" ? t.Trail.FirstOrDefault() : null)).ToList(),
-            quote?.Total ?? 0, note, later.Select(ToResponse).ToList(), CashQuoter.OffersVas(first),
+            quote?.Total ?? 0, note, later.Select(ToResponse).ToList(), quote?.VasMenu is { Count: > 0 },
             (quote?.NoPrice ?? []).Select(ToResponse).ToList(),
             (quote?.VasMenu ?? []).Select(ToResponse).ToList());
 
@@ -434,7 +433,7 @@ internal static class WindowEndpoints
         var boxes = await window.QuoteBoxesAsync(context, request.BookingContainerIds!.ToHashSet(), request.PaidUntil, ct, terms, carriedBy);
         var missing = request.BookingContainerIds!.Where(id => boxes.All(b => b.Box.BookingContainerId != id)).ToList();
         if (missing.Count > 0) return RevenueSupport.Invalid("bookingContainerIds", $"Not on {plan.OrderNo}: {string.Join(", ", missing)}.");
-        if (WindowService.VasNotOffered(terms, boxes) is { } vasProblem) return vasProblem;
+        if (WindowService.VasNotOffered(terms, boxes.Select(b => b.Quote?.VasMenu)) is { } vasProblem) return vasProblem;
         // A cash charge no tariff prices is not charged (owner 2026-10-07, as Vector): the priced lines are taken.
         var payable = boxes.Where(b => b.Quote is { Lines.Count: > 0 }).ToList();
         var idle = boxes.Except(payable).ToList();
@@ -759,11 +758,19 @@ internal sealed class WindowService(RevenueDbContext db, CashQuoter quoter, Bran
         WithholdingTax.MayApply(totalWithVat)
         && await master.GetBoolSettingAsync(RevenueSettingKeys.WithholdingTaxEnabled, branchId, true, ct);
 
-    /// <summary>VAS ticked, but none of the boxes is an empty drop-off or a pick-up (§3 f): a 400, not a silent drop.</summary>
-    public static ValidationProblem? VasNotOffered(GateTerms terms, IReadOnlyList<QuotedBox> boxes) =>
-        terms.Vas is { Count: > 0 } && !boxes.Any(b => b.Rules is { IsBillable: true } r && CashQuoter.OffersVas(r))
-            ? RevenueSupport.Invalid("vas", "Gate VAS is offered on an empty drop-off or a pick-up only; none of these boxes is one.")
+    /// <summary>
+    /// VAS ticked that no box offers (§3 f): a 400, not a silent drop. A box offers the VAS named on its step, and one
+    /// named on no step only on an empty drop-off or a pick-up (CashQuoter.OffersVas).
+    /// </summary>
+    public static ValidationProblem? VasNotOffered(GateTerms terms, IEnumerable<IReadOnlyList<VasOption>?> menus)
+    {
+        if (terms.Vas is not { Count: > 0 } ticked) return null;
+        var offered = menus.SelectMany(m => m ?? []).Select(v => v.ChargeCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var not = ticked.Where(v => !offered.Contains(v)).ToList();
+        return not.Count > 0
+            ? RevenueSupport.Invalid("vas", $"{string.Join(", ", not)}: not offered on these boxes. A gate VAS is offered on the movement it is named on, or, named on none, on an empty drop-off or a pick-up.")
             : null;
+    }
 
     /// <summary>
     /// Two bookings on ONE truck (owner 2026-10-01: the gate charge is collected once,

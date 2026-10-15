@@ -185,6 +185,14 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     public static bool OffersVas(OrderTypeStepRef step) =>
         step.Direction == "OUT" || (step.Direction == "IN" && step.FullEmpty == "EMPTY");
 
+    /// <summary>
+    /// One gate VAS on this step. A VAS the order type names on a movement is offered on that movement whatever it is —
+    /// a full drop-off too (owner 2026-10-15: KORAKIT's S-010..S-013 on FULL IN CUSTOMER's FULL_IN). A VAS named on no
+    /// movement keeps Vector's rule above.
+    /// </summary>
+    public static bool OffersVas(OrderTypeStepRef step, string? vasMovementCode) =>
+        vasMovementCode is null ? OffersVas(step) : string.Equals(vasMovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase);
+
     public async Task<MovementQuote> QuoteAsync(BookingPlan plan, BookingPlanContainer box, OrderTypeStepRef step,
         BranchClockInfo branch, DateOnly? paidUntil, DateTimeOffset now, CancellationToken ct, GateTerms? gate = null)
     {
@@ -228,11 +236,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             .Where(c => !c.IsValueAddedService && string.Equals(c.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase))
             .ToList();
         // A VAS is the order type's, at gate, on this movement (or on any movement when the order type names none).
-        var offered = OffersVas(step)
-            ? orderTypeCharges.Where(c => c.IsValueAddedService && c.RaiseAtGateIn
-                                          && (c.MovementCode is null || string.Equals(c.MovementCode, step.MovementCode, StringComparison.OrdinalIgnoreCase)))
-                .ToList()
-            : [];
+        var offered = orderTypeCharges.Where(c => c.IsValueAddedService && c.RaiseAtGateIn && OffersVas(step, c.MovementCode)).ToList();
         var ticked = terms.Vas is { Count: > 0 } vas
             ? offered.Where(c => vas.Contains(c.ChargeCode, StringComparer.OrdinalIgnoreCase)).ToList()
             : [];

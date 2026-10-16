@@ -450,15 +450,19 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
             {
                 var category = stay.FullEmptyIn == "FULL" ? "LADEN" : "EMPTY";
                 var storage = (await master.ChargeVariantsOfTypeAsync("STORAGE", ct))
-                    .Where(v => v.PaymentTermCode == Cash && string.Equals(v.ChargeCategory, category, StringComparison.OrdinalIgnoreCase))
+                    .Where(v => string.Equals(v.ChargeCategory, category, StringComparison.OrdinalIgnoreCase))
                     .ToList();
-                storageApplies = storage.Count > 0;
+                var cashStorage = storage.Where(v => v.PaymentTermCode == Cash).ToList();
+                // R2: a customer on credit is billed for its storage at the gate, never asked for it in cash —
+                // so its storage holds no automatic coupon and sends no truck to the window.
+                bool BilledOnCredit(ChargeVariantRef v) => customerTerm.Term == Credit && v.BillTo == Customer;
+                storageApplies = cashStorage.Any(v => !BilledOnCredit(v));
 
                 until = paidUntil ?? branch.LocalDate(now);
                 var inDate = branch.LocalDate(stay.InAt);
                 stayDays = Math.Max(1, until.Value.DayNumber - inDate.DayNumber + 1);
 
-                foreach (var variant in storage)
+                foreach (var variant in cashStorage)
                 {
                     var paid = settled.Where(s => s.ChargeCode == variant.ChargeCode && s.BillTo == variant.BillTo).ToList();
                     var paidTo = paid.Max(p => p.ServiceTo);
@@ -468,25 +472,47 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
                         continue;
                     }
 
-                    var result = await pricing.PriceAsync(Request(plan, box, step, size, variant.ChargeCode, variant.BillTo, Cash,
+                    if (BilledOnCredit(variant))
+                    {
+                        tried.Add(new TriedVariant(variant.ChargeCode, variant.BillTo, Cash, "CUSTOMER_ON_CREDIT", null, [customerTerm.Why!]));
+                        // Its CREDIT rate, else the CASH rate billed on credit (as the movement lines above).
+                        var credit = storage.FirstOrDefault(v => v.PaymentTermCode == Credit && v.ChargeCode == variant.ChargeCode && v.BillTo == variant.BillTo);
+                        if (credit is null || !await StorageAsync(credit, Credit, paid.Sum(p => p.Amount), paidTo, later, billAs: null))
+                            await StorageAsync(variant, Cash, paid.Sum(p => p.Amount), paidTo, later, billAs: credit ?? variant);
+                        continue;
+                    }
+
+                    await StorageAsync(variant, Cash, paid.Sum(p => p.Amount), paidTo, lines, billAs: null);
+                }
+
+                // Prices one storage variant for the whole stay; false when the tariff has no rate for it.
+                // billAs: the variant the line is billed on (CREDIT), when priced at another term's rate.
+                async Task<bool> StorageAsync(ChargeVariantRef variant, string term, decimal alreadyPaid, DateOnly? paidTo,
+                    List<QuoteLine> into, ChargeVariantRef? billAs)
+                {
+                    var result = await pricing.PriceAsync(Request(plan, box, step, size, variant.ChargeCode, variant.BillTo, term,
                         terms.TruckCategoryCode, now, stayDays.Value, FreeTimeKinds.Storage, stay.FullEmptyIn), ct);
                     // Tiered storage is priced for the WHOLE stay, then what was paid
                     // before is taken off: a top-up must land on the right tier.
-                    var due = result.Outcome == PriceOutcomes.Priced ? (result.Amount ?? 0) - paid.Sum(p => p.Amount) : (decimal?)null;
+                    var due = result.Outcome == PriceOutcomes.Priced ? (result.Amount ?? 0) - alreadyPaid : (decimal?)null;
                     if (due is not > 0)
                     {
-                        tried.Add(new TriedVariant(variant.ChargeCode, variant.BillTo, Cash,
+                        tried.Add(new TriedVariant(variant.ChargeCode, variant.BillTo, term,
                             due is null ? PriceOutcomes.Unpriced : "PRICED_ZERO", due, result.PrecedenceTrail));
-                        continue;
+                        return due is not null;
                     }
 
                     var from = paidTo is { } p ? p.AddDays(1) : inDate;
                     // The receipt prints the days CHARGED: free days come off the first
                     // payment (32 in the yard, 7 free = 25); a top-up is all extra days.
                     var charged = paidTo is null ? result.ChargeableQuantity ?? stayDays.Value : until.Value.DayNumber - from.DayNumber + 1;
-                    tried.Add(new TriedVariant(variant.ChargeCode, variant.BillTo, Cash, PriceOutcomes.Priced, due, result.PrecedenceTrail));
-                    lines.Add(Line(QuoteLine.Storage, variant, PayerFor(plan, variant.BillTo),
-                        charged, result.UnitRate, due.Value, result, from, until));
+                    var trail = billAs is null ? result.PrecedenceTrail
+                        : [.. result.PrecedenceTrail, $"No {Credit} rate: the {term} price, billed on {Credit}."];
+                    tried.Add(new TriedVariant(variant.ChargeCode, variant.BillTo, term, PriceOutcomes.Priced, due, trail));
+                    var line = Line(QuoteLine.Storage, billAs ?? variant, PayerFor(plan, variant.BillTo),
+                        charged, result.UnitRate, due.Value, result, from, until);
+                    into.Add(billAs is null ? line : line with { PaymentTermCode = Credit });
+                    return true;
                 }
             }
         }

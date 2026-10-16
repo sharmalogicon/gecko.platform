@@ -711,6 +711,94 @@ internal static class TestDatabase
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>
+    /// Adds (or removes) ZZSTORE, an EMPTY storage charge of SCT (customer CASH and CREDIT variants, 7% VAT), priced by PUB-LCB
+    /// at ฿100 a day for WALK MTY OUT only, CASH rate only — as KORAKIT's S-110 on MTY OUT CUSTOMER. PUB-LCB gives an empty
+    /// box 5 free days. The fixture's own STORAGE charge is GENERAL (never quoted at the gate) and credit only.
+    /// </summary>
+    public static async Task EmptyStorageOnWalkMtyOutAsync(bool add)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            DELETE FROM gecko_revenue.tariff.rate_tier WHERE owner_id IN
+                (SELECT tos_rate_id FROM gecko_revenue.tariff.tos_rate WHERE tenant_id = @tenant AND charge_code = 'ZZSTORE');
+            DELETE FROM gecko_revenue.tariff.tos_rate WHERE tenant_id = @tenant AND charge_code = 'ZZSTORE';
+            DELETE FROM gecko_master.commercial.charge_code_variant WHERE charge_code_id IN
+                (SELECT charge_code_id FROM gecko_master.commercial.charge_code WHERE tenant_id = @tenant AND charge_code = 'ZZSTORE');
+            DELETE FROM gecko_master.commercial.charge_code WHERE tenant_id = @tenant AND charge_code = 'ZZSTORE';
+            IF @add = 1
+            BEGIN
+                DECLARE @cc UNIQUEIDENTIFIER = NEWID(), @rate UNIQUEIDENTIFIER = NEWID();
+                DECLARE @module VARCHAR(20), @tax UNIQUEIDENTIFIER;
+                SELECT @module = cc.module_code, @tax = v.tax_code_id
+                  FROM gecko_master.commercial.charge_code cc
+                  JOIN gecko_master.commercial.charge_code_variant v ON v.charge_code_id = cc.charge_code_id
+                 WHERE cc.tenant_id = @tenant AND cc.charge_code = 'GATETRIP' AND v.bill_to = 'CUSTOMER' AND v.payment_term_code = 'CASH';
+                DECLARE @ot UNIQUEIDENTIFIER = (SELECT order_type_id FROM gecko_master.commercial.order_type
+                                                WHERE tenant_id = @tenant AND order_type_code = 'WALK MTY OUT' AND deleted_at IS NULL);
+                DECLARE @pub UNIQUEIDENTIFIER = (SELECT schedule_id FROM gecko_revenue.tariff.schedule
+                                                 WHERE tenant_id = @tenant AND schedule_no = 'PUB-LCB' AND status = 'APPROVED' AND deleted_at IS NULL);
+                INSERT INTO gecko_master.commercial.charge_code
+                    (charge_code_id, tenant_id, charge_code, description_en, module_code, charge_type, charge_category, billing_unit_code, is_active)
+                VALUES (@cc, @tenant, 'ZZSTORE', 'Test empty storage', @module, 'STORAGE', 'EMPTY', 'PER_DAY', 1);
+                INSERT INTO gecko_master.commercial.charge_code_variant (tenant_id, charge_code_id, bill_to, payment_term_code, tax_code_id, is_active)
+                VALUES (@tenant, @cc, 'CUSTOMER', 'CASH', @tax, 1), (@tenant, @cc, 'CUSTOMER', 'CREDIT', @tax, 1);
+                INSERT INTO gecko_revenue.tariff.tos_rate (tos_rate_id, tenant_id, schedule_id, charge_code_id, charge_code, bill_to, payment_term_code,
+                                                           order_type_id, order_type_code, billing_unit_code, pricing_method, tier_basis, source)
+                VALUES (@rate, @tenant, @pub, @cc, 'ZZSTORE', 'CUSTOMER', 'CASH', @ot, 'WALK MTY OUT', 'PER_DAY', 'TIERED_INCREMENTAL', 'DAY', 'MANUAL');
+                INSERT INTO gecko_revenue.tariff.rate_tier (tenant_id, owner_type, owner_id, from_qty, to_qty, rate)
+                VALUES (@tenant, 'TOS_RATE', @rate, 1, NULL, 100);
+            END
+            """;
+        command.Parameters.AddWithValue("@tenant", Sct);
+        command.Parameters.AddWithValue("@add", add);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>Moves the arrival of a box's OPEN stay (Revenue's projection) back by whole days; returns the rows moved (0 until Revenue has it).</summary>
+    public static async Task<int> BackdateStayAsync(string containerNo, int days)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            UPDATE gecko_revenue.projection.container_stay SET in_at = DATEADD(DAY, -@days, in_at)
+             WHERE container_no = @box AND status = 'OPEN';
+            """;
+        command.Parameters.AddWithValue("@box", containerNo);
+        command.Parameters.AddWithValue("@days", days);
+        return await command.ExecuteNonQueryAsync();
+    }
+
+    public sealed record StorageChargeRow(string Source, string Status, string PaymentTermCode, decimal Quantity, decimal Amount, Guid? ContainerStayId);
+
+    /// <summary>Revenue's raised (not QUOTED) charges of one code on walk-in bookings tagged with this remarks tag (sysadmin read).</summary>
+    public static async Task<List<StorageChargeRow>> WalkInChargesAsync(string remarksTag, string chargeCode)
+    {
+        await using var connection = new SqlConnection(AdminConnection);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXEC sp_set_session_context @key = N'IsSystemContext', @value = 1;
+            SELECT c.source, c.status, c.payment_term_code, c.quantity, c.amount, c.container_stay_id
+            FROM gecko_revenue.billing.charge c
+            WHERE c.booking_id IN (SELECT booking_id FROM booking.booking WHERE remarks = @tag)
+              AND c.charge_code = @code AND c.source <> 'QUOTE';
+            """;
+        command.Parameters.AddWithValue("@tag", remarksTag);
+        command.Parameters.AddWithValue("@code", chargeCode);
+        var rows = new List<StorageChargeRow>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            rows.Add(new StorageChargeRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetDecimal(3),
+                reader.GetDecimal(4), reader.IsDBNull(5) ? null : reader.GetGuid(5)));
+        return rows;
+    }
+
     public static async Task UnpricedChargeOnImpCyCyAsync(string movementCode, bool add)
     {
         await using var connection = new SqlConnection(AdminConnection);

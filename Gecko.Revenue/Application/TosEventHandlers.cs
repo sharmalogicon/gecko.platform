@@ -360,7 +360,9 @@ internal sealed class GateEventHandler(
                                                && c.ChargeCode == line.ChargeCode && c.BillTo == line.BillTo && c.PaymentTermCode == line.PaymentTermCode, ct))
                 continue;   // uq_charge__gate: this gate move already raised it
 
-            var charge = CashQuoter.ChargeFrom(plan, box, gate.MovementCode, null, line, ChargeSource.Gate, ChargeStatus.Unbilled, now);
+            // Storage billed on credit (R2) names the stay it covers, as the cash one does.
+            var stayId = line.Kind == QuoteLine.Storage ? quote.Stay?.ContainerStayId : null;
+            var charge = CashQuoter.ChargeFrom(plan, box, gate.MovementCode, stayId, line, ChargeSource.Gate, ChargeStatus.Unbilled, now);
             charge.GateTransactionId = gate.GateTransactionId;
             charge.EirNo = gate.EirNo;
             charge.TruckVisitId = gate.TruckVisitId;

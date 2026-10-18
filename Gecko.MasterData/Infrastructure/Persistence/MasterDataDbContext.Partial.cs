@@ -14,10 +14,13 @@ namespace Gecko.MasterData.Infrastructure.Persistence;
 //
 // Re-scaffold (from Gecko.MasterData\):
 //   dotnet dotnet-ef dbcontext scaffold "Server=DESKTOP-6AQI384\APPIFY;Database=gecko_master;Integrated Security=true;TrustServerCertificate=true" Microsoft.EntityFrameworkCore.SqlServer --schema lookup --schema config --schema org --schema party --schema logistics --schema equipment --schema commercial --context MasterDataDbContext --context-dir Infrastructure/Persistence --output-dir Infrastructure/Persistence/Entities --namespace Gecko.MasterData.Infrastructure.Persistence.Entities --context-namespace Gecko.MasterData.Infrastructure.Persistence --no-onconfiguring --force
-public partial class MasterDataDbContext
+public partial class MasterDataDbContext : ITenantFilteredContext
 {
+    /// <summary>The tenant every query is also filtered on (Gecko.Data TenantFilter), read per query.</summary>
+    public Guid FilterTenantId => TenantFilter.For(this);
+
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
-        modelBuilder.ApplySoftDeleteFilters();
+        modelBuilder.ApplyHouseFilters(TenantFilter.IsTenantScoped(this) ? this : null);
     }
 }

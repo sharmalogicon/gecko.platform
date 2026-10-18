@@ -10,10 +10,13 @@ namespace Gecko.Tos.Infrastructure.Persistence;
 //
 // Re-scaffold (from Gecko.Tos\):
 //   dotnet dotnet-ef dbcontext scaffold "Server=DESKTOP-6AQI384\APPIFY;Database=gecko_tos;Integrated Security=true;TrustServerCertificate=true" Microsoft.EntityFrameworkCore.SqlServer --schema lookup --schema vessel --schema booking --schema yard --schema gate --context TosDbContext --context-dir Infrastructure/Persistence --output-dir Infrastructure/Persistence/Entities --namespace Gecko.Tos.Infrastructure.Persistence.Entities --context-namespace Gecko.Tos.Infrastructure.Persistence --no-onconfiguring --force
-public partial class TosDbContext
+public partial class TosDbContext : ITenantFilteredContext
 {
+    /// <summary>The tenant every query is also filtered on (Gecko.Data TenantFilter), read per query.</summary>
+    public Guid FilterTenantId => TenantFilter.For(this);
+
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
-        modelBuilder.ApplySoftDeleteFilters();
+        modelBuilder.ApplyHouseFilters(TenantFilter.IsTenantScoped(this) ? this : null);
     }
 }

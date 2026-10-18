@@ -27,6 +27,9 @@ public sealed class MissingTenantContextException()
 /// </summary>
 public sealed class TenantSessionInterceptor(ITenantContext tenant) : DbConnectionInterceptor
 {
+    /// <summary>The tenant this context's connections are scoped to — also the EF tenant filter's value (<see cref="TenantFilter"/>).</summary>
+    public Guid? TenantId => tenant.TenantId;
+
     public override InterceptionResult ConnectionOpening(
         DbConnection connection, ConnectionEventData eventData, InterceptionResult result)
     {

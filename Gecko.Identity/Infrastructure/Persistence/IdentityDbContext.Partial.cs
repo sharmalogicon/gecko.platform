@@ -9,8 +9,11 @@ namespace Gecko.Identity.Infrastructure.Persistence;
 //
 // Re-scaffold (from Gecko.Identity\):
 //   dotnet dotnet-ef dbcontext scaffold "Server=DESKTOP-6AQI384\APPIFY;Database=gecko_identity;Integrated Security=true;TrustServerCertificate=true" Microsoft.EntityFrameworkCore.SqlServer --schema lookup --schema tenant --schema iam --schema subscription --schema audit --context IdentityDbContext --context-dir Infrastructure/Persistence --output-dir Infrastructure/Persistence/Entities --namespace Gecko.Identity.Infrastructure.Persistence.Entities --context-namespace Gecko.Identity.Infrastructure.Persistence --no-onconfiguring --force
-public partial class IdentityDbContext
+public partial class IdentityDbContext : ITenantFilteredContext
 {
+    /// <summary>The tenant every query is also filtered on (Gecko.Data TenantFilter), read per query.</summary>
+    public Guid FilterTenantId => TenantFilter.For(this);
+
     /// <summary>For <see cref="IdentitySystemDbContext"/>, which needs its own options type.</summary>
     protected IdentityDbContext(DbContextOptions options) : base(options)
     {
@@ -18,7 +21,7 @@ public partial class IdentityDbContext
 
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
-        modelBuilder.ApplySoftDeleteFilters();
+        modelBuilder.ApplyHouseFilters(TenantFilter.IsTenantScoped(this) ? this : null);
     }
 }
 

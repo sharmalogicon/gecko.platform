@@ -74,6 +74,9 @@ internal static class ScheduleEndpoints
         var tariffs = revenue.MapGroup("/tariffs").WithTags("Revenue — tariffs");
 
         tariffs.MapGet("/", ListAsync).RequirePermission(RevenuePermissions.TariffView).WithSummary("List tariff versions, with their lifecycle today");
+        tariffs.MapGet("/coverage", TariffCoverageEndpoints.CoverageAsync).RequirePermission(RevenuePermissions.TariffView)
+            .WithSummary("For an order type's charges: what each box type would pay, and the box types no tariff prices")
+            .WithDescription("Asks the pricer itself (booking > contract > standard; type > size > any). customerCode prices as that customer's contract would; branchId as that depot; truckCategoryCode / cargoCategoryCode for rates keyed on them (a gate charge per truck category).");
         tariffs.MapGet("/{scheduleId:guid}", GetAsync).RequirePermission(RevenuePermissions.TariffView).WithName("GetTariff").WithSummary("Get one tariff version");
         tariffs.MapPost("/", CreateAsync).RequirePermission(RevenuePermissions.TariffManage).Validate<SaveScheduleRequest>().WithSummary("Create a new tariff (version 1, DRAFT)");
         tariffs.MapPut("/{scheduleId:guid}", UpdateAsync).RequirePermission(RevenuePermissions.TariffManage).Validate<SaveScheduleRequest>().WithSummary("Edit a DRAFT tariff's header");

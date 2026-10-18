@@ -74,6 +74,41 @@ public sealed class TariffApiTests(RevenueApiFactory api)
 
     // ── the fixture, as the API sees it ─────────────────────────────────────
 
+    /// <summary>Owner 2026-10-18: every charge of an order type, priced for every active box type, gaps listed.</summary>
+    [Fact]
+    public async Task Coverage_prices_every_box_type_for_each_charge_of_an_order_type_and_lists_the_gaps()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(RevenueApiFactory.SctAccounts);
+
+        Assert.Equal(HttpStatusCode.BadRequest, (await sct.GetAsync($"{Tariffs}/coverage", ct)).StatusCode);
+
+        // The fixture's import lift (LIN: LIFTIN, CREDIT, cargo GENERAL), as priced on 17 Sep for CUS-ESL.
+        var owner = await api.ClientForAsync(RevenueApiFactory.SctOwner);
+        var lcb = (await owner.GetFromJsonAsync<JsonElement>("/api/branches?pageSize=50", ct)).GetProperty("items").EnumerateArray()
+            .Single(b => b.GetProperty("branchCode").GetString() == "SCT-LCB01").GetProperty("branchId").GetGuid();
+        var coverage = (await sct.GetFromJsonAsync<TariffCoverageResponse>(
+            $"{Tariffs}/coverage?orderTypeCode=LIN&customerCode=CUS-ESL&agentCode=AGT-SEA&forwarderCode=FWD-GCB&paymentTermCode=CREDIT&cargoCategoryCode=GENERAL&branchId={lcb}&at=2026-09-17T03:00:00Z", ct))!;
+        Assert.NotEmpty(coverage.Rows);
+        var types = coverage.Rows[0].Priced.Count + coverage.Rows[0].Unpriced.Count;
+        Assert.True(types > 0);
+        Assert.All(coverage.Rows, r => Assert.Equal(types, r.Priced.Count + r.Unpriced.Count));   // every active type, once
+        Assert.Equal(coverage.Rows.Sum(r => r.Unpriced.Count), coverage.Gaps);
+
+        // What it says a box pays is what the pricer says.
+        var row = coverage.Rows.FirstOrDefault(r => r.Priced.Count > 0);
+        Assert.True(row is not null, JsonSerializer.Serialize(coverage.Rows.Select(r => new { r.ChargeCode, r.MovementCode, r.PaymentTermCode, r.Unpriced })));
+        var one = row.Priced[0];
+        var priced = await sct.PostAsJsonAsync("/api/revenue/price", new
+        {
+            moduleCode = "TOS", branchId = lcb, eventTime = "2026-09-17T03:00:00Z", chargeCode = row.ChargeCode, billTo = row.BillTo,
+            paymentTermCode = row.PaymentTermCode, customerPartyCode = "CUS-ESL", agentPartyCode = "AGT-SEA", forwarderPartyCode = "FWD-GCB", orderTypeCode = "LIN", movementCode = row.MovementCode,
+            equipmentTypeCode = one.EquipmentTypeCode, cargoCategoryCode = "GENERAL", quantity = 1,
+        }, ct);
+        var body = await priced.Content.ReadFromJsonAsync<JsonElement>(ct);
+        Assert.Equal(one.Amount, body.GetProperty("amount").GetDecimal());
+    }
+
     [Fact]
     public async Task The_list_reads_each_tariff_as_the_single_read_does()
     {

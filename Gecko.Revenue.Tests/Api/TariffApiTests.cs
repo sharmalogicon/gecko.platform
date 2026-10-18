@@ -75,6 +75,25 @@ public sealed class TariffApiTests(RevenueApiFactory api)
     // ── the fixture, as the API sees it ─────────────────────────────────────
 
     [Fact]
+    public async Task The_list_reads_each_tariff_as_the_single_read_does()
+    {
+        // The list batches "until / superseded" and rate counts per page; the single read
+        // still projects them per row. Both must say the same thing about every tariff.
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(RevenueApiFactory.SctAccounts);
+
+        var page = (await sct.GetFromJsonAsync<PagedResult<ScheduleResponse>>($"{Tariffs}?pageSize=200", ct))!;
+        Assert.NotEmpty(page.Items);
+        Assert.Contains(page.Items, s => s.RateCount > 0);
+        foreach (var listed in page.Items)
+        {
+            var single = await ReloadAsync(sct, listed.ScheduleId, ct);
+            Assert.Equal((single.ScheduleNo, single.VersionNo, single.EffectiveUntil, single.Lifecycle, single.RateCount),
+                (listed.ScheduleNo, listed.VersionNo, listed.EffectiveUntil, listed.Lifecycle, listed.RateCount));
+        }
+    }
+
+    [Fact]
     public async Task The_fixture_tariffs_read_back_with_their_lifecycle()
     {
         var ct = TestContext.Current.CancellationToken;

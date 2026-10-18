@@ -105,13 +105,30 @@ internal static class ScheduleEndpoints
         if (!string.IsNullOrWhiteSpace(query.Search))
             schedules = schedules.Where(s => s.ScheduleNo.Contains(query.Search) || s.Name.Contains(query.Search));
 
-        var page = await Project(db, schedules
-                .OrderBy(s => s.ScopeRank).ThenBy(s => s.ScheduleNo).ThenBy(s => s.VersionNo))
+        // Page the bare rows, then read the page's "until / superseded" and rate counts in one
+        // query each. Per-row subqueries re-ran the view's LEAD over every schedule for each row.
+        var page = await schedules
+            .OrderBy(s => s.ScopeRank).ThenBy(s => s.ScheduleNo).ThenBy(s => s.VersionNo)
             .ToPagedAsync(query.Page, query.PageSize, ct);
+        var ids = page.Items.Select(s => s.ScheduleId).ToList();
+        var effective = await db.VwScheduleEffectives.AsNoTracking()
+            .Where(e => ids.Contains(e.ScheduleId))
+            .Select(e => new { e.ScheduleId, e.EffectiveUntil, e.IsFullySuperseded })
+            .ToDictionaryAsync(e => e.ScheduleId, ct);
+        var rateCounts = await db.TosRates.AsNoTracking()
+            .Where(r => ids.Contains(r.ScheduleId))
+            .GroupBy(r => r.ScheduleId)
+            .Select(g => new { ScheduleId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(g => g.ScheduleId, g => g.Count, ct);
 
-        var today = await calendar.TodayForAsync(page.Items.Select(i => i.Row.BranchId), ct);
+        var today = await calendar.TodayForAsync(page.Items.Select(s => s.BranchId), ct);
         return TypedResults.Ok(new PagedResult<ScheduleResponse>(
-            page.Items.Select(i => Map(i, today(i.Row.BranchId))).ToList(), page.Page, page.PageSize, page.TotalCount));
+            page.Items.Select(s =>
+            {
+                var e = effective.GetValueOrDefault(s.ScheduleId);
+                var row = new ScheduleRow(s, e?.EffectiveUntil, e?.IsFullySuperseded == true, rateCounts.GetValueOrDefault(s.ScheduleId));
+                return Map(row, today(s.BranchId));
+            }).ToList(), page.Page, page.PageSize, page.TotalCount));
     }
 
     private static async Task<Results<Ok<ScheduleResponse>, NotFound>> GetAsync(

@@ -311,6 +311,89 @@ public sealed class WalkInApiTests(TosApiFactory api)
         }
     }
 
+    private static object NoNumberDropOff(string tag) => new
+    {
+        walkIn = new { fullEmpty = "EMPTY", customerCode = "CUS-TAE", lineCode = "MAEU", equipmentTypeCode = "20GP", remarks = tag },
+        move = new { direction = "IN", tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m },
+    };
+
+    /// <summary>
+    /// Owner 2026-10-18 (WALK_IN_NO_CONTAINER_NO_FOR_API, gecko_tos 31): a walk-in drop-off with no readable number is gated in
+    /// under a NOID number the gate issues — one each, kept on a retry, an ordinary box afterwards, renumbered to its real one.
+    /// </summary>
+    [Fact]
+    public async Task A_walk_in_box_with_no_number_is_given_one_and_renumbered_later()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var tag = NewTag();
+        var real = NewBox();
+        var minted = new List<string>();
+        try
+        {
+            var key = Guid.NewGuid().ToString();
+            object body = new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-6464" },
+                rows = new[] { NoNumberDropOff(tag), NoNumberDropOff(tag) },
+            };
+            var saved = await SavedAsync(client, key, body, ct);
+            Assert.All(saved.Rows, r => Assert.True(r is { Status: "GATED", ContainerNoWasMinted: true }, $"{r.ContainerNo} {r.Status}: {r.Reason}"));
+            minted.AddRange(saved.Rows.Select(r => r.ContainerNo));
+            Assert.All(minted, n => Assert.True(ContainerNumber.IsPlaceholder(n), n));
+            Assert.Equal(2, minted.Distinct().Count());                                   // one number each
+            Assert.Single(saved.Rows.Select(r => r.OrderNo).Distinct());                  // one walk-in booking for the truck
+
+            // A retry is the same answer: the same numbers, not new ones.
+            var again = await SavedAsync(client, key, body, ct);
+            Assert.Equal(minted, again.Rows.Select(r => r.ContainerNo));
+
+            // An ordinary box from here: offered to a walk-in pick-up; not put in the registry.
+            Assert.Contains(await WalkInBoxesAsync(client, "EMPTY", minted[0], ct), b => b.ContainerNo == minted[0]);
+            Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($"/api/master/containers/{minted[0]}", ct)).StatusCode);
+
+            // The real number later: the stay and the EIR move with it, and the real box is registered.
+            var renumbered = await client.PostAsJsonAsync($"/api/tos/containers/{minted[0]}/renumber",
+                new { newContainerNo = real, reason = "Plate cleaned: number readable" }, ct);
+            Assert.True(renumbered.StatusCode == HttpStatusCode.OK, await renumbered.Content.ReadAsStringAsync(ct));
+            var moved = (await renumbered.Content.ReadFromJsonAsync<RenumberContainerResponse>(ct))!;
+            Assert.True(moved.Moved["containerVisits"] == 1 && moved.Moved["gateTransactions"] == 1,
+                string.Join(", ", moved.Moved.Select(m => $"{m.Key}={m.Value}")));
+            Assert.Contains(await WalkInBoxesAsync(client, "EMPTY", real, ct), b => b.ContainerNo == real);
+            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/master/containers/{real}", ct)).StatusCode);
+        }
+        finally
+        {
+            await TestDatabase.RemoveWalkInAsync(tag);
+            await TestDatabase.RemoveBoxReservationsAsync([.. minted, real]);
+            await TestDatabase.RemoveRegistryAsync(real);
+        }
+    }
+
+    /// <summary>Only a walk-in drop-off may come with no number: a pick-up, a booked box and a blind row still name theirs.</summary>
+    [Fact]
+    public async Task Only_a_walk_in_drop_off_may_come_with_no_number()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var cases = new (string Name, object Row, string Field)[]
+        {
+            ("walk-in pick-up", new { walkIn = new { fullEmpty = "EMPTY", customerCode = "CUS-TAE" }, move = new { direction = "OUT", tripType = "PICK_UP_CONT" } }, "rows[0].move.containerNo"),
+            ("booked drop-off", new { bookingContainerId = Guid.NewGuid(), move = new { direction = "IN", tripType = "DROP_OFF_CONT" } }, "rows[0].move.ContainerNo"),
+            ("blind drop-off", new { blind = new { lineCode = "MAEU", customerCode = "CUS-TAE" }, move = new { direction = "IN", tripType = "DROP_OFF_CONT" } }, "rows[0].move.ContainerNo"),
+        };
+        foreach (var (name, row, field) in cases)
+        {
+            var response = await SaveAsync(client, Guid.NewGuid().ToString(), new
+            {
+                branchId = SctLcb01, draftId = Guid.NewGuid(), truck = new { plate = "70-6565" }, rows = new[] { row },
+            }, ct);
+            var text = await response.Content.ReadAsStringAsync(ct);
+            Assert.True(response.StatusCode == HttpStatusCode.BadRequest, $"{name}: {(int)response.StatusCode} {text}");
+            Assert.Contains(field, text, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     [Fact]
     public async Task A_walk_in_row_names_its_load_and_customer()
     {

@@ -592,6 +592,8 @@ internal static class GateEndpoints
     /// </summary>
     internal static async Task RegisterAsync(IMasterDataReferences master, string containerNo, string? typeCode, string? lineCode, CancellationToken ct)
     {
+        // A number the gate issued is not a box's identity (owner 2026-10-18): the registry gets the real one at renumber.
+        if (ContainerNumber.IsPlaceholder(containerNo)) return;
         try { await master.EnsureRegisteredAsync([new UnregisteredBox(containerNo, typeCode, lineCode)], ct); }
         catch (Exception e) when (e is not OperationCanceledException) { }
     }

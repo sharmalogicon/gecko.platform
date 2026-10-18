@@ -199,8 +199,18 @@ internal static class ContainerMasterEndpoints
         if (visit is not null) AddEvent(db, visit, "RENUMBERED", from, to, reason, now, caller);
         await db.SaveChangesAsync(ct);
 
-        // Base64: case matters, so trimmed only (Clean() upper-cases).
-        var done = await registry.RenumberAsync(from, to, reason, string.IsNullOrWhiteSpace(request.RowVersion) ? null : request.RowVersion.Trim(), ct);
+        ContainerRenumberResult done;
+        if (ContainerNumber.IsPlaceholder(from))
+        {
+            // A NOID number the gate issued (owner 2026-10-18) was never registered: nothing to rename there. The real number is
+            // registered as the gate would have (it may be known already, from an earlier stay), and Revenue moves its rows.
+            await GateEndpoints.RegisterAsync(master, to, visit?.EquipmentTypeCode, visit?.LinePartyCode, ct);
+            var real = (await master.ContainersAsync([to], ct)).GetValueOrDefault(to);
+            done = new ContainerRenumberResult(ContainerRenumberOutcome.Renumbered, real?.ContainerId ?? visit?.ContainerVisitId ?? Guid.NewGuid());
+        }
+        else
+            // Base64: case matters, so trimmed only (Clean() upper-cases).
+            done = await registry.RenumberAsync(from, to, reason, string.IsNullOrWhiteSpace(request.RowVersion) ? null : request.RowVersion.Trim(), ct);
         switch (done.Outcome)
         {
             case ContainerRenumberOutcome.NotFound: return TypedResults.NotFound();

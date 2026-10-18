@@ -27,6 +27,9 @@ public partial class TripSave
 
     public string? ResultJson { get; set; }
 
+    /// <summary>gecko_tos 31: the NOID numbers this Save issued to walk-in boxes with none, by row ({"0":"NOID0000001"}).</summary>
+    public string? MintedContainerNos { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 
     public Guid? CreatedBy { get; set; }

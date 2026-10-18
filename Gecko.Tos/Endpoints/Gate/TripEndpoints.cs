@@ -88,7 +88,8 @@ internal static class TripEndpoints
 
         // ── the rows ────────────────────────────────────────────────────────
         var errors = new Dictionary<string, List<string>>();
-        var rows = request.Rows!;
+        // A copy: a walk-in drop-off keyed with no number takes the one the gate issues (step 0b) before anything else reads it.
+        var rows = request.Rows!.ToList();
         for (var i = 0; i < rows.Count; i++)
         {
             var row = rows[i];
@@ -99,8 +100,9 @@ internal static class TripEndpoints
             var move = Move(row, request, null);
             var emptyPickup = request.TruckVisitId is null && row.Move.Direction == GateRules.Out && row.BookingContainerId is not null
                               && string.IsNullOrWhiteSpace(row.Move.ContainerNo);   // the yard chooses the box; it is keyed at gate out
+            var unnumbered = IsUnnumberedDropOff(row);   // owner 2026-10-18: the gate issues it a NOID number
             if (!Validator.TryValidateObject(move, new ValidationContext(move), invalid, validateAllProperties: true))
-                foreach (var v in invalid.Where(v => !(emptyPickup && v.MemberNames.Contains(nameof(GateTransactionRequest.ContainerNo)))))
+                foreach (var v in invalid.Where(v => !((emptyPickup || unnumbered) && v.MemberNames.Contains(nameof(GateTransactionRequest.ContainerNo)))))
                     errors.Add($"rows[{i}].move.{string.Join(",", v.MemberNames)}", v.ErrorMessage ?? "Invalid.");
             if (row.Blind is { } blind && !string.Equals(ContainerNumber.Normalise(blind.ContainerNo ?? ""), ContainerNumber.Normalise(row.Move.ContainerNo ?? ""), StringComparison.Ordinal))
                 errors.Add($"rows[{i}].blind.containerNo", "The blind order and the move must name the same box.");
@@ -217,6 +219,39 @@ internal static class TripEndpoints
         {
             await UndoAsync("Gate Save stopped before payment.");
             return answer;
+        }
+
+        // ── 0b. a walk-in drop-off with no number (owner 2026-10-18, gecko_tos 31): the gate issues NOID + 7 digits ──
+        // Kept on the Save by row, so a resumed Save reuses the number its walk-in order was raised with instead of issuing another.
+        var minted = new Dictionary<int, string>();
+        if (Enumerable.Range(0, rows.Count).Any(i => IsUnnumberedDropOff(rows[i])))
+        {
+            var issued = save.MintedContainerNos is { } kept ? JsonSerializer.Deserialize<Dictionary<int, string>>(kept) ?? [] : [];
+            var branchCode = (await clock.BranchesAsync([branchId], ct)).GetValueOrDefault(branchId)?.BranchCode;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (!IsUnnumberedDropOff(rows[i])) continue;
+                string number;
+                if (issued.TryGetValue(i, out var earlier) && ContainerNumber.IsPlaceholder(earlier)) number = earlier;
+                else
+                {
+                    try { number = await TosNumberSeries.NextAsync(db, TosNumberSeries.NoIdBox, branchId, branchCode ?? "", time.GetUtcNow(), ct); }
+                    catch (Microsoft.Data.SqlClient.SqlException e) when (e.Number == 50020)
+                    {
+                        return await StopAsync(TosSupport.Conflict("This depot has no number series for a box with no number (NO_ID_BOX).",
+                            "Key the box's number, or ask an administrator to set the series up (gecko_tos 31)."));
+                    }
+                }
+                minted[i] = number;
+                rows[i] = rows[i] with { Move = rows[i].Move! with { ContainerNo = number } };
+                if (walkIn[i] is { } w) walkIn[i] = w with { ContainerNo = number };
+            }
+            if (!minted.OrderBy(m => m.Key).SequenceEqual(issued.OrderBy(m => m.Key)))
+            {
+                save.MintedContainerNos = JsonSerializer.Serialize(minted);
+                save.UpdatedAt = time.GetUtcNow();
+                await db.SaveChangesAsync(ct);
+            }
         }
 
         // ── 1a. a box keyed on an EMPTY booking place: written onto it, or onto the next free place like it ──
@@ -519,13 +554,14 @@ internal static class TripEndpoints
                 }
                 results[i] = new TripRowResponse(i, eir.ContainerNo, lines[i].BookingContainerId, eir.OrderNo, "GATED",
                     eir.EirNo, eir.GateTransactionId, $"/api/tos/gate/transactions/{eir.GateTransactionId}/eir.pdf", coupon, null,
-                    said, surveyId, holds);
+                    said, surveyId, holds, ContainerNoWasMinted: minted.ContainsKey(i));
             }
             else
             {
                 var (reason, findings) = Why(recorded.Result);
                 results[i] = new TripRowResponse(i, lines[i].ContainerNo, lines[i].BookingContainerId, lines[i].OrderNo, "NOT_GATED",
-                    null, null, null, coupon, reason, switched.GetValueOrDefault(i) is { } moved ? [.. findings, moved] : findings);
+                    null, null, null, coupon, reason, switched.GetValueOrDefault(i) is { } moved ? [.. findings, moved] : findings,
+                    ContainerNoWasMinted: minted.ContainsKey(i));
             }
         }
 
@@ -683,6 +719,15 @@ internal static class TripEndpoints
     private sealed record WalkInRow(OrderTypePlanRef Plan, string CustomerCode, string LineCode, string EquipmentTypeCode, string ContainerNo, string Direction);
 
     /// <summary>
+    /// A walk-in drop-off keyed with no number (owner 2026-10-18): the gate issues it one (NOID, step 0b). Only a walk-in IN —
+    /// a pick-up collects a box in the yard, a booked box is on its booking, a blind row names its box.
+    /// </summary>
+    private static bool IsUnnumberedDropOff(TripRowRequest row) =>
+        row.WalkIn is not null && row.BookingContainerId is null && row.Blind is null && row.Move is { } move
+        && string.Equals(move.Direction?.Trim(), GateRules.In, StringComparison.OrdinalIgnoreCase)
+        && string.IsNullOrWhiteSpace(move.ContainerNo);
+
+    /// <summary>
     /// Each walk-in row's walk-in order type (by the move's direction and the clerk's Empty / Full), customer, and the box's
     /// line and type: a drop-off's as keyed, else the registry's; a pick-up's from the yard. R5: a walk-in order type's cap
     /// on boxes per truck. Problems go into <paramref name="errors"/> under the row; a row with one is null.
@@ -705,7 +750,9 @@ internal static class TripEndpoints
             var number = ContainerNumber.Normalise(move.ContainerNo ?? "");
             var way = move.Direction.Clean()?.ToUpperInvariant();
             var load = w.FullEmpty.Clean()?.ToUpperInvariant();
-            if (number.Length == 0) { errors.Add($"rows[{i}].move.containerNo", "A walk-in truck's box is named at the gate: key its number."); continue; }
+            // A drop-off may come with no number (the gate issues one, step 0b); a pick-up names a box in the yard.
+            if (number.Length == 0 && !IsUnnumberedDropOff(rows[i])) { errors.Add($"rows[{i}].move.containerNo", "A walk-in pick-up names the box it collects: key its number."); continue; }
+            var label = number.Length > 0 ? number : "A box with no number";
             if (load is not (GateRules.Full or GateRules.Empty)) { errors.Add($"{at}.fullEmpty", "EMPTY or FULL: what the truck drops off or picks up."); continue; }
             if (way is not (GateRules.In or GateRules.Out)) continue;   // the move's own validation says so
             var plan = offered.FirstOrDefault(p => p.WalkInStep!.Direction == way && p.WalkInStep.FullEmpty == load);
@@ -716,14 +763,14 @@ internal static class TripEndpoints
             }
             if (w.CustomerCode.Clean()?.ToUpperInvariant() is not { } customer) { errors.Add($"{at}.customerCode", "Whose truck is it? A walk-in order is made out to the customer."); continue; }
 
-            var known = registry.GetValueOrDefault(number);
-            var standing = yard.FirstOrDefault(v => v.ContainerNo == number);
+            var known = number.Length == 0 ? null : registry.GetValueOrDefault(number);
+            var standing = number.Length == 0 ? null : yard.FirstOrDefault(v => v.ContainerNo == number);
             if (way == GateRules.Out && standing is null) { errors.Add($"rows[{i}].move.containerNo", $"{number} is not in the yard at this depot."); continue; }
             var type = way == GateRules.Out ? standing!.EquipmentTypeCode ?? known?.EquipmentTypeCode
                 : w.EquipmentTypeCode.Clean()?.ToUpperInvariant() ?? known?.EquipmentTypeCode;
             var line = way == GateRules.Out ? standing!.LinePartyCode : w.LineCode.Clean()?.ToUpperInvariant() ?? known?.OwnerPartyCode;
-            if (type is null) errors.Add($"{at}.equipmentTypeCode", $"{number} is not in the registry: say what type of box it is.");
-            if (line is null) errors.Add($"{at}.lineCode", $"Whose box is {number}? Name its line: the registry has no owner for it.");
+            if (type is null) errors.Add($"{at}.equipmentTypeCode", number.Length == 0 ? $"{label}: say what type of box it is." : $"{number} is not in the registry: say what type of box it is.");
+            if (line is null) errors.Add($"{at}.lineCode", number.Length == 0 ? $"{label}: name its line." : $"Whose box is {number}? Name its line: the registry has no owner for it.");
             if (type is null || line is null) continue;
             resolved[i] = new WalkInRow(plan, customer, line, type, number, way);
         }

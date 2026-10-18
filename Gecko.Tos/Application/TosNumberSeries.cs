@@ -21,6 +21,9 @@ internal static class TosNumberSeries
     public const string TruckVisit = "TRUCK_VISIT";
     public const string GatePass = "GATE_PASS";
 
+    /// <summary>NOID + 7 digits for a walk-in box with no number (gecko_tos 31): tenant-wide, never reset, not gap-free.</summary>
+    public const string NoIdBox = "NO_ID_BOX";
+
     /// <param name="at">Branch-local "now" — the number's YYMM is the depot's month.</param>
     public static async Task<string> NextAsync(TosDbContext db, string seriesKey, Guid branchId, string branchCode,
         DateTimeOffset at, CancellationToken ct)

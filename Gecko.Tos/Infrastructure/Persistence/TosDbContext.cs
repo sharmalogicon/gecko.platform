@@ -2085,6 +2085,9 @@ public partial class TosDbContext : DbContext
                 .IsUnicode(false)
                 .HasColumnName("receipt_no");
             entity.Property(e => e.ResultJson).HasColumnName("result_json");
+            entity.Property(e => e.MintedContainerNos)
+                .HasMaxLength(400)
+                .HasColumnName("minted_container_nos");
             entity.Property(e => e.RowVersion)
                 .IsRowVersion()
                 .IsConcurrencyToken()

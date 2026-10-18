@@ -104,7 +104,8 @@ public static class GateRules
     /// <summary>Q6: 13 of Vector's 194K boxes fail the digit and still arrive. Allowed, never anonymously.</summary>
     /// <remarks>Owner 2026-10-08: a depot that does not enforce it hears nothing about it — no note at all.</remarks>
     public static GateFinding? CheckDigit(string containerNo, bool isValid, bool enforced, int? expected) =>
-        isValid || !enforced
+        // A number the gate issued (NOID, owner 2026-10-18) has no ISO check digit to fail.
+        isValid || !enforced || Gecko.SharedKernel.ContainerNumber.IsPlaceholder(containerNo)
             ? null
             : new GateFinding(
                 "CHECK_DIGIT",

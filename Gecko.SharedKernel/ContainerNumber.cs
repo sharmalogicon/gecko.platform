@@ -43,6 +43,19 @@ public static partial class ContainerNumber
     public static bool IsIsoFormed(string? containerNo) =>
         !string.IsNullOrWhiteSpace(containerNo) && IsoFormed.IsMatch(containerNo);
 
+    /// <summary>
+    /// The number the gate gives a walk-in box that arrives without one (gecko_tos 31, owner 2026-10-18): NOID + 7 digits.
+    /// NOID is no ISO owner code + category, so no stencilled box carries it. Not registered; renumbered when the real one is known.
+    /// </summary>
+    public const string PlaceholderPrefix = "NOID";
+
+    [GeneratedRegex("^NOID[0-9]{7}$")]
+    private static partial Regex PlaceholderFormed { get; }
+
+    /// <summary>True for a number the gate issued (<see cref="PlaceholderPrefix"/>), not one read off a box.</summary>
+    public static bool IsPlaceholder(string? containerNo) =>
+        !string.IsNullOrWhiteSpace(containerNo) && PlaceholderFormed.IsMatch(containerNo);
+
     /// <summary>Normalises what a human or an OCR camera produced: trim, strip spaces and dashes, upper-case.</summary>
     public static string Normalise(string containerNo) =>
         containerNo.Replace(" ", "").Replace("-", "").Trim().ToUpperInvariant();

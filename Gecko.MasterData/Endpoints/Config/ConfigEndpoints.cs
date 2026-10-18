@@ -459,7 +459,7 @@ internal static class ConfigEndpoints
 
     // ── number series ───────────────────────────────────────────────────────
 
-    private static readonly HashSet<string> TosOwnedSeriesKeys = ["BOOKING", "EIR", "TRUCK_VISIT", "GATE_PASS"];
+    private static readonly HashSet<string> TosOwnedSeriesKeys = ["BOOKING", "EIR", "TRUCK_VISIT", "GATE_PASS", "NO_ID_BOX"];
 
     private static async Task<Ok<IReadOnlyList<NumberSeriesResponse>>> ListSeriesAsync(
         MasterDataDbContext db, CancellationToken ct, bool includeInactive = false)

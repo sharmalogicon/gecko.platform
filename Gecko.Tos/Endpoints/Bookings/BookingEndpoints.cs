@@ -1269,12 +1269,14 @@ internal static class BookingEndpoints
 
                 digitOk = ContainerNumber.IsValid(no);
                 // Owner 2026-10-08: no ISO check at all — unless the depot sets gate.enforce_check_digit.
-                if (!digitOk && enforceDigit)
+                // A NOID number the gate issued (owner 2026-10-18) is neither ISO nor registered, by design.
+                var placeholder = ContainerNumber.IsPlaceholder(no);
+                if (!digitOk && enforceDigit && !placeholder)
                     errors.Add($"{key}.containerNo",
                         $"{no} fails the ISO 6346 check digit (expected {ContainerNumber.CheckDigitOf(no)}). Check the number — a misread box is a box released to the wrong truck.");
 
                 known = registry.GetValueOrDefault(no);
-                if (known is null && !allowUnknown)
+                if (known is null && !allowUnknown && !placeholder)
                     errors.Add($"{key}.containerNo", $"{no} is not in the container registry, and this depot does not accept unknown boxes.");
 
                 if (activeElsewhere.FirstOrDefault(a => a.ContainerNo == no) is { } other)

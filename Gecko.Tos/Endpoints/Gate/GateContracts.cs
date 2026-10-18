@@ -336,7 +336,9 @@ public sealed record TripRowResponse(
     IReadOnlyList<GateFindingResponse> Findings,
     Guid? SurveyId = null, IReadOnlyList<string>? HoldsApplied = null,
     // owner 2026-10-06: a pick-up at gate in is PLANNED on the truck's visit (no EIR); gate out releases it.
-    Guid? VisitPickupId = null);
+    Guid? VisitPickupId = null,
+    // owner 2026-10-18 (gecko_tos 31): the walk-in box came with no number; ContainerNo is the NOID one the gate issued.
+    bool ContainerNoWasMinted = false);
 
 public sealed record VoidGateTransactionRequest(
     [property: Required, MinLength(3), MaxLength(300)] string Reason,

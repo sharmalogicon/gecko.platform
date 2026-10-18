@@ -82,6 +82,7 @@ public sealed class TariffApiTests(RevenueApiFactory api)
         var sct = await api.ClientForAsync(RevenueApiFactory.SctAccounts);
 
         Assert.Equal(HttpStatusCode.BadRequest, (await sct.GetAsync($"{Tariffs}/coverage", ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await sct.GetAsync($"{Tariffs}/coverage?orderTypeCode=LIN", ct)).StatusCode);   // no depot
 
         // The fixture's import lift (LIN: LIFTIN, CREDIT, cargo GENERAL), as priced on 17 Sep for CUS-ESL.
         var owner = await api.ClientForAsync(RevenueApiFactory.SctOwner);

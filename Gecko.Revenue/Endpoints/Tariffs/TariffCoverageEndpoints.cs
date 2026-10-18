@@ -31,6 +31,8 @@ internal static class TariffCoverageEndpoints
     {
         var orderType = orderTypeCode?.Trim().ToUpperInvariant();
         if (string.IsNullOrEmpty(orderType)) return RevenueSupport.Invalid("orderTypeCode", "Which order type? Its code.");
+        // A depot's own tariffs (the standard one is usually branch-scoped) only apply with the branch named.
+        if (branchId is null) return RevenueSupport.Invalid("branchId", "Which depot? Its tariffs apply only there.");
         var customer = string.IsNullOrWhiteSpace(customerCode) ? null : customerCode.Trim().ToUpperInvariant();
         var defaultTerm = string.IsNullOrWhiteSpace(paymentTermCode) ? null : paymentTermCode.Trim().ToUpperInvariant();
         var when = at ?? time.GetUtcNow();

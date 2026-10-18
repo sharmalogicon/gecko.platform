@@ -675,6 +675,14 @@ public sealed class GateChargingFlowTests(TosApiFactory api)
             var after = await StatementLinesAsync(client, orderNo, ct);
             Assert.Equal("INVOICED", after.Single(c => c.ChargeId == lift.ChargeId).Status);
             Assert.Equal("QUOTED", after.Single(c => c.ChargeId == fee.ChargeId).Status);
+            // The statement names the invoice on the credit line, as it names the receipt on a cash one, and lists the invoice.
+            var statement = (await client.GetFromJsonAsync<Gecko.Revenue.Endpoints.Charges.BookingStatementResponse>(
+                $"/api/revenue/charges/statement?orderNo={Uri.EscapeDataString(orderNo)}", ct))!;
+            var billed = statement.Boxes.SelectMany(b => b.Lines).Single(l => l.Charge.ChargeId == lift.ChargeId);
+            Assert.Equal(((Guid?)invoice.InvoiceId, invoice.InvoiceNo, (string?)null), (billed.InvoiceId, billed.InvoiceNo, billed.ReceiptNo));
+            Assert.Null(statement.Boxes.SelectMany(b => b.Lines).Single(l => l.Charge.ChargeId == fee.ChargeId).InvoiceNo);
+            var listed = Assert.Single(statement.Invoices!);
+            Assert.Equal((invoice.InvoiceNo, "CREDIT", 321.00m, 1), (listed.InvoiceNo, listed.InvoiceType, listed.Total, listed.Lines));
             Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync($"{Invoices}/send", new { chargeIds = new[] { lift.ChargeId }, paymentTermCode = "CREDIT" }, ct)).StatusCode);
 
             // The box leaves: the gate does not bill the invoiced lift a second time.

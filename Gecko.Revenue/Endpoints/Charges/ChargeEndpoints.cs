@@ -520,6 +520,26 @@ internal static class ChargeEndpoints
             .OrderBy(r => r.ReceiptAt).ToListAsync(ct);
         var receiptNo = receipts.ToDictionary(r => r.ReceiptId, r => r.ReceiptNo);
 
+        // The credit side, as the cash side names its receipt (web.tos 2026-10-19): the invoices with a line of this
+        // booking, and for each charge the invoice whose line carries it (the latest, should one ever be re-invoiced).
+        var branches = scope.BranchesFor(RevenuePermissions.ChargeView)?.ToList();
+        var invoices = await db.Invoices.AsNoTracking()
+            .Where(i => db.InvoiceLines.Any(l => l.InvoiceId == i.InvoiceId && l.BookingId == plan.BookingId)
+                        && (branches == null || branches.Contains(i.BranchId)))
+            .OrderBy(i => i.IssuedAt).ThenBy(i => i.InvoiceNo)
+            .Select(i => new InvoiceSummaryResponse(i.InvoiceId, i.InvoiceNo, i.BranchId, i.InvoiceType, i.Status, i.PaymentTermCode,
+                i.BillTo, i.PayerPartyCode, i.PayerName, i.CurrencyCode, i.SubtotalAmount, i.TaxAmount, i.TotalAmount,
+                db.InvoiceLines.Count(l => l.InvoiceId == i.InvoiceId), i.IssuedAt, i.Remarks))
+            .ToListAsync(ct);
+        var invoiceById = invoices.ToDictionary(i => i.InvoiceId);
+        var invoiceOf = (await db.InvoiceLines.AsNoTracking()
+                .Where(l => l.BookingId == plan.BookingId)
+                .Select(l => new { l.ChargeId, l.InvoiceId })
+                .ToListAsync(ct))
+            .Where(l => invoiceById.ContainsKey(l.InvoiceId))
+            .GroupBy(l => l.ChargeId)
+            .ToDictionary(g => g.Key, g => g.Select(l => invoiceById[l.InvoiceId]).MaxBy(i => i.IssuedAt)!);
+
         var names = await PayerNamesAsync(master, lines.Select(c => c.PayerPartyCode).Append(plan.CustomerPartyCode), ct);
         var types = await ChargeTypesAsync(master, lines.Select(c => c.ChargeCode), ct);
 
@@ -540,9 +560,10 @@ internal static class ChargeEndpoints
         StatementLineResponse Line(Charge c)
         {
             var type = c.BookingContainerId is { } id ? boxType.GetValueOrDefault(id) : null;
+            var invoice = invoiceOf.GetValueOrDefault(c.ChargeId);
             return new(ToResponse(c, names, types) with
                 { EquipmentTypeCode = type, EquipmentSize = type is null ? null : sizes.GetValueOrDefault(type)?.SizeCode },
-            c.ReceiptId is { } rid ? receiptNo.GetValueOrDefault(rid) : null);
+            c.ReceiptId is { } rid ? receiptNo.GetValueOrDefault(rid) : null, invoice?.InvoiceId, invoice?.InvoiceNo);
         }
 
         var known = boxes.Select(b => b.BookingContainerId).ToHashSet();
@@ -570,7 +591,7 @@ internal static class ChargeEndpoints
                 r.VoidedAt, r.VoidReason,
                 r.ReplacesReceiptId is { } rep ? receiptNo.GetValueOrDefault(rep) : null,
                 replacedBy.GetValueOrDefault(r.ReceiptId))).ToList(),
-            Totals(lines), header?.CarrierRef, header?.SubBlNo));
+            Totals(lines), header?.CarrierRef, header?.SubBlNo, invoices));
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -699,8 +720,8 @@ public sealed record UnbilledPayerResponse(
 public sealed record StatementTotals(decimal Paid, decimal Waived, decimal Unbilled, decimal Invoiced, decimal Cancelled,
     decimal ExpectedCash = 0, decimal ExpectedCredit = 0, int NoPrice = 0);
 
-/// <summary>A charge line, and the number of the receipt that paid it (a voided one included).</summary>
-public sealed record StatementLineResponse(ChargeResponse Charge, string? ReceiptNo);
+/// <summary>A charge line, and the number of the receipt that paid it (a voided one included) or of the invoice that billed it.</summary>
+public sealed record StatementLineResponse(ChargeResponse Charge, string? ReceiptNo, Guid? InvoiceId = null, string? InvoiceNo = null);
 
 /// <summary><c>BookingContainerId</c> null = lines whose box Revenue does not know on this booking.</summary>
 public sealed record StatementBoxResponse(
@@ -721,7 +742,9 @@ public sealed record BookingStatementResponse(
     string? CustomerCode, string? CustomerName,
     IReadOnlyList<StatementBoxResponse> Boxes, IReadOnlyList<StatementReceiptResponse> Receipts, StatementTotals Totals,
     // The numbers the customer quotes for the booking (2026-10-08): the header leads with them, OrderNo behind.
-    string? CarrierRef = null, string? SubBlNo = null);
+    string? CarrierRef = null, string? SubBlNo = null,
+    // The invoices with a line of this booking, oldest first — the credit side's documents, as Receipts are the cash side's.
+    IReadOnlyList<InvoiceSummaryResponse>? Invoices = null);
 
 /// <summary>Totals add across currencies only when there is one; the page shows them per payer.</summary>
 public sealed record UnbilledResponse(

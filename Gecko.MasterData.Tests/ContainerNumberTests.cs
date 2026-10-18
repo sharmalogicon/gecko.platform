@@ -47,15 +47,33 @@ public sealed class ContainerNumberTests
         Assert.False(ContainerNumber.IsValid(containerNo));       // the number is not
     }
 
+    /// <summary>
+    /// Owner 2026-10-08: no ISO checks on entry — some real boxes do not follow ISO 6346
+    /// (TMSKORAKIT: ANVY6399011, PLD9256601, RBI051, 4043535). Any 4–11 letters or digits is
+    /// accepted; it is simply not an ISO number, so it has no check digit to pass.
+    /// </summary>
+    [Theory]
+    [InlineData("CSQ3054383")]     // three owner letters
+    [InlineData("CSQUA054383")]    // letter in the serial
+    [InlineData("CSQX3054383")]    // X is not an ISO equipment category (U, J, Z only)
+    [InlineData("CSQU305438")]     // ten characters
+    [InlineData("PLD9256601")]
+    [InlineData("RBI051")]
+    [InlineData("4043535")]
+    public void Non_iso_numbers_are_accepted_but_not_iso_valid(string containerNo)
+    {
+        Assert.True(ContainerNumber.IsWellFormed(containerNo));
+        Assert.False(ContainerNumber.IsIsoFormed(containerNo));
+        Assert.False(ContainerNumber.IsValid(containerNo));
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
     [InlineData("   ")]
-    [InlineData("CSQ3054383")]     // only two owner letters
-    [InlineData("CSQUA054383")]    // letter in the serial
-    [InlineData("CSQX3054383")]    // X is not a valid equipment category (U, J, Z only)
-    [InlineData("CSQU305438")]     // too short
-    [InlineData("CSQU30543833")]   // too long
+    [InlineData("ABC")]            // fewer than 4 characters
+    [InlineData("CSQU30543833")]   // more than 11
+    [InlineData("CSQU-3054383")]   // punctuation (Normalise strips it first)
     public void Malformed_numbers_are_rejected(string? containerNo)
     {
         Assert.False(ContainerNumber.IsWellFormed(containerNo));

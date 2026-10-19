@@ -129,4 +129,50 @@ public sealed class UnbilledOrdersApiTests(TosApiFactory api)
             await TestDatabase.RemoveBookingsAsync(carrierRef);
         }
     }
+
+    /// <summary>
+    /// Owner 2026-10-19: a booking's credit prices are on the worklist as soon as the booking is priced — a box
+    /// that has not moved yet shows its QUOTED credit line (billable in advance), and adding a box adds its line.
+    /// </summary>
+    [Fact]
+    public async Task A_booked_boxs_credit_line_is_listed_before_it_moves_and_an_added_box_adds_one()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var client = await api.ClientForAsync(TosApiFactory.SctOwner);
+        var carrierRef = $"ZZQ-{Guid.NewGuid():N}"[..16].ToUpperInvariant();
+        try
+        {
+            var created = await client.PostAsJsonAsync("/api/tos/bookings", new
+            {
+                branchId = SctLcb01, orderTypeCode = "GATE TEST", lineCode = "MAEU", customerCode = "CUS-TAE", carrierRef,
+                validTo = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)),
+                requirements = new object[] { new { equipmentTypeCode = "20GP", qty = 2 } },
+                containers = new object[] { new { containerNo = NewBox() } },
+            }, ct);
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            var booking = (await created.Content.ReadFromJsonAsync<BookingDetailResponse>(ct))!.Booking;
+
+            string Lines() => $"{Unbilled}/lines?branchId={SctLcb01}&orderNo={booking.OrderNo}";
+            var first = await EventuallyAsync(async () => (await client.GetFromJsonAsync<List<UnbilledLineResponse>>(Lines(), ct))!,
+                l => l.Any(x => x.ChargeCode == "LIFTCR"), "the booked box's quoted credit line", ct);
+            var lift = Assert.Single(first, l => l.ChargeCode == "LIFTCR");
+            Assert.Equal(("QUOTED", "CREDIT", 300m), (lift.Status, lift.PaymentTermCode, lift.Amount));
+            Assert.All(first, l => Assert.Equal("CREDIT", l.PaymentTermCode));   // cash is paid at the window, not here
+
+            var page = (await client.GetFromJsonAsync<UnbilledOrdersPage>($"{Unbilled}/orders?branchId={SctLcb01}&carrierRef={carrierRef}", ct))!;
+            var order = Assert.Single(page.Items);
+            Assert.Equal(first.Sum(l => l.Total), order.Total);
+
+            // A second box added to the booking brings its own line.
+            var added = await client.PostAsJsonAsync($"/api/tos/bookings/{booking.BookingId}/containers",
+                new { containers = new object[] { new { containerNo = NewBox() } } }, ct);
+            Assert.True(added.IsSuccessStatusCode, $"add box returned {(int)added.StatusCode}: {await added.Content.ReadAsStringAsync(ct)}");
+            await EventuallyAsync(async () => (await client.GetFromJsonAsync<List<UnbilledLineResponse>>(Lines(), ct))!,
+                l => l.Count(x => x.ChargeCode == "LIFTCR") == 2, "the added box's quoted credit line", ct);
+        }
+        finally
+        {
+            await TestDatabase.RemoveBookingsAsync(carrierRef);
+        }
+    }
 }

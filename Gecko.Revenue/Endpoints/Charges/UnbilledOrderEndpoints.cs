@@ -33,6 +33,7 @@ internal static class UnbilledOrderEndpoints
     public static readonly string[] Progresses = ["ALL", "COMPLETED", "HALF_COMPLETED", "DELIVERED"];
     private static readonly string[] BillTos = ["AGENT", "CUSTOMER", "FORWARDER", "LINE", "HAULIER"];
     private const int MaxLines = 20_000;
+    private const string CreditTerm = "CREDIT";
 
     public static RouteGroupBuilder MapUnbilledOrderEndpoints(this RouteGroupBuilder revenue)
     {
@@ -61,7 +62,7 @@ internal static class UnbilledOrderEndpoints
         var size = Math.Clamp(pageSize ?? 50, 1, 200);
         return TypedResults.Ok(new UnbilledOrdersPage(
             orders.Skip((p - 1) * size).Take(size).ToList(), p, size, orders.Count,
-            found!.Lines.Count(l => l.Status == ChargeStatus.Unbilled), Unbilled(found.Lines).Sum(l => l.Amount),
+            found!.Lines.Count(IsOpen), Unbilled(found.Lines).Sum(l => l.Amount),
             Unbilled(found.Lines).Sum(l => l.TaxAmount), Unbilled(found.Lines).Sum(l => l.Amount + l.TaxAmount)));
     }
 
@@ -225,8 +226,14 @@ internal static class UnbilledOrderEndpoints
         string[] statuses = f.IncludeSettled == true
             ? [ChargeStatus.Unbilled, ChargeStatus.Invoiced, ChargeStatus.Paid, ChargeStatus.Earned]
             : [ChargeStatus.Unbilled];
+        // A CREDIT line is billable from the moment the booking is priced (owner 2026-10-07: an invoice may
+        // bill QUOTED credit lines in advance; 2026-10-19: they belong on this worklist). A QUOTED cash line is
+        // not — it is paid at the window when the box moves. Unpriced placeholders (0, no tariff) are left out.
         var rows = db.Charges.AsNoTracking()
-            .Where(c => c.BranchId == branch && statuses.Contains(c.Status) && c.BookingId != null);
+            .Where(c => c.BranchId == branch && c.BookingId != null
+                        && (statuses.Contains(c.Status)
+                            || (c.Status == ChargeStatus.Quoted && c.PaymentTermCode == CreditTerm
+                                && (c.Amount != 0 || c.Source == ChargeSource.Manual))));
         if (billTo is not null) rows = rows.Where(c => c.BillTo == billTo);
         if (Up(f.PaymentTermCode) is { } term) rows = rows.Where(c => c.PaymentTermCode == term);
         if (Up(f.ChargeCode) is { } charge) rows = rows.Where(c => c.ChargeCode == charge);
@@ -299,7 +306,7 @@ internal static class UnbilledOrderEndpoints
                 var all = g.ToList();
                 var list = Unbilled(all).ToList();
                 if (list.Count == 0) list = all;   // settled in full: the row still shows its lines and currency
-                var billed = all.Where(l => l.Status != ChargeStatus.Unbilled).Sum(l => l.Amount + l.TaxAmount);
+                var billed = all.Where(l => !IsOpen(l)).Sum(l => l.Amount + l.TaxAmount);
                 var unbilled = Unbilled(all).Sum(l => l.Amount + l.TaxAmount);
                 return new UnbilledOrderResponse(
                     h.BookingId, h.OrderNo, h.CarrierRef, h.SubBlNo, h.BookedAt, h.BookingTypeCode, h.OrderTypeCode,
@@ -318,7 +325,10 @@ internal static class UnbilledOrderEndpoints
             .OrderByDescending(o => o.BookedAt).ThenByDescending(o => o.OrderNo, StringComparer.Ordinal).ToList();
     }
 
-    private static IEnumerable<Charge> Unbilled(IEnumerable<Charge> lines) => lines.Where(l => l.Status == ChargeStatus.Unbilled);
+    /// <summary>Still to be billed: moved (UNBILLED), or a priced credit line of a booked box (QUOTED) — see FindAsync.</summary>
+    private static bool IsOpen(Charge l) => l.Status is ChargeStatus.Unbilled or ChargeStatus.Quoted;
+
+    private static IEnumerable<Charge> Unbilled(IEnumerable<Charge> lines) => lines.Where(IsOpen);
 
     private static async Task<IReadOnlyList<UnbilledLineResponse>> LinesOfAsync(Found found, RevenueDbContext db, IMasterDataReferences master, CancellationToken ct)
     {
@@ -331,7 +341,7 @@ internal static class UnbilledOrderEndpoints
             l.BookingContainerId is { } b ? types.GetValueOrDefault(b) : null, l.MovementCode, l.EirNo, l.PricedForDate,
             l.ChargeCode, l.ChargeName, l.BillTo, l.PayerPartyCode, l.PayerPartyCode is { } p ? parties.GetValueOrDefault(p)?.Name : null,
             l.PaymentTermCode, l.Quantity, l.UnitRate, l.Amount, l.TaxRate, l.TaxAmount, l.Amount + l.TaxAmount, l.CurrencyCode,
-            l.BillingUnitCode, l.IsTripCharge, l.ScheduleNo, l.Source)).ToList();
+            l.BillingUnitCode, l.IsTripCharge, l.ScheduleNo, l.Source, l.Status)).ToList();
     }
 }
 
@@ -382,4 +392,6 @@ public sealed record UnbilledLineResponse(
     string? MovementCode, string? EirNo, DateOnly? PricedForDate,
     string ChargeCode, string? ChargeName, string BillTo, string? PayerCode, string? PayerName, string PaymentTermCode,
     decimal Quantity, decimal? UnitRate, decimal Amount, decimal TaxRate, decimal TaxAmount, decimal Total, string CurrencyCode,
-    string? BillingUnitCode, bool IsTripCharge, string? ScheduleNo, string Source);
+    string? BillingUnitCode, bool IsTripCharge, string? ScheduleNo, string Source,
+    /// <summary>UNBILLED = the box has moved; QUOTED = a credit line of a booked box, billable in advance.</summary>
+    string Status);

@@ -88,8 +88,7 @@ internal sealed class BookingClonedHandler(RevenueDbContext db, BranchCalendar c
         c.DiscountType = s.DiscountType;
         c.DiscountRate = s.DiscountRate;
         c.UnitRate = s.UnitRate;
-        c.Amount = c.UnitRate is { } rate ? CashQuoter.Money(c.Quantity * rate) : 0m;
-        c.TaxAmount = CashQuoter.Money(c.Amount * c.TaxRate / 100m);
+        (c.Amount, c.TaxAmount) = CashQuoter.NetAndTax(c.UnitRate is { } rate ? c.Quantity * rate : 0m, c.TaxRate);
         c.IsRateOverridden = true;
         c.OverrideReason = Truncate(s.OverrideReason is { Length: > 0 } why ? $"{why} ({note})" : note, 500);
         c.OverriddenBy = s.OverriddenBy;

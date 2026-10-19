@@ -698,8 +698,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
         }
         else
         {
-            net = Money(amount);
-            tax = Money(net * rate / 100m);
+            (net, tax) = NetAndTax(amount, rate);
         }
 
         return new QuoteLine(kind, variant.ChargeCodeId, variant.ChargeCode, variant.DescriptionEn, variant.BillTo, variant.PaymentTermCode, payer,
@@ -713,8 +712,7 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     public static QuoteLine Overridden(string kind, ChargeVariantRef variant, string? payer, decimal quantity, decimal unitRate,
         PriceResult price, decimal? original, string? reason, Guid? by, DateTimeOffset? at)
     {
-        var net = Money(quantity * unitRate);
-        var tax = Money(net * variant.TaxRatePct / 100m);
+        var (net, tax) = NetAndTax(quantity * unitRate, variant.TaxRatePct);
         return new QuoteLine(kind, variant.ChargeCodeId, variant.ChargeCode, variant.DescriptionEn, variant.BillTo, variant.PaymentTermCode, payer,
             quantity, unitRate, net, price.CurrencyCode ?? "THB", variant.TaxCode, variant.TaxRatePct, tax, null, null, price,
             variant.BillingUnitCode, RateSource: RateSources.Override, UnitRateOriginal: original, OverrideReason: reason,
@@ -754,6 +752,19 @@ internal sealed class CashQuoter(RevenueDbContext db, IMasterDataReferences mast
     }
 
     public static decimal Money(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
+
+    /// <summary>
+    /// A line's amount before VAT and its VAT, from the UNROUNDED quantity x rate. The total is rounded
+    /// once and VAT is what is left, so a price quoted as ฿250 incl. VAT and stored as 233.6449 bills
+    /// 233.64 + 16.36 = 250.00 (owner 2026-10-19), not 233.64 + 16.35 = 249.99. For a rate with 2 decimals
+    /// and a whole quantity this is the same as VAT on the rounded amount.
+    /// </summary>
+    public static (decimal Net, decimal Tax) NetAndTax(decimal exactAmount, decimal taxRatePct)
+    {
+        var net = Money(exactAmount);
+        var gross = Money(exactAmount * (1 + taxRatePct / 100m));
+        return (net, gross - net);
+    }
 
     /// <summary>Who the booking says pays, for each bill-to role (lookup.bill_to_role).</summary>
     public static string? PayerFor(BookingPlan plan, string billTo) => billTo switch

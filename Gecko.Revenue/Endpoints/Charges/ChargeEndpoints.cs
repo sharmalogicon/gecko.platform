@@ -344,11 +344,10 @@ internal static class ChargeEndpoints
         }
     }
 
-    /// <summary>amount = quantity x unitRate, rounded to satang once; VAT on top at the line's own rate.</summary>
+    /// <summary>amount = quantity x unitRate, rounded to satang once; VAT at the line's own rate (CashQuoter.NetAndTax).</summary>
     private static void Reprice(Charge charge)
     {
-        charge.Amount = charge.UnitRate is { } rate ? CashQuoter.Money(charge.Quantity * rate) : 0m;
-        charge.TaxAmount = CashQuoter.Money(charge.Amount * charge.TaxRate / 100m);
+        (charge.Amount, charge.TaxAmount) = CashQuoter.NetAndTax(charge.UnitRate is { } rate ? charge.Quantity * rate : 0m, charge.TaxRate);
     }
 
     private static NotFound<ProblemDetails> NoSuchCharge() =>

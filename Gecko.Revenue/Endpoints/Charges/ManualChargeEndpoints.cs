@@ -167,8 +167,7 @@ internal static class ManualChargeEndpoints
         c.DiscountType = p.DiscountType;
         c.DiscountRate = p.Discount;
         c.UnitRate = p.Selling;
-        c.Amount = CashQuoter.Money(c.Quantity * p.Selling);
-        c.TaxAmount = CashQuoter.Money(c.Amount * c.TaxRate / 100m);
+        (c.Amount, c.TaxAmount) = CashQuoter.NetAndTax(c.Quantity * p.Selling, c.TaxRate);
         c.IsRateOverridden = true;
         c.OverrideReason = p.Reason;
         c.OverriddenBy = by;

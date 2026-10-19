@@ -49,6 +49,19 @@ public sealed class PartyApiTests(MasterDataApiFactory api)
         Assert.Contains("CUSTOMER", hit.Roles);
     }
 
+    [Theory]
+    [InlineData("บ.บางกอก เฟรท")]           // a Thai name with า: the search must not rewrite vowels
+    [InlineData("บจก.บางกอกเฟรท")]
+    public async Task Search_with_a_company_prefix_finds_a_thai_name_with_sara_aa(string search)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var sct = await api.ClientForAsync(MasterDataApiFactory.SctAdmin);
+
+        var page = await sct.GetFromJsonAsync<Paged<Summary>>($"{Base}?search={Uri.EscapeDataString(search)}", ct);
+
+        Assert.Contains(page!.Items, p => p.PartyCode == "CUS-BKF");
+    }
+
     [Fact]
     public async Task Role_filter_uses_the_extension_tables_and_the_list_is_ordered_by_name()
     {

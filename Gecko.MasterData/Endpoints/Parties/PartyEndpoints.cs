@@ -150,7 +150,7 @@ internal static class PartyEndpoints
                 parties = parties.Where(p =>
                     p.PartyCode.Contains(s)
                     || p.NameEn.Replace(" ", "").Contains(s)
-                    || (p.NameLocal != null && p.NameLocal.Replace("ํา", "ำ").Replace(" ", "").Contains(s))
+                    || (p.NameLocal != null && p.NameLocal.Replace(" ", "").Contains(s))
                     || (p.ShortName != null && p.ShortName.Contains(s))
                     || (p.TaxId != null && p.TaxId.Contains(s))
                     || aliasHits.Contains(p.PartyId));

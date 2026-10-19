@@ -154,7 +154,7 @@ internal static class ShippingLineEndpoints
             foreach (var s in PartySearch.Terms(search))
                 rows = rows.Where(r =>
                     r.P.PartyCode.Contains(s) || r.P.NameEn.Replace(" ", "").Contains(s)
-                    || (r.P.NameLocal != null && r.P.NameLocal.Replace("ํา", "ำ").Replace(" ", "").Contains(s))
+                    || (r.P.NameLocal != null && r.P.NameLocal.Replace(" ", "").Contains(s))
                     || (r.P.ShortName != null && r.P.ShortName.Contains(s))
                     || (r.E.ScacCode != null && r.E.ScacCode.Contains(s))
                     || (r.E.SmdgCode != null && r.E.SmdgCode.Contains(s))

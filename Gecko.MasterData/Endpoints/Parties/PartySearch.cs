@@ -32,7 +32,7 @@ public static partial class PartySearch
         var words = new List<string>();
         foreach (var part in raw.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
         {
-            var w = part.Replace("ํา", "ำ");
+            var w = part;
             w = ThaiPrefix().Replace(w, "");
             if (w.EndsWith("จำกัด", StringComparison.Ordinal) && w.Length > "จำกัด".Length) w = w[..^"จำกัด".Length];
             if (CompanyWords.Contains(w)) continue;

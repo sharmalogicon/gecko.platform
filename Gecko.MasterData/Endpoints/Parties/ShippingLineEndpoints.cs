@@ -150,14 +150,15 @@ internal static class ShippingLineEndpoints
         if (!includeInactive) rows = rows.Where(r => r.P.IsActive);
         if (!string.IsNullOrWhiteSpace(search))
         {
-            var s = search.Trim();
-            rows = rows.Where(r =>
-                r.P.PartyCode.Contains(s) || r.P.NameEn.Contains(s)
-                || (r.P.NameLocal != null && r.P.NameLocal.Contains(s))
-                || (r.P.ShortName != null && r.P.ShortName.Contains(s))
-                || (r.E.ScacCode != null && r.E.ScacCode.Contains(s))
-                || (r.E.SmdgCode != null && r.E.SmdgCode.Contains(s))
-                || (r.PrincipalCode != null && r.PrincipalCode.Contains(s)));
+            // every typed word must be found (PartySearch drops "บริษัท", "CO.,LTD" ...)
+            foreach (var s in PartySearch.Terms(search))
+                rows = rows.Where(r =>
+                    r.P.PartyCode.Contains(s) || r.P.NameEn.Replace(" ", "").Contains(s)
+                    || (r.P.NameLocal != null && r.P.NameLocal.Replace("ํา", "ำ").Replace(" ", "").Contains(s))
+                    || (r.P.ShortName != null && r.P.ShortName.Contains(s))
+                    || (r.E.ScacCode != null && r.E.ScacCode.Contains(s))
+                    || (r.E.SmdgCode != null && r.E.SmdgCode.Contains(s))
+                    || (r.PrincipalCode != null && r.PrincipalCode.Contains(s)));
         }
 
         // A line, then the agents that act for it.

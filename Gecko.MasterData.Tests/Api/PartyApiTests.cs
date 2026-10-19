@@ -33,6 +33,10 @@ public sealed class PartyApiTests(MasterDataApiFactory api)
     [InlineData("ไทย อะโกร")]                 // Thai name
     [InlineData(ThaiAgroTaxId)]               // tax id
     [InlineData("d-tae")]                     // alias (debtor code), lower case
+    [InlineData("บ.ไทย อะโกร")]               // Thai short company prefix glued to the name
+    [InlineData("บจก. ไทยอะโกร จำกัด")]       // company words dropped, spaces differ
+    [InlineData("อะโกร ไทย")]                 // words in any order
+    [InlineData("export thai agro co.,ltd")]  // English, words in any order, CO.,LTD dropped
     public async Task Search_matches_code_names_tax_id_and_alias(string search)
     {
         var ct = TestContext.Current.CancellationToken;

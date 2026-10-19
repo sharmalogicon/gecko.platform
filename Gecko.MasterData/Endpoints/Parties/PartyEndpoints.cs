@@ -138,17 +138,23 @@ internal static class PartyEndpoints
         {
             // Collation is case-insensitive, so Contains is the case-insensitive match
             // the contract asks for — including Thai, which has no case.
-            var s = search.Trim();
-            // Alias hits are found ONCE, then matched by id. As a correlated EXISTS inside
-            // the OR, SQL Server re-scanned every alias for every party — 15-16 s per search
-            // over KORAKIT's 9,540 parties / 9,543 aliases (measured 2026-09-29).
-            var aliasHits = await db.PartyAliases.AsNoTracking()
-                .Where(a => a.AliasValue.Contains(s)).Select(a => a.PartyId).Distinct().Take(500).ToListAsync(ct);
-            parties = parties.Where(p =>
-                p.PartyCode.Contains(s) || p.NameEn.Contains(s) || (p.NameLocal != null && p.NameLocal.Contains(s))
-                || (p.ShortName != null && p.ShortName.Contains(s))
-                || (p.TaxId != null && p.TaxId.Contains(s))
-                || aliasHits.Contains(p.PartyId));
+            // Each typed word must be found, in any order; "บ.", "บริษัท", "จำกัด", "CO.,LTD" are
+            // dropped, and names are compared without spaces (PartySearch).
+            foreach (var s in PartySearch.Terms(search))
+            {
+                // Alias hits are found ONCE, then matched by id. As a correlated EXISTS inside
+                // the OR, SQL Server re-scanned every alias for every party — 15-16 s per search
+                // over KORAKIT's 9,540 parties / 9,543 aliases (measured 2026-09-29).
+                var aliasHits = await db.PartyAliases.AsNoTracking()
+                    .Where(a => a.AliasValue.Contains(s)).Select(a => a.PartyId).Distinct().Take(500).ToListAsync(ct);
+                parties = parties.Where(p =>
+                    p.PartyCode.Contains(s)
+                    || p.NameEn.Replace(" ", "").Contains(s)
+                    || (p.NameLocal != null && p.NameLocal.Replace("ํา", "ำ").Replace(" ", "").Contains(s))
+                    || (p.ShortName != null && p.ShortName.Contains(s))
+                    || (p.TaxId != null && p.TaxId.Contains(s))
+                    || aliasHits.Contains(p.PartyId));
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(role))

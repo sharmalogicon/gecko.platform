@@ -19,6 +19,8 @@ namespace Gecko.Tos.Application;
 /// the boxes the visit gated plus the ones it is still here to collect.
 ///
 /// Gecko additions the RDL has no rule against: a voided move still prints, under the VOID watermark.
+/// Owner 2026-10-20: each sheet also says whether the truck drops the box off (ใบฝากตู้) or picks it up (ใบปล่อยตู้),
+/// whether the customer pays cash at the gate (เงินสด) or is billed (เครดิต), and whether the box is FULL or EMPTY.
 /// Times are the branch's clock; names are MDM's and Identity's at print time.
 /// </summary>
 internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock)
@@ -31,7 +33,8 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
         string BookingBlNo, string SizeType, string SetTemp, string Vent, string PreCool,
         string ContainerNo, string SealNo1,
         string HaulierName, string TruckNo, string TimeIn, string DestinationPort,
-        string Remarks, bool IsVoided);
+        string Remarks, bool IsVoided,
+        string SlipTitle = "", string PaymentTerm = "");
 
     /// <summary>The form's page header, the same on every sheet (the RDL's First() of the dataset).</summary>
     internal sealed record Header(string CompanyName, string CreatedBy, string DateTimeIn);
@@ -47,19 +50,31 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
             join bc in db.BookingContainers on g.BookingContainerId equals bc.BookingContainerId
             join r in db.EquipmentRequirements on bc.EquipmentRequirementId equals r.EquipmentRequirementId
             select new Line(g.TransactionAt, g.PositionNo, g.ContainerNo, g.Status == "VOIDED", g.BookingId, bc, r.EquipmentTypeCode,
-                r.ReeferSetTempC, r.ReeferVentPct)).ToListAsync(ct);
+                r.ReeferSetTempC, r.ReeferVentPct, g.Direction, g.FullEmpty)).ToListAsync(ct);
         var collecting = await (
             from p in db.VisitPickups.AsNoTracking().Where(x => x.TruckVisitId == truckVisitId && x.Status == "PLANNED")
             join bc in db.BookingContainers on p.BookingContainerId equals bc.BookingContainerId
             join r in db.EquipmentRequirements on bc.EquipmentRequirementId equals r.EquipmentRequirementId
             select new Line(p.PlannedAt, byte.MaxValue, p.ContainerNo ?? bc.ContainerNo, false, bc.BookingId, bc, r.EquipmentTypeCode,
-                r.ReeferSetTempC, r.ReeferVentPct)).ToListAsync(ct);
+                r.ReeferSetTempC, r.ReeferVentPct, "OUT", null)).ToListAsync(ct);
+
+        // A box still to collect is not gated yet: its full/empty is that of the next pick-up step planned for it.
+        var collectIds = collecting.Select(l => l.Box.BookingContainerId).Distinct().ToList();
+        var nextOut = collectIds.Count == 0 ? new Dictionary<Guid, string>() : (await db.MovementPlans.AsNoTracking()
+                .Where(m => collectIds.Contains(m.BookingContainerId) && m.GateTransactionId == null && m.SkippedAt == null
+                            && m.MovementCode.Contains("OUT"))
+                .Select(m => new { m.BookingContainerId, m.SequenceNo, m.MovementCode }).ToListAsync(ct))
+            .GroupBy(m => m.BookingContainerId)
+            .ToDictionary(g => g.Key, g => g.OrderBy(m => m.SequenceNo).First().MovementCode);
+        collecting = collecting.Select(l => l with { FullEmpty = FullEmptyOf(nextOut.GetValueOrDefault(l.Box.BookingContainerId)) }).ToList();
+
         var lines = gated.Concat(collecting).OrderBy(l => l.At).ThenBy(l => l.PositionNo).ToList();
 
         var bookingIds = lines.Select(l => l.BookingId).Distinct().ToList();
         var bookings = await db.Bookings.AsNoTracking().Where(b => bookingIds.Contains(b.BookingId)).ToDictionaryAsync(b => b.BookingId, ct);
         var parties = await master.PartiesAsync(
             bookings.Values.Select(b => b.CustomerPartyCode).Append(visit.HaulierPartyCode).OfType<string>().Distinct(), ct);
+        var paysCash = await PaysCashAsync(bookings.Values, ct);
         var typeCodes = lines.Select(l => l.EquipmentTypeCode).Distinct().ToList();
         var types = typeCodes.Count == 0 ? new Dictionary<string, EquipmentTypeRef>() : await master.EquipmentTypesAsync(typeCodes, ct);
 
@@ -75,7 +90,7 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
             return new Sheet(
                 AgentCode: booking?.AgentPartyCode ?? "",
                 CustomerName: Name(booking?.CustomerPartyCode) ?? "",
-                CommodityDesc: booking?.CommodityCode ?? "",
+                CommodityDesc: Commodity(l.FullEmpty, booking?.CommodityCode),
                 BookingBlNo: booking?.CarrierRef ?? "",
                 SizeType: SizeType(l.EquipmentTypeCode, types.GetValueOrDefault(l.EquipmentTypeCode)?.SizeCode),
                 SetTemp: SetTemp(l.Box.ReeferSetTempC ?? l.SetTempC),
@@ -88,7 +103,9 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
                 TimeIn: TimeOfDay(timeIn),
                 DestinationPort: booking?.FpdPortCode ?? "",
                 Remarks: Remarks(booking?.Remarks, l.Box.Remarks),
-                IsVoided: l.IsVoided);
+                IsVoided: l.IsVoided,
+                SlipTitle: SlipTitle(l.Direction),
+                PaymentTerm: booking is null ? "" : PaymentTermText(paysCash.GetValueOrDefault(booking.BookingId)));
         }).ToList();
 
         var header = new Header(
@@ -100,7 +117,49 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
 
     private sealed record Line(
         DateTimeOffset At, byte PositionNo, string? ContainerNo, bool IsVoided, Guid BookingId,
-        Infrastructure.Persistence.Entities.BookingContainer Box, string EquipmentTypeCode, decimal? SetTempC, decimal? VentPct);
+        Infrastructure.Persistence.Entities.BookingContainer Box, string EquipmentTypeCode, decimal? SetTempC, decimal? VentPct,
+        string Direction, string? FullEmpty);
+
+    /// <summary>
+    /// Whether each booking's customer pays cash at the gate, by the order type's payment rule (R2) as the cash quoter applies
+    /// it: CASH_ONLY is cash; otherwise a customer whose default term is CREDIT is billed and everyone else pays cash.
+    /// </summary>
+    private async Task<Dictionary<Guid, bool>> PaysCashAsync(IEnumerable<Infrastructure.Persistence.Entities.Booking> bookings, CancellationToken ct)
+    {
+        var list = bookings.ToList();
+        if (list.Count == 0) return [];
+        var rules = await master.OrderTypePlansAsync(list.Select(b => b.OrderTypeCode).Distinct(), ct);
+        var customers = list.Select(b => b.CustomerPartyCode).OfType<string>().Distinct().ToList();
+        var credit = customers.Count == 0 ? new Dictionary<string, CustomerCreditRef>() : await master.CustomerCreditAsync(customers, ct);
+        return list.ToDictionary(b => b.BookingId, b =>
+            rules.GetValueOrDefault(b.OrderTypeCode)?.RulesOrNone.PaymentRule == OrderTypeRules.CashOnly
+            || b.CustomerPartyCode is null
+            || credit.GetValueOrDefault(b.CustomerPartyCode) is not { IsOnCredit: true });
+    }
+
+    // ── owner 2026-10-20 additions ──────────────────────────────────────────
+
+    /// <summary>Drop-off: ใบฝากตู้; pick-up: ใบปล่อยตู้.</summary>
+    internal static string SlipTitle(string direction) => direction switch
+    {
+        "IN" => "ใบฝากตู้",
+        "OUT" => "ใบปล่อยตู้",
+        _ => "",
+    };
+
+    /// <summary>Cash at the gate: เงินสด; billed on credit: เครดิต.</summary>
+    internal static string PaymentTermText(bool paysCash) => paysCash ? "เงินสด" : "เครดิต";
+
+    /// <summary>FULL or EMPTY in front of the commodity: "FULL / RICE", "EMPTY".</summary>
+    internal static string Commodity(string? fullEmpty, string? commodity) =>
+        string.Join(" / ", new[] { fullEmpty, commodity }.Where(x => !string.IsNullOrWhiteSpace(x)));
+
+    /// <summary>A movement code's load: FULL_OUT is FULL, MTY_OUT is EMPTY; anything else unknown.</summary>
+    internal static string? FullEmptyOf(string? movementCode) =>
+        movementCode is null ? null
+        : movementCode.StartsWith("FULL", StringComparison.OrdinalIgnoreCase) ? "FULL"
+        : movementCode.StartsWith("MTY", StringComparison.OrdinalIgnoreCase) || movementCode.StartsWith("EMPTY", StringComparison.OrdinalIgnoreCase) ? "EMPTY"
+        : null;
 
     // ── the RDL's expressions ───────────────────────────────────────────────
 
@@ -139,7 +198,17 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
     internal static byte[] Render(Header header, IReadOnlyList<Sheet> sheets)
     {
         GeckoPdf.EnsureInitialised();
-        return Document.Create(document => document.Page(page =>
+        return Document.Create(document =>
+        {
+            foreach (var sheet in sheets)
+                SheetPage(document, header, sheet);
+        }).GeneratePdf();
+    }
+
+    /// <summary>One A4 page per box: the header (with the sheet's slip title and payment term) over its body.</summary>
+    private static void SheetPage(IDocumentContainer document, Header header, Sheet sheet)
+    {
+        document.Page(page =>
         {
             page.Size(PageSizes.A4);
             page.Margin(0.1f, Unit.Inch);
@@ -154,25 +223,20 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
                 Box(layers, 0.30566f, 6.61873f, 1.34029f, 0.25f, header.CreatedBy, 8);
                 Box(layers, 0.59733f, 5.72415f, 0.82514f, 0.25f, "Printed Date", 8);
                 Box(layers, 0.59733f, 6.61874f, 1.34028f, 0.25f, header.DateTimeIn, 8);
+                // Owner 2026-10-20: the slip title above the form's name, the payment term beside it
+                Box(layers, 0f, 0.0868f, 1.8f, 0.3f, sheet.SlipTitle, 13, bold: true);
+                Box(layers, 0.24f, 4.05f, 1.6f, 0.35f, sheet.PaymentTerm, 16, bold: true);
             });
 
-            page.Content().Column(column =>
+            page.Content().Height(3.35926f, Unit.Inch).Layers(layers =>
             {
-                for (var i = 0; i < sheets.Count; i++)
-                {
-                    if (i > 0) column.Item().PageBreak();
-                    var sheet = sheets[i];
-                    column.Item().Height(3.35926f, Unit.Inch).Layers(layers =>
-                    {
-                        layers.PrimaryLayer();
-                        if (sheet.IsVoided) layers.Layer().VoidWatermark();
-                        SheetBody(layers, sheet);
-                    });
-                }
+                layers.PrimaryLayer();
+                if (sheet.IsVoided) layers.Layer().VoidWatermark();
+                SheetBody(layers, sheet);
             });
 
             page.Footer().Height(0.26042f, Unit.Inch);
-        })).GeneratePdf();
+        });
     }
 
     /// <summary>Rectangle1 of Tablix1 (top 0.11966in, left 0.0868in); every item at its RDL position inside it.</summary>

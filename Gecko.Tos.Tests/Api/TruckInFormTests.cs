@@ -39,13 +39,30 @@ public sealed class TruckInFormTests
         Assert.Equal("box only", TruckInDocument.Remarks(null, "box only"));
     }
 
+    /// <summary>Owner 2026-10-20: the slip title, the payment term, and FULL/EMPTY before the commodity.</summary>
+    [Fact]
+    public void A_sheet_says_drop_off_or_pick_up_cash_or_credit_and_full_or_empty()
+    {
+        Assert.Equal("ใบฝากตู้", TruckInDocument.SlipTitle("IN"));
+        Assert.Equal("ใบปล่อยตู้", TruckInDocument.SlipTitle("OUT"));
+        Assert.Equal("เงินสด", TruckInDocument.PaymentTermText(paysCash: true));
+        Assert.Equal("เครดิต", TruckInDocument.PaymentTermText(paysCash: false));
+        Assert.Equal("EMPTY", TruckInDocument.Commodity("EMPTY", null));
+        Assert.Equal("FULL / RICE", TruckInDocument.Commodity("FULL", "RICE"));
+        Assert.Equal("RICE", TruckInDocument.Commodity(null, "RICE"));
+        Assert.Equal("FULL", TruckInDocument.FullEmptyOf("FULL_OUT"));
+        Assert.Equal("EMPTY", TruckInDocument.FullEmptyOf("MTY_OUT"));
+        Assert.Null(TruckInDocument.FullEmptyOf("GOF"));
+    }
+
     [Fact]
     public void Each_box_is_its_own_sheet_and_a_voided_one_still_prints()
     {
         var header = new TruckInDocument.Header("KORAKRIT LOGISTICS CO.,LTD.", "Gate Clerk", "08-10-2026 07:05");
         TruckInDocument.Sheet Box(string no, bool voided) => new(
             "MAEU", "บริษัท ทดสอบ จำกัด", "FROZEN FISH", "CHENG-BK-88421", "20 RF", "-18.00 CEL", "", "YES",
-            no, "SEAL-001", "Haulier Co.", "70-4321", "07:05 Hrs", "JPTYO", "keep frozen", voided);
+            no, "SEAL-001", "Haulier Co.", "70-4321", "07:05 Hrs", "JPTYO", "keep frozen", voided,
+            voided ? "ใบปล่อยตู้" : "ใบฝากตู้", voided ? "เครดิต" : "เงินสด");
 
         var pdf = TruckInDocument.Render(header, [Box("ZZTU1234565", false), Box("ZZTU7654321", true)]);
 

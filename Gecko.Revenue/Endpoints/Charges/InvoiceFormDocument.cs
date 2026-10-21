@@ -46,6 +46,47 @@ internal sealed class InvoiceFormDocument(
         return new Rendered($"{i.InvoiceNo.Replace('/', '-')}.pdf", cashFormat ? RenderCash(form) : RenderCredit(form));
     }
 
+    /// <summary>
+    /// The credit invoice as the customer gets it (owner 2026-10-21: "follow the cash invoice print out"): the cash bill's A4
+    /// tax-invoice layout (<see cref="ReceiptDocument.Render"/>) titled ใบแจ้งหนี้/ใบกำกับภาษี — seller, customer with tax id,
+    /// branch, address and phone (MDM), the lines grouped by charge with their containers, the totals, VAT and the amount in words.
+    /// The booking numbers print after "อ้างอิง". A voided invoice still prints, under the VOID mark.
+    /// </summary>
+    public async Task<Rendered?> TaxInvoiceAsync(Guid invoiceId, CancellationToken ct)
+    {
+        var i = await db.Invoices.AsNoTracking().SingleOrDefaultAsync(x => x.InvoiceId == invoiceId, ct);
+        if (i is null) return null;
+        var lines = await db.InvoiceLines.AsNoTracking().Where(l => l.InvoiceId == invoiceId).OrderBy(l => l.LineNo)
+            .Select(l => new ReceiptLineResponse(l.LineNo, l.ChargeCode, l.ChargeName ?? l.ChargeCode, l.ContainerNo, l.MovementCode,
+                l.Quantity, l.UnitRate, l.Amount, l.TaxRate, l.TaxAmount, null, null, null))
+            .ToListAsync(ct);
+
+        var party = i.PayerPartyCode is { } code ? (await master.PartiesAsync([code], ct)).GetValueOrDefault(code) : null;
+        var seller = await master.InvoicingCompanyAsync(i.BranchId, ct);
+        var branch = await calendar.BranchAsync(i.BranchId, ct);
+        var address = party is null ? null
+            : string.Join(" ", new[] { party.Address1, party.Address2, party.State, party.Postcode }.Where(x => !string.IsNullOrWhiteSpace(x)));
+        var orders = lines.Count == 0 ? [] : await db.InvoiceLines.AsNoTracking().Where(l => l.InvoiceId == invoiceId && l.OrderNo != null)
+            .Select(l => l.OrderNo!).Distinct().OrderBy(o => o).ToListAsync(ct);
+
+        var bill = new ReceiptResponse(i.InvoiceId, i.InvoiceNo, branch is null ? i.IssuedAt : branch.Local(i.IssuedAt), i.Status,
+            orders.FirstOrDefault() ?? "", i.PayerName ?? party?.Name ?? i.PayerPartyCode ?? "", party?.TaxId,
+            i.SubtotalAmount, i.TaxAmount, i.TotalAmount, 0, i.CurrencyCode, lines, [], [],
+            i.BranchId, branch?.BranchCode, party?.TaxBranchCode, address, Guid.Empty, i.IssuedBy,
+            seller is null ? null : new SellerResponse(seller.CompanyCode, seller.LegalNameEn, seller.LegalNameLocal,
+                seller.TaxId, seller.TaxBranchNo, seller.IsHeadOffice, seller.Address, seller.Phone, seller.Email),
+            null, null, NettAmount: i.TotalAmount, PayerPartyCode: i.PayerPartyCode, Remarks: i.Remarks);
+
+        var codes = lines.Select(l => l.ChargeCode).Distinct().ToList();
+        IReadOnlyDictionary<string, string> names = codes.Count == 0 ? new Dictionary<string, string>() : (await master.ChargeVariantsAsync(codes, ct))
+            .GroupBy(v => v.ChargeCode, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().DescriptionLocal ?? g.First().DescriptionEn, StringComparer.OrdinalIgnoreCase);
+        var facts = new ReceiptPrintFacts(party?.Phone, null, names);
+
+        return new Rendered($"{i.InvoiceNo.Replace('/', '-')}.pdf",
+            ReceiptDocument.Render(bill, facts, BillTitles.CreditInvoice(orders.Count == 0 ? null : string.Join(", ", orders))));
+    }
+
     public async Task<Rendered?> ReceiptAsync(Guid receiptId, CancellationToken ct)
     {
         var r = await db.Receipts.AsNoTracking().SingleOrDefaultAsync(x => x.ReceiptId == receiptId, ct);

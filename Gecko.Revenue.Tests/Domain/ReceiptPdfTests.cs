@@ -43,6 +43,21 @@ public sealed class ReceiptPdfTests
         Assert.True(pdf.Length > 5_000, "a real page with embedded Thai fonts is not a few hundred bytes");
     }
 
+    /// <summary>Owner 2026-10-21: the credit invoice prints in the cash bill's layout, titled ใบแจ้งหนี้/ใบกำกับภาษี.</summary>
+    [Fact]
+    public void A_credit_invoice_prints_in_the_cash_bill_layout()
+    {
+        var invoice = Receipt("ISSUED", FullSeller) with { ReceiptNo = "INV-KTC-2610-00005", Payments = [], Coupons = [], Change = 0 };
+        var facts = new ReceiptPrintFacts("038-000000", null, new Dictionary<string, string> { ["GATEFEE"] = "ค่ายกตู้ขึ้นรถ" });
+
+        var pdf = ReceiptDocument.Render(invoice, facts, BillTitles.CreditInvoice("BK-KTC-2610-00046, BK-KTC-2610-00049"));
+
+        Assert.Equal("%PDF"u8.ToArray(), pdf[..4]);
+        Assert.NotEqual(ReceiptDocument.Render(invoice, facts), pdf);
+        if (Environment.GetEnvironmentVariable("GECKO_SAMPLE_PDF_DIR") is { Length: > 0 } dir)
+            File.WriteAllBytes(Path.Combine(dir, "credit-invoice-sample.pdf"), pdf);
+    }
+
     [Fact]
     public void A_seller_without_a_tax_id_or_address_still_prints_and_so_does_no_seller_at_all()
     {

@@ -126,8 +126,9 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
     ///   – a charge whose lines were priced at different rates prints one row per rate, so every row's amount is right;
     ///   – a VOIDED receipt still prints, with the VOID mark.
     /// </summary>
-    internal static byte[] Render(ReceiptResponse r, ReceiptPrintFacts? facts = null)
+    internal static byte[] Render(ReceiptResponse r, ReceiptPrintFacts? facts = null, BillTitles? titles = null)
     {
+        titles ??= BillTitles.CashBill;
         GeckoPdf.EnsureInitialised();
         var voided = r.Status == "VOIDED";
         var s = r.Seller;
@@ -165,7 +166,7 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
             {
                 layers.PrimaryLayer();
                 layers.At(0.125, 0.24016, 7.50205, 0.30904, c => c.AlignBottom().Text(sellerName ?? "(not set)").FontSize(12));
-                layers.At(0.47778, 3.66235, 2.08539, 0.23958, c => c.AlignCenter().Text("บิลเงินสด/ใบกำกับภาษี ").FontSize(12));
+                layers.At(0.47778, 3.66235, 2.08539, 0.23958, c => c.AlignCenter().Text(titles.Title).FontSize(12));
                 layers.At(0.44098, 0.24016, 3.35274, 0.81805, c => c.Text(
                     (s?.Address ?? "") + "\n" + "เลขประจำตัวผู้เสียภาษี " + (s?.TaxId ?? "") + "\n"
                     + (s is null ? "" : s.IsHeadOffice == true ? "(สำนักงานใหญ่)" : s.TaxBranchNo is { } b ? $"(สาขาที่ {b})" : "")));
@@ -182,12 +183,12 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
                     layers.At(0.60986, 0.25182, 4.70709, 0.54098, c => c.Text("ที่อยู่ " + (r.PayerAddress ?? "")).FontSize(9));
                     layers.At(1.22028, 0.24016, 4.52083, 0.2, c => c.Text("เลขประจำตัวผู้เสียภาษี " + (r.PayerTaxId ?? "") + BuyerBranch(r.PayerBranchNo)).FontSize(9));
                     layers.At(1.44806, 0.24016, 4.52083, 0.2, c => c.Text("โทร. " + (facts?.PayerPhone ?? "")).FontSize(9));
-                    layers.At(1.67584, 0.24016, 4.52083, 0.2, c => c.Text("อ้างอิง").FontSize(9));
+                    layers.At(1.67584, 0.24016, 4.52083, 0.2, c => c.Text("อ้างอิง " + (titles.Reference ?? "")).FontSize(9));
                     layers.At(1.91889, 0.24016, 4.52083, 0.2, c => c.Text("ขนส่งโดย " + (facts?.HaulierName ?? "")).FontSize(9));
                     layers.At(1.46334, 5.27446, 1.36663, 0.2, c => c.Text("เลขที่ใบสั่งขาย ").FontSize(9));
                     layers.At(1.67723, 5.27446, 1.36663, 0.2, c => c.Text("พนักงานขาย").FontSize(9));
                     layers.At(1.91889, 5.27446, 1.36663, 0.2, c => c.Text("เขตการขาย ").FontSize(9));
-                    layers.At(0.04042, 5.13903, 2.50206, 0.26042, c => c.AlignRight().Text("เลขที่บิลเงินสด " + r.ReceiptNo));
+                    layers.At(0.04042, 5.13903, 2.50206, 0.26042, c => c.AlignRight().Text(titles.NumberLabel + " " + r.ReceiptNo));
                     layers.At(0.3125, 5.5557, 2.08539, 0.26042, c => c.AlignRight().Text("วันที่ " + r.ReceiptAt.ToString("dd/MM/yyyy HH:mm", CultureInfo.InvariantCulture)));
                 });
 
@@ -274,6 +275,16 @@ internal sealed class ReceiptDocument(RevenueDbContext db, IMasterDataReferences
         branchNo is null ? ""
         : branchNo.Trim('0').Length == 0 ? " (สำนักงานใหญ่)"
         : $" (สาขาที่ {branchNo})";
+}
+
+/// <summary>
+/// The words that make the bill a cash bill or a credit invoice (owner 2026-10-21: the credit invoice prints like the cash bill).
+/// </summary>
+/// <param name="Reference">Printed after "อ้างอิง": the credit invoice's booking numbers.</param>
+internal sealed record BillTitles(string Title, string NumberLabel, string? Reference = null)
+{
+    public static readonly BillTitles CashBill = new("บิลเงินสด/ใบกำกับภาษี ", "เลขที่บิลเงินสด");
+    public static BillTitles CreditInvoice(string? reference) => new("ใบแจ้งหนี้/ใบกำกับภาษี", "เลขที่ใบแจ้งหนี้", reference);
 }
 
 /// <param name="PayerPhone">MDM party.primary_phone of the payer — the bill's "โทร." line.</param>

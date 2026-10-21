@@ -234,7 +234,8 @@ public sealed record BranchRef(Guid BranchId, string BranchCode, string? TimeZon
 /// the lines Vector's printed forms took from Master.Contact.</param>
 public sealed record PartyRef(Guid PartyId, string PartyCode, string Name, bool IsActive,
     bool IsCustomer, bool IsShippingLine, bool IsForwarder, bool IsHaulier, string? OperatorCode = null, string? Phone = null,
-    string? Address1 = null, string? Address2 = null, string? State = null, string? Postcode = null);
+    string? Address1 = null, string? Address2 = null, string? State = null, string? Postcode = null,
+    string? TaxId = null, string? TaxBranchCode = null);
 
 public sealed record ChargeCodeRef(Guid ChargeCodeId, string ChargeCode, string ModuleCode, string BillingUnitCode, bool IsActive);
 

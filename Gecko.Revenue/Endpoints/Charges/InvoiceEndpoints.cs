@@ -159,21 +159,25 @@ internal static class InvoiceEndpoints
         return TypedResults.Ok(page);
     }
 
-    /// <param name="format">credit (default) — Vector's credit invoice form; cash — its cash-invoice format (CustomerInvoice.cs "Cash Invoice Format").</param>
+    /// <param name="format">credit (default) — the tax invoice in the cash bill's layout (owner 2026-10-21); cash — Vector's cash-invoice
+    /// format (CustomerInvoice.cs "Cash Invoice Format"); form — Vector's credit invoice form for pre-printed stationery.</param>
     private static async Task<Results<FileContentHttpResult, NotFound<ProblemDetails>, ValidationProblem>> PdfAsync(
         Guid invoiceId, RevenueDbContext db, InvoiceFormDocument document, ICallerPermissions scope, CancellationToken ct, string? format = null)
     {
-        var cash = format?.Trim().ToLowerInvariant() switch
+        var which = format?.Trim().ToLowerInvariant() switch
         {
-            null or "" or "credit" => false,
-            "cash" => true,
-            _ => (bool?)null,
+            null or "" or "credit" => "credit",
+            "cash" => "cash",
+            "form" => "form",
+            _ => null,
         };
-        if (cash is null) return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["format"] = ["credit or cash."] });
+        if (which is null) return TypedResults.ValidationProblem(new Dictionary<string, string[]> { ["format"] = ["credit, cash or form."] });
         var branchId = await db.Invoices.AsNoTracking().Where(i => i.InvoiceId == invoiceId).Select(i => (Guid?)i.BranchId).SingleOrDefaultAsync(ct);
         if (branchId is null || !scope.HasAt(RevenuePermissions.ChargeView, branchId.Value))
             return TypedResults.NotFound(new ProblemDetails { Title = "No such invoice in your branches." });
-        var rendered = await document.InvoiceAsync(invoiceId, cash.Value, ct);
+        var rendered = which == "credit"
+            ? await document.TaxInvoiceAsync(invoiceId, ct)
+            : await document.InvoiceAsync(invoiceId, cashFormat: which == "cash", ct);
         return rendered is null
             ? TypedResults.NotFound(new ProblemDetails { Title = "No such invoice in your branches." })
             : TypedResults.File(rendered.Pdf, "application/pdf", rendered.FileName);

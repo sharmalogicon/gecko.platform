@@ -21,11 +21,17 @@ public sealed record LoginRequest(
 /// <summary>The refresh token is NOT in the body — it is set as an HttpOnly cookie the page's JavaScript cannot read.</summary>
 public sealed record LoginResponse(string AccessToken, string TokenType, DateTimeOffset ExpiresAt);
 
+/// <param name="FirstName">The user's name as Gecko holds it: one full_name column, sent whole here (owner 2026-10-21,
+/// web.tos AUTH_ME_IDENTITY_FOR_API.md — never split on a space: wrong for Thai names).</param>
+/// <param name="LastName">Always null: there is no family-name column.</param>
+/// <param name="Email">The sign-in e-mail.</param>
+/// <param name="UserName">The sign-in user ID (e.g. "PLA"), when the user has one.</param>
 public sealed record MeResponse(
     Guid UserId, Guid TenantId, string? UserType,
     IReadOnlyList<string> Branches, IReadOnlyList<string> Modules,
     IReadOnlyList<string> Roles, IReadOnlyList<string> Permissions,
-    IReadOnlyList<string> BranchPermissions);
+    IReadOnlyList<string> BranchPermissions,
+    string? FirstName = null, string? LastName = null, string? Email = null, string? UserName = null);
 
 public sealed record InvitationTokenRequest([property: Required, StringLength(64, MinimumLength = 64)] string Token);
 
@@ -65,7 +71,7 @@ internal static class AuthEndpoints
 
         auth.MapGet("/me", Me)
             .RequireAuthorization()
-            .WithSummary("The claims in the caller's access token");
+            .WithSummary("The claims in the caller's access token, and who the caller is (name, e-mail, user ID)");
 
         auth.MapPost("/password", ChangePasswordAsync)
             .RequireAuthorization()
@@ -190,17 +196,28 @@ internal static class AuthEndpoints
         return TypedResults.NoContent();
     }
 
-    private static MeResponse Me(HttpContext http)
+    /// <summary>
+    /// The token's claims, plus the person read from iam.user (owner 2026-10-21): a rename shows on the next page load,
+    /// not the next token refresh. One read per call; web.tos calls it once per page load.
+    /// </summary>
+    private static async Task<MeResponse> Me(HttpContext http, IdentityDbContext db, CancellationToken ct)
     {
         var user = http.User;
         List<string> All(string type) => user.FindAll(type).Select(c => c.Value).ToList();
+        var userId = Guid.Parse(user.FindFirst(GeckoClaimTypes.UserId)!.Value);
+        var person = await db.Users.AsNoTracking().Where(u => u.UserId == userId)
+            .Select(u => new { u.FullName, u.Email, u.UserName }).SingleOrDefaultAsync(ct);
 
         return new MeResponse(
-            Guid.Parse(user.FindFirst(GeckoClaimTypes.UserId)!.Value),
+            userId,
             Guid.Parse(user.FindFirst(GeckoClaimTypes.TenantId)!.Value),
             user.FindFirst(GeckoClaimTypes.UserType)?.Value,
             All(GeckoClaimTypes.Branch), All(GeckoClaimTypes.Module), All(GeckoClaimTypes.Role), All(GeckoClaimTypes.Permission),
-            All(GeckoClaimTypes.BranchPermission));
+            All(GeckoClaimTypes.BranchPermission),
+            FirstName: string.IsNullOrWhiteSpace(person?.FullName) ? null : person.FullName.Trim(),
+            LastName: null,
+            Email: person?.Email,
+            UserName: person?.UserName);
     }
 
     private static ClientInfo Client(HttpContext http) =>

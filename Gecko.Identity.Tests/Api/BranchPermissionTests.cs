@@ -27,6 +27,11 @@ public class BranchPermissionTests(ApiFactory api)
 
         var me = (await client.GetFromJsonAsync<MeResponse>("/auth/me", ct))!;
 
+        // Owner 2026-10-21: /auth/me names the person — the whole full_name as FirstName, the sign-in e-mail.
+        Assert.Equal(ApiFactory.SctOpsLcb, me.Email, ignoreCase: true);
+        Assert.False(string.IsNullOrWhiteSpace(me.FirstName));
+        Assert.Null(me.LastName);
+
         Assert.Empty(me.Permissions);                       // unchanged: `prm` is tenant-wide only
         Assert.Equal(2, me.BranchPermissions.Count);        // OPS_MANAGER's set, VIEWER's set
 

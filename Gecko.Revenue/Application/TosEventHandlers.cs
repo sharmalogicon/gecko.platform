@@ -17,8 +17,13 @@ namespace Gecko.Revenue.Application;
 /// </summary>
 internal static class Inbox
 {
+    /// <summary>
+    /// A message is the one already handled only when its type and aggregate match too (and its tenant: RLS). TOS's outbox
+    /// ids started again on Azure after the September test data (gecko_revenue 44), so an id alone can name two messages.
+    /// </summary>
     public static async Task<bool> AlreadyHandledAsync(RevenueDbContext db, OutboxMessage message, CancellationToken ct) =>
-        await db.Inboxes.AnyAsync(i => i.SourceContext == "TOS" && i.MessageId == message.MessageId, ct);
+        await db.Inboxes.AnyAsync(i => i.SourceContext == "TOS" && i.MessageId == message.MessageId
+                                       && i.MessageType == message.MessageType && i.AggregateId == message.AggregateId, ct);
 
     public static void Record(RevenueDbContext db, OutboxMessage message, string outcome = "APPLIED", string? note = null) =>
         db.Inboxes.Add(new Infrastructure.Persistence.Entities.Inbox

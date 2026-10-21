@@ -1003,7 +1003,7 @@ public partial class RevenueDbContext : DbContext
 
             entity.ToTable("inbox", "billing");
 
-            entity.HasIndex(e => new { e.SourceContext, e.MessageId }, "uq_inbox__message").IsUnique();
+            entity.HasIndex(e => new { e.TenantId, e.SourceContext, e.MessageId, e.MessageType, e.AggregateId }, "uq_inbox__message").IsUnique();
 
             entity.Property(e => e.InboxId).HasColumnName("inbox_id");
             entity.Property(e => e.AggregateId).HasColumnName("aggregate_id");

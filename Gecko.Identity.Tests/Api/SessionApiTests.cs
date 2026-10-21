@@ -90,7 +90,7 @@ public class SessionApiTests(ApiFactory api)
     {
         var ct = TestContext.Current.CancellationToken;
         const string who = "gate2.lcb@sct.co.th";
-        const string fresh = "A-new-Password-2026";
+        const string fresh = "New-Pass-2026";
         using var anonymous = api.CreateClient();
         Task<HttpResponseMessage> Login(string password) => anonymous.PostAsJsonAsync("/auth/login", new { email = who, password }, ct);
         async Task<HttpClient> SignedIn(string password)

@@ -31,12 +31,12 @@ public sealed record InvitationTokenRequest([property: Required, StringLength(64
 
 public sealed record AcceptInvitationRequest(
     [property: Required, StringLength(64, MinimumLength = 64)] string Token,
-    [property: Required, StringLength(128, MinimumLength = 12, ErrorMessage = "Password must be 12-128 characters.")] string Password,
+    [property: Required, StringLength(18, MinimumLength = 6, ErrorMessage = "Password must be 6-18 characters.")] string Password,
     [property: MaxLength(200)] string? FullName = null);
 
 /// <summary>The signed-in user's new password, typed twice.</summary>
 public sealed record ChangePasswordRequest(
-    [property: Required, StringLength(128, MinimumLength = 12, ErrorMessage = "Password must be 12-128 characters.")] string NewPassword,
+    [property: Required, StringLength(18, MinimumLength = 6, ErrorMessage = "Password must be 6-18 characters.")] string NewPassword,
     [property: Required] string ConfirmPassword);
 
 internal static class AuthEndpoints

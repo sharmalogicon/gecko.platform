@@ -147,6 +147,7 @@ public class InvitationAcceptanceTests(ApiFactory api)
 
     [Theory]
     [InlineData("short")]
+    [InlineData("nineteen-chars-long")]
     [InlineData("")]
     public async Task Weak_password_is_a_400(string password)
     {

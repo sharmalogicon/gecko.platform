@@ -33,6 +33,23 @@ internal static class CashReceiptReports
         "GATE_1", "GATE_2", "WEIGHT_SCALE", "CLEANING", "ELECTRICITY", "CONTAINER_STORAGE", "CARGO_STORAGE", "OTHER",
     ];
 
+    /// <summary>
+    /// billing.report_charge_column rows under this key list the money columns a tenant's User listing prints (column_key;
+    /// charge_code repeats it). None: all 15, as the RDL.
+    /// </summary>
+    public const string UserColumnsReport = "CASH_RECEIPT_USER_COLUMNS";
+
+    /// <summary>
+    /// Which of the 15 money columns the User listing prints: the tenant's chosen columns, and Other; a code whose column is
+    /// not printed is counted in Other, so the totals never change (owner 2026-10-21, KORAKIT: "deleted blue columns").
+    /// </summary>
+    internal static bool[] Shown(IReadOnlyCollection<string> chosen) =>
+        chosen.Count == 0
+            ? Columns.Select(_ => true).ToArray()
+            : Columns.Select(k => k == "OTHER" || chosen.Contains(k, StringComparer.OrdinalIgnoreCase)).ToArray();
+
+    private static readonly bool[] All = Columns.Select(_ => true).ToArray();
+
     private static Dictionary<string, string> Lists(params (string Key, string[] Codes)[] lists) =>
         lists.SelectMany(l => l.Codes.Select(c => (c, l.Key))).ToDictionary(x => x.c, x => x.Key, StringComparer.OrdinalIgnoreCase);
 
@@ -69,6 +86,21 @@ internal static class CashReceiptReports
     [
         ("GATE", "ค่าผ่านท่า"), ("PORT_CHARGE", "ค่าภาระผ่านท่า"), ("CLEANING", "ค่าทำความสะอาด"), ("LIFT", "ค่ายกตู้"), ("WEIGHT", "ค่าชั่งน้ำหนัก"),
     ];
+
+    /// <summary>
+    /// The summary rows a tenant prints. Owner 2026-10-21 (KORAKIT): a tenant whose codes name CONTAINER_STORAGE prints
+    /// ค่าฝากตู้เกิน in place of ค่าภาระผ่านท่า, and one whose codes name ELECTRICITY prints ค่าไฟ in place of ค่าทำความสะอาด.
+    /// </summary>
+    internal static IReadOnlyList<(string Key, string Label)> CompanyRowsFor(IReadOnlyDictionary<string, string> tenant)
+    {
+        bool Uses(string key) => tenant.Values.Contains(key, StringComparer.OrdinalIgnoreCase);
+        return CompanyRows.Select(r => r.Key switch
+        {
+            "PORT_CHARGE" when Uses("CONTAINER_STORAGE") => ("CONTAINER_STORAGE", "ค่าฝากตู้เกิน"),
+            "CLEANING" when Uses("ELECTRICITY") => ("ELECTRICITY", "ค่าไฟ"),
+            _ => r,
+        }).ToList();
+    }
 
     public static readonly IReadOnlyDictionary<string, string> CompanyLists = Lists(
         ("GATE", ["SA001-CA", "SA002-CA"]),
@@ -180,7 +212,7 @@ internal static class CashReceiptReports
         return sums;
     }
 
-    private static object?[] Sums(IReadOnlyList<Row> rows, Func<string, string> column, string label)
+    private static object?[] Sums(IReadOnlyList<Row> rows, Func<string, string> column, string label, bool[] shown)
     {
         var buckets = new decimal[Columns.Length];
         foreach (var r in rows)
@@ -188,39 +220,48 @@ internal static class CashReceiptReports
             var m = Money15(r, column);
             for (var i = 0; i < buckets.Length; i++) buckets[i] += m[i];
         }
-        return [null, null, null, null, null, null, label, .. buckets.Cast<object?>(),
+        return [null, null, null, null, null, null, label, .. Pick(buckets, shown),
             rows.Sum(r => r.Subtotal), rows.Sum(r => r.Tax), rows.Sum(r => r.Total), rows.Sum(r => r.Wht)];
     }
 
-    private static object?[] ReceiptCells(int no, object date, Row r, Func<string, string> column) =>
+    private static object?[] ReceiptCells(int no, object date, Row r, Func<string, string> column, bool[] shown) =>
         [no, date, r.ReceiptNo, r.AgentCode, r.PayerName, r.ContainerNo, r.SizeType,
-         .. Money15(r, column).Cast<object?>(), r.Subtotal, r.Tax, r.Total, r.Wht];
+         .. Pick(Money15(r, column), shown), r.Subtotal, r.Tax, r.Total, r.Wht];
 
-    private static IReadOnlyList<TabularColumn> ListingColumns(string dateFormat) =>
+    private static IEnumerable<object?> Pick(decimal[] money, bool[] shown) =>
+        money.Where((_, i) => shown[i]).Cast<object?>();
+
+    private static IReadOnlyList<TabularColumn> ListingColumns(string dateFormat, bool[] shown) =>
     [
         new(1.0, null, CellAlign.Center), new(dateFormat.Length > 10 ? 2.9 : 2.0, dateFormat, CellAlign.Center), new(3.0), new(1.8),
         new(5.0), new(2.6), new(1.5, null, CellAlign.Center),
-        .. Enumerable.Range(0, 15).Select(_ => new TabularColumn(2.1, Money, CellAlign.Right)),
+        .. shown.Where(s => s).Select(_ => new TabularColumn(2.1, Money, CellAlign.Right)),
         new(2.4, Money, CellAlign.Right), new(2.1, Money, CellAlign.Right), new(2.4, Money, CellAlign.Right), new(2.0, Money, CellAlign.Right),
     ];
 
-    private static IReadOnlyList<IReadOnlyList<HeaderCell>> ListingHeader(bool liner) =>
-    [
+    private static IReadOnlyList<IReadOnlyList<HeaderCell>> ListingHeader(bool liner, bool[] shown)
+    {
+        // Columns 0–6 sit under "Handling"; 7–14 are two rows tall.
+        string[] handling = ["Lift On", "Lift Off", liner ? "LOLO " : "LOLO", liner ? "handling" : "Handling", "Relocation", "Stuff/unStuff", "Facilities"];
+        string[] tall =
+        [
+            "Gate Charge", "Gate Charge", liner ? "weight scale" : "Weight Scale", liner ? "cleaning" : "Cleaning", "Electricity Charge",
+            liner ? "Container storage" : "Container Storage", liner ? "Cargo storage" : "Cargo Storage", liner ? "other" : "Other",
+        ];
+        var underHandling = Enumerable.Range(0, 7).Count(i => shown[i]);
+        List<HeaderCell> top =
         [
             new("No.", RowSpan: 2), new("Invoice Date", RowSpan: 2), new("Invoice No", RowSpan: 2), new("Agent Code", RowSpan: 2),
             new("Customer Name", RowSpan: 2), new(liner ? "Container No" : "Container No.", RowSpan: 2), new("Size/Type", RowSpan: 2),
-            new(liner ? "Handling " : "Handling", ColSpan: 7),
-            new("Gate Charge", RowSpan: 2), new("Gate Charge", RowSpan: 2), new(liner ? "weight scale" : "Weight Scale", RowSpan: 2),
-            new(liner ? "cleaning" : "Cleaning", RowSpan: 2), new("Electricity Charge", RowSpan: 2),
-            new(liner ? "Container storage" : "Container Storage", RowSpan: 2), new(liner ? "Cargo storage" : "Cargo Storage", RowSpan: 2),
-            new(liner ? "other" : "Other", RowSpan: 2), new(liner ? "Total charge" : "Total Charge", RowSpan: 2),
+        ];
+        if (underHandling > 0) top.Add(new(liner ? "Handling " : "Handling", ColSpan: underHandling));
+        top.AddRange(Enumerable.Range(7, 8).Where(i => shown[i]).Select(i => new HeaderCell(tall[i - 7], RowSpan: 2)));
+        top.AddRange([
+            new(liner ? "Total charge" : "Total Charge", RowSpan: 2),
             new("VAT", RowSpan: 2), new("VAT Include", RowSpan: 2), new("W/H Tax", RowSpan: 2),
-        ],
-        [
-            new("Lift On"), new("Lift Off"), new(liner ? "LOLO " : "LOLO"), new(liner ? "handling" : "Handling"), new("Relocation"),
-            new("Stuff/unStuff"), new("Facilities"),
-        ],
-    ];
+        ]);
+        return [top, Enumerable.Range(0, 7).Where(i => shown[i]).Select(i => new HeaderCell(handling[i])).ToList()];
+    }
 
     private static List<ReportText> ListingHeading(AccountingReportContext c, DateTime from, DateTime to) =>
     [
@@ -247,7 +288,10 @@ internal static class CashReceiptReports
         var rows = await LoadAsync(db, tos, null, master, c.Branch.BranchId, c.Start, c.End, bookingType, ct);
         if (cashierUserId is { } only) rows = rows.Where(r => r.CashierUserId == only).ToList();
         var tenant = await TenantMapAsync(db, ColumnsReport, ct);
-        string Column(string code) => tenant.GetValueOrDefault(code) ?? UserLists.GetValueOrDefault(code) ?? "OTHER";
+        var shown = Shown((await TenantMapAsync(db, UserColumnsReport, ct)).Values.ToList());
+        string Column(string code) =>
+            (tenant.GetValueOrDefault(code) ?? UserLists.GetValueOrDefault(code) ?? "OTHER") is var key
+            && Array.IndexOf(Columns, key) is var at && at >= 0 && shown[at] ? key : "OTHER";
         var names = await users.DisplayNamesAsync(rows.Select(r => r.CashierUserId).Concat(rows.Select(r => r.VoidedBy).OfType<Guid>()).Distinct(), ct);
         string Name(Guid? id) => id is { } g ? names.GetValueOrDefault(g) ?? g.ToString() : "";
 
@@ -259,10 +303,10 @@ internal static class CashReceiptReports
                 output.Add(TabularRow.Banner($"{banner}{Name(group.Key)}"));
                 var no = 0;
                 foreach (var r in group.OrderBy(r => r.ReceiptNo, StringComparer.Ordinal))
-                    output.Add(new TabularRow(ReceiptCells(++no, c.Branch.LocalDate(r.ReceiptAt), r, Column)));
-                output.Add(new TabularRow(Sums(group.ToList(), Column, "Total"), RowKind.Subtotal));
+                    output.Add(new TabularRow(ReceiptCells(++no, c.Branch.LocalDate(r.ReceiptAt), r, Column, shown)));
+                output.Add(new TabularRow(Sums(group.ToList(), Column, "Total", shown), RowKind.Subtotal));
             }
-            output.Add(new TabularRow(Sums(set, Column, "Grand Total"), RowKind.Total));
+            output.Add(new TabularRow(Sums(set, Column, "Grand Total", shown), RowKind.Total));
         }
 
         Section(rows.Where(r => r.IsIssued).ToList(), r => r.CashierUserId, "USER ID : ");
@@ -274,7 +318,7 @@ internal static class CashReceiptReports
             Page: ReportPage.A3Landscape, MarginCm: 0.5,
             Heading: ListingHeading(c, from, to), HeadingRight: PrintedBlock(c),
             Preamble: [], PreambleRight: [],
-            Columns: ListingColumns("dd/MM/yyyy"), HeaderRows: ListingHeader(liner: false), Rows: output);
+            Columns: ListingColumns("dd/MM/yyyy", shown), HeaderRows: ListingHeader(liner: false, shown), Rows: output);
     }
 
     /// <summary>
@@ -301,8 +345,8 @@ internal static class CashReceiptReports
                 output.Add(TabularRow.Banner($"{banner}{group.Key}    {ordered[0].ReceiptNo}"));
                 var no = 0;
                 foreach (var r in ordered)
-                    output.Add(new TabularRow(ReceiptCells(++no, c.Branch.Local(r.ReceiptAt).DateTime, r, Column)));
-                output.Add(new TabularRow(Sums(ordered, Column, "Total"), RowKind.Subtotal));
+                    output.Add(new TabularRow(ReceiptCells(++no, c.Branch.Local(r.ReceiptAt).DateTime, r, Column, All)));
+                output.Add(new TabularRow(Sums(ordered, Column, "Total", All), RowKind.Subtotal));
             }
         }
 
@@ -315,7 +359,7 @@ internal static class CashReceiptReports
             Page: ReportPage.A3Landscape, MarginCm: 0.5,
             Heading: ListingHeading(c, from, to), HeadingRight: PrintedBlock(c),
             Preamble: [], PreambleRight: [],
-            Columns: ListingColumns("dd/MM/yyyy HH:mm"), HeaderRows: ListingHeader(liner: true), Rows: output);
+            Columns: ListingColumns("dd/MM/yyyy HH:mm", All), HeaderRows: ListingHeader(liner: true, All), Rows: output);
     }
 
     // ── Company ─────────────────────────────────────────────────────────────
@@ -346,7 +390,7 @@ internal static class CashReceiptReports
         var issuedLines = issued.SelectMany(r => r.Lines).ToList();
         var summary = new List<TabularRow>();
         decimal net = 0, vat = 0;
-        foreach (var (key, label) in CompanyRows)
+        foreach (var (key, label) in CompanyRowsFor(tenant))
         {
             var mine = issuedLines.Where(l => Row(l.ChargeCode) == key).ToList();
             var (amount, tax) = (mine.Sum(l => l.Amount), mine.Sum(l => l.Tax));

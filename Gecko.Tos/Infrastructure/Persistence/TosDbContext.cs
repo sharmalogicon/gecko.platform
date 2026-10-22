@@ -1469,6 +1469,9 @@ public partial class TosDbContext : DbContext
             entity.Property(e => e.DriverName)
                 .HasMaxLength(100)
                 .HasColumnName("driver_name");
+            entity.Property(e => e.DriverMobile)
+                .HasMaxLength(30)
+                .HasColumnName("driver_mobile");
             entity.Property(e => e.DwellMinutes)
                 .HasComputedColumnSql("(datediff(minute,[arrived_at],[gate_out_at]))", true)
                 .HasColumnName("dwell_minutes");

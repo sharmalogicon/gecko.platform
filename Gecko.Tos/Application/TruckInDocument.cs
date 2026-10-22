@@ -21,6 +21,9 @@ namespace Gecko.Tos.Application;
 /// Gecko additions the RDL has no rule against: a voided move still prints, under the VOID watermark.
 /// Owner 2026-10-20: each sheet also says whether the truck drops the box off (ใบฝากตู้) or picks it up (ใบปล่อยตู้),
 /// whether the customer pays cash at the gate (เงินสด) or is billed (เครดิต), and whether the box is FULL or EMPTY.
+/// Owner 2026-10-22: the haulier gets room for its whole name; each sheet also prints the box's yard location (the
+/// position keyed at the gate-in screen, or where the yard stock now has it), its weight, and the driver's name, phone
+/// and a line for the driver to sign.
 /// Times are the branch's clock; names are MDM's and Identity's at print time.
 /// </summary>
 internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences master, IUserDirectory users, BranchClock clock)
@@ -34,7 +37,8 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
         string ContainerNo, string SealNo1,
         string HaulierName, string TruckNo, string TimeIn, string DestinationPort,
         string Remarks, bool IsVoided,
-        string SlipTitle = "", string PaymentTerm = "");
+        string SlipTitle = "", string PaymentTerm = "",
+        string YardLocation = "", string Weight = "", string DriverName = "", string DriverMobile = "");
 
     /// <summary>The form's page header, the same on every sheet (the RDL's First() of the dataset).</summary>
     internal sealed record Header(string CompanyName, string CreatedBy, string DateTimeIn);
@@ -50,13 +54,14 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
             join bc in db.BookingContainers on g.BookingContainerId equals bc.BookingContainerId
             join r in db.EquipmentRequirements on bc.EquipmentRequirementId equals r.EquipmentRequirementId
             select new Line(g.TransactionAt, g.PositionNo, g.ContainerNo, g.Status == "VOIDED", g.BookingId, bc, r.EquipmentTypeCode,
-                r.ReeferSetTempC, r.ReeferVentPct, g.Direction, g.FullEmpty)).ToListAsync(ct);
+                r.ReeferSetTempC, r.ReeferVentPct, g.Direction, g.FullEmpty,
+                g.PositionText, g.GrossWeightKg, g.TareWeightKg, g.CargoWeightKg)).ToListAsync(ct);
         var collecting = await (
             from p in db.VisitPickups.AsNoTracking().Where(x => x.TruckVisitId == truckVisitId && x.Status == "PLANNED")
             join bc in db.BookingContainers on p.BookingContainerId equals bc.BookingContainerId
             join r in db.EquipmentRequirements on bc.EquipmentRequirementId equals r.EquipmentRequirementId
             select new Line(p.PlannedAt, byte.MaxValue, p.ContainerNo ?? bc.ContainerNo, false, bc.BookingId, bc, r.EquipmentTypeCode,
-                r.ReeferSetTempC, r.ReeferVentPct, "OUT", null)).ToListAsync(ct);
+                r.ReeferSetTempC, r.ReeferVentPct, "OUT", null, null, null, null, null)).ToListAsync(ct);
 
         // A box still to collect is not gated yet: its full/empty is that of the next pick-up step planned for it.
         var collectIds = collecting.Select(l => l.Box.BookingContainerId).Distinct().ToList();
@@ -69,6 +74,19 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
         collecting = collecting.Select(l => l with { FullEmpty = FullEmptyOf(nextOut.GetValueOrDefault(l.Box.BookingContainerId)) }).ToList();
 
         var lines = gated.Concat(collecting).OrderBy(l => l.At).ThenBy(l => l.PositionNo).ToList();
+
+        // A box the truck takes out: where the yard stock has it now, else what its gate-in recorded — and its gate-in weights.
+        var outBoxes = lines.Where(l => l.Direction != "IN" && l.ContainerNo is { Length: > 0 }).Select(l => l.ContainerNo!).Distinct().ToList();
+        var inYard = outBoxes.Count == 0 ? new Dictionary<string, string?>() : (await db.VwContainerInYards.AsNoTracking()
+                .Where(v => v.BranchId == visit.BranchId && outBoxes.Contains(v.ContainerNo))
+                .Select(v => new { v.ContainerNo, v.PositionText }).ToListAsync(ct))
+            .GroupBy(v => v.ContainerNo).ToDictionary(g => g.Key, g => g.First().PositionText);
+        var lastIn = outBoxes.Count == 0 ? new Dictionary<string, GateIn>() : (await db.GateTransactions.AsNoTracking()
+                .Where(g => g.BranchId == visit.BranchId && g.Direction == "IN" && g.Status == "COMPLETED" && outBoxes.Contains(g.ContainerNo!))
+                .Select(g => new { g.ContainerNo, g.TransactionAt, g.PositionText, g.GrossWeightKg, g.TareWeightKg, g.CargoWeightKg })
+                .ToListAsync(ct))
+            .GroupBy(g => g.ContainerNo!).ToDictionary(g => g.Key, g => g.OrderByDescending(x => x.TransactionAt)
+                .Select(x => new GateIn(x.PositionText, x.GrossWeightKg, x.TareWeightKg, x.CargoWeightKg)).First());
 
         var bookingIds = lines.Select(l => l.BookingId).Distinct().ToList();
         var bookings = await db.Bookings.AsNoTracking().Where(b => bookingIds.Contains(b.BookingId)).ToDictionaryAsync(b => b.BookingId, ct);
@@ -105,7 +123,13 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
                 Remarks: Remarks(booking?.Remarks, l.Box.Remarks),
                 IsVoided: l.IsVoided,
                 SlipTitle: SlipTitle(l.Direction),
-                PaymentTerm: booking is null ? "" : PaymentTermText(paysCash.GetValueOrDefault(booking.BookingId)));
+                PaymentTerm: booking is null ? "" : PaymentTermText(paysCash.GetValueOrDefault(booking.BookingId)),
+                YardLocation: YardLocationOf(l, inYard, lastIn),
+                Weight: Kg(WeightOf(l.Gross, l.Tare, l.Cargo)
+                           ?? (l.Direction != "IN" && l.ContainerNo is { } no && lastIn.TryGetValue(no, out var gin) ? WeightOf(gin.Gross, gin.Tare, gin.Cargo) : null)
+                           ?? l.Box.DeclaredVgmKg),
+                DriverName: visit.DriverName ?? "",
+                DriverMobile: visit.DriverMobile ?? "");
         }).ToList();
 
         var header = new Header(
@@ -118,7 +142,21 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
     private sealed record Line(
         DateTimeOffset At, byte PositionNo, string? ContainerNo, bool IsVoided, Guid BookingId,
         Infrastructure.Persistence.Entities.BookingContainer Box, string EquipmentTypeCode, decimal? SetTempC, decimal? VentPct,
-        string Direction, string? FullEmpty);
+        string Direction, string? FullEmpty,
+        string? PositionText, decimal? Gross, decimal? Tare, decimal? Cargo);
+
+    /// <summary>What a box's gate-in recorded: the position keyed at the gate-in screen and the weights.</summary>
+    private sealed record GateIn(string? PositionText, decimal? Gross, decimal? Tare, decimal? Cargo);
+
+    /// <summary>
+    /// A drop-off prints the position its gate-in recorded. A pick-up prints where the yard stock has the box now (a yard
+    /// move may have shifted it), else the position its own gate-out or its last gate-in recorded.
+    /// </summary>
+    private static string YardLocationOf(Line l, IReadOnlyDictionary<string, string?> inYard, IReadOnlyDictionary<string, GateIn> lastIn)
+    {
+        if (l.Direction == "IN" || l.ContainerNo is not { Length: > 0 } no) return l.PositionText ?? "";
+        return (inYard.GetValueOrDefault(no) ?? l.PositionText ?? lastIn.GetValueOrDefault(no)?.PositionText) ?? "";
+    }
 
     /// <summary>
     /// Whether each booking's customer pays cash at the gate, by the order type's payment rule (R2) as the cash quoter applies
@@ -160,6 +198,17 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
         : movementCode.StartsWith("FULL", StringComparison.OrdinalIgnoreCase) ? "FULL"
         : movementCode.StartsWith("MTY", StringComparison.OrdinalIgnoreCase) || movementCode.StartsWith("EMPTY", StringComparison.OrdinalIgnoreCase) ? "EMPTY"
         : null;
+
+    /// <summary>The box's weight as the gate weighed it: the gross, else tare + cargo, else whichever of the two was keyed.</summary>
+    internal static decimal? WeightOf(decimal? gross, decimal? tare, decimal? cargo) =>
+        gross is > 0 ? gross
+        : tare is > 0 && cargo is > 0 ? tare + cargo
+        : tare is > 0 ? tare
+        : cargo is > 0 ? cargo
+        : null;
+
+    /// <summary>"12,340 KG"; nothing when no weight is known.</summary>
+    internal static string Kg(decimal? kg) => kg is > 0 ? $"{kg.Value.ToString("#,0", CultureInfo.InvariantCulture)} KG" : "";
 
     // ── the RDL's expressions ───────────────────────────────────────────────
 
@@ -270,22 +319,36 @@ internal sealed class TruckInDocument(TosDbContext db, IMasterDataReferences mas
         // Cntr no. 1, and the requested seal (its value sits just above the "Request Seal" label, as in the RDL)
         Value(0.93881f, 6.65761f, 1.12432f, s.ContainerNo);
         Label(0.96520f, 5.98875f, 0.62499f, "Cntr no. 1");
-        Value(1.28091f, 6.74511f, 1.03682f, s.SealNo1);
+        Value(1.35473f, 6.74511f, 1.03682f, s.SealNo1);
 
-        // Haulier · Plate · Time · Destination Port · Request Seal
-        Label(1.30618f, 0.06250f, 0.57291f, "Haulier");
-        Value(1.30618f, 0.65486f, 0.92500f, s.HaulierName);
-        Label(1.30618f, 1.61736f, 0.32916f, "Plate");
-        Value(1.30618f, 1.95346f, 0.71876f, s.TruckNo);
-        Label(1.30618f, 2.68889f, 0.30208f, "Time");
-        Value(1.30618f, 3.02152f, 0.83487f, s.TimeIn);
-        Label(1.30618f, 3.92693f, 0.91666f, "Destination Port");
-        Value(1.30618f, 4.91929f, 1.00000f, s.DestinationPort);
-        Label(1.30618f, 5.98875f, 0.73957f, "Request Seal");
+        // Owner 2026-10-22: Yard Location · Weight, and Destination Port moved up to give the haulier room
+        Label(1.03000f, 0.06250f, 0.80000f, "Yard Location");
+        Value(1.03000f, 1.06000f, 1.20000f, s.YardLocation);
+        Label(1.03000f, 2.32000f, 0.52000f, "Weight");
+        Value(1.03000f, 2.86000f, 0.95000f, s.Weight);
+        Label(1.03000f, 3.86000f, 1.05000f, "Destination Port");
+        Value(1.03000f, 4.93000f, 0.98000f, s.DestinationPort);
+
+        // Haulier (its whole name: three times the RDL's 0.925in) · Plate · Time · Request Seal
+        Label(1.38000f, 0.06250f, 0.57291f, "Haulier");
+        Value(1.38000f, 0.65486f, 2.95000f, s.HaulierName, size: 9);
+        Label(1.38000f, 3.68000f, 0.32916f, "Plate");
+        Value(1.38000f, 4.03000f, 0.80000f, s.TruckNo);
+        Label(1.38000f, 4.86000f, 0.30208f, "Time");
+        Value(1.38000f, 5.18000f, 0.78000f, s.TimeIn);
+        Label(1.38000f, 5.98875f, 0.73957f, "Request Seal");
 
         // Remark
         Label(1.71520f, 0.06250f, 0.57291f, "Remark");
         Value(1.71520f, 0.69097f, 6.59375f, s.Remarks, size: 8, bold: false);
+
+        // Owner 2026-10-22: the driver, and a line for the driver to sign
+        Label(2.09827f, 0.06250f, 0.50000f, "Driver");
+        Value(2.09827f, 0.62000f, 2.30000f, s.DriverName);
+        Label(2.09827f, 3.00000f, 0.45000f, "Phone");
+        Value(2.09827f, 3.48000f, 1.55000f, s.DriverMobile);
+        Label(2.78229f, 0.06250f, 1.08333f, "Driver Signature");
+        DottedLine(layers, top + 3.03799f, left + 1.24876f, 1.28999f);
 
         // Signatures
         Label(2.09827f, 5.24305f, 1.08333f, "Survey By Body");

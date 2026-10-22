@@ -25,6 +25,9 @@ public partial class TruckVisit
 
     public string? DriverName { get; set; }
 
+    /// <summary>Owner 2026-10-22: printed on the truck-in form (gecko_tos 32).</summary>
+    public string? DriverMobile { get; set; }
+
     public byte[]? DriverLicenceHash { get; set; }
 
     public Guid? SlotBookingId { get; set; }

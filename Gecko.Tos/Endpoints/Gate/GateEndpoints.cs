@@ -689,6 +689,7 @@ internal static class GateEndpoints
             HaulierPartyId = haulier?.PartyId,
             HaulierPartyCode = haulier?.PartyCode,
             DriverName = truck.DriverName?.Trim(),
+            DriverMobile = string.IsNullOrWhiteSpace(truck.DriverMobile) ? null : truck.DriverMobile.Trim(),
             DriverLicenceHash = Hash(truck.DriverLicence),
             LaneCode = truck.LaneCode.Clean(),
             TruckCategoryCode = truckCategory,
@@ -1164,7 +1165,7 @@ internal static class GateEndpoints
         v.TruckVisitId, v.VisitNo, v.BranchId, v.TruckPlate, v.TrailerPlate, v.HaulierPartyCode, v.DriverName, v.LaneCode,
         v.ArrivedAt, v.GateInAt, v.GateOutAt, v.DwellMinutes,
         v.GateOutAt is not null ? "DEPARTED" : v.GateInAt is not null ? "ON_SITE" : "ARRIVED",
-        v.Source, boxes, v.TruckCategoryCode, mode);
+        v.Source, boxes, v.TruckCategoryCode, mode, DriverMobile: v.DriverMobile);
 
     private static async Task<GatePreflightResponse> ProjectAsync(TosDbContext db, BarrierView view, CancellationToken ct)
     {

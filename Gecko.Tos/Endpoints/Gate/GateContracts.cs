@@ -106,7 +106,9 @@ public sealed record TruckRequest(
     [property: MaxLength(10)] string? LaneCode = null,
     DateTimeOffset? ArrivedAt = null,
     // Vector parity (gate-in-vector-parity.md §5): a tariff axis — MDM code list TRUCK_CATEGORY.
-    [property: MaxLength(20)] string? TruckCategoryCode = null);
+    [property: MaxLength(20)] string? TruckCategoryCode = null,
+    // Owner 2026-10-22: printed on the truck-in form beside the driver's name.
+    [property: MaxLength(30)] string? DriverMobile = null);
 
 /// <summary>AGENT and CUSTOMER are Vector's "Agent Seal" / "Cust. Seal" (gecko_tos 15).</summary>
 public sealed record SealRequest(
@@ -371,4 +373,5 @@ public sealed record TruckVisitResponse(
     // DROPOFF (in only), PICKUP (out only), PICKUP_DROPOFF (both), NONE (no move stands). Never an input.
     string? PickupDropoffMode = null,
     // owner 2026-10-06: the boxes the truck came to collect (PLANNED ones are what gate out releases).
-    IReadOnlyList<VisitPickupResponse>? Pickups = null);
+    IReadOnlyList<VisitPickupResponse>? Pickups = null,
+    string? DriverMobile = null);

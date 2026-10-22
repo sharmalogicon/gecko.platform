@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.RegularExpressions;
 using Gecko.SharedKernel;
+using Microsoft.EntityFrameworkCore;
 using Gecko.Tos.Application;
 using Gecko.Tos.Endpoints.Gate;
 
@@ -55,14 +56,28 @@ public sealed class TruckInFormTests
         Assert.Null(TruckInDocument.FullEmptyOf("GOF"));
     }
 
+    /// <summary>Owner 2026-10-22: the box's weight as the gate weighed it.</summary>
+    [Fact]
+    public void The_weight_is_the_gross_else_tare_and_cargo_else_what_was_keyed()
+    {
+        Assert.Equal(24100m, TruckInDocument.WeightOf(24100m, 2200m, 18000m));
+        Assert.Equal(20200m, TruckInDocument.WeightOf(null, 2200m, 18000m));
+        Assert.Equal(3700m, TruckInDocument.WeightOf(null, 3700m, null));
+        Assert.Null(TruckInDocument.WeightOf(null, null, null));
+        Assert.Equal("24,100 KG", TruckInDocument.Kg(24100m));
+        Assert.Equal("", TruckInDocument.Kg(null));
+    }
+
     [Fact]
     public void Each_box_is_its_own_sheet_and_a_voided_one_still_prints()
     {
         var header = new TruckInDocument.Header("KORAKRIT LOGISTICS CO.,LTD.", "Gate Clerk", "08-10-2026 07:05");
-        TruckInDocument.Sheet Box(string no, bool voided) => new(
+        TruckInDocument.Sheet Box(string no, bool voided) => new TruckInDocument.Sheet(
             "MAEU", "บริษัท ทดสอบ จำกัด", "FROZEN FISH", "CHENG-BK-88421", "20 RF", "-18.00 CEL", "", "YES",
             no, "SEAL-001", "Haulier Co.", "70-4321", "07:05 Hrs", "JPTYO", "keep frozen", voided,
-            voided ? "ใบปล่อยตู้" : "ใบฝากตู้", voided ? "เครดิต" : "เงินสด");
+            voided ? "ใบปล่อยตู้" : "ใบฝากตู้", voided ? "เครดิต" : "เงินสด",
+            YardLocation: "A-12-03-2", Weight: "3,700 KG", DriverName: "สมชาย ใจดี", DriverMobile: "081-234-5678")
+            with { HaulierName = "บริษัท ทรานสปอร์ต โลจิสติกส์ เอ็กซ์เพรส จำกัด" };
 
         var pdf = TruckInDocument.Render(header, [Box("ZZTU1234565", false), Box("ZZTU7654321", true)]);
 
@@ -103,12 +118,17 @@ public sealed class TruckInFormApiTests(TosApiFactory api)
             {
                 branchId = SctLcb01, containerNo = box, direction = "IN",
                 tripType = "DROP_OFF_CONT", tareWeightKg = 2200m, maxGrossWeightKg = 30480m, cargoWeightKg = 18000m, customsPermitNo = "ZZ-PERMIT-1",
-                truck = new { plate = "70-4321", driverName = "Somchai P." },
+                truck = new { plate = "70-4321", driverName = "Somchai P.", driverMobile = " 081-234-5678 " },
+                positionText = "A-12-03-2",
                 grossWeightKg = 24100m, weightSource = "WEIGHBRIDGE",
                 seals = new object[] { new { sealNo = $"ZZ-{box[^4..]}", sealType = "LINE", isIntact = true } },
             }, ct);
             Assert.True(gated.StatusCode == HttpStatusCode.Created, await gated.Content.ReadAsStringAsync(ct));
             var eir = (await gated.Content.ReadFromJsonAsync<GateTransactionResponse>(ct))!;
+
+            // Owner 2026-10-22: the gate keeps the driver's mobile (web.tos "Mobile", truck.driverMobile) for the form.
+            await using (var db = TestDatabase.ForTenant(TestDatabase.Sct))
+                Assert.Equal("081-234-5678", (await db.TruckVisits.SingleAsync(v => v.TruckVisitId == eir.TruckVisitId, ct)).DriverMobile);
 
             var form = await client.GetAsync($"/api/tos/gate/visits/{eir.TruckVisitId}/truck-in.pdf", ct);
             Assert.True(form.StatusCode == HttpStatusCode.OK, await form.Content.ReadAsStringAsync(ct));

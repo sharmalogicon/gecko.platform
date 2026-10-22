@@ -741,11 +741,8 @@ public sealed class GateApiTests(TosApiFactory api)
             await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tripType: "DROP-OFF CARGO"), ct), "tripType", ct);
             await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tripType: "PICK_UP_CONT"), ct), "tripType", ct);
 
-            // Vector's matrix (GateIn.cs:146): a FULL drop-off needs max gross AND cargo weight.
-            var missing = await client.PostAsJsonAsync(url, DropOff(BoxA, maxGrossWeightKg: null, cargoWeightKg: null), ct);
-            await ExpectFieldAsync(missing, "maxGrossWeightKg", ct);
-            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, cargoWeightKg: null), ct), "cargoWeightKg", ct);
-            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tareWeightKg: null), ct), "tareWeightKg", ct);
+            // Vector's matrix (GateIn.cs:146): a FULL drop-off needs its cargo weight; tare and max gross are optional (owner 2026-10-22).
+            await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, tareWeightKg: null, maxGrossWeightKg: null, cargoWeightKg: null), ct), "cargoWeightKg", ct);
             await ExpectFieldAsync(await client.PostAsJsonAsync(url, DropOff(BoxA, withSeals: false), ct), "seals", ct);
 
             // None of the refusals left anything behind: the box gates in cleanly afterwards.

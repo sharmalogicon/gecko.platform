@@ -339,7 +339,8 @@ public static class GateRules
     /// gate-in-vector-parity.md §2.1), enforced on EVERY gate transaction (owner,
     /// 2026-10-01 — the trip type itself is required, so this always runs):
     /// <list type="bullet">
-    /// <item>DROP-OFF CONT → tare weight, max gross weight (GateIn.cs:171-177)</item>
+    /// <item>DROP-OFF CONT → nothing extra: tare and max gross weight are optional (owner 2026-10-22;
+    /// Vector's GateIn.cs:171-177 required them)</item>
     /// <item>DROP-OFF CONT + FULL → cargo weight, seal 1 (GateIn.cs:179-188)</item>
     /// <item>DROP-OFF CONT + FULL + booking type EXPORT → customs permit no (GateIn.cs:181-182)</item>
     /// <item>PICK-UP CONT → nothing extra (the box comes from the yard)</item>
@@ -355,10 +356,6 @@ public static class GateRules
         var errors = new Dictionary<string, string[]>();
         if (tripType != DropOffContainer) return errors;   // PICK-UP: nothing extra (GateIn.cs:171 is the only branch)
 
-        if (tareWeightKg is null or <= 0)
-            errors["tareWeightKg"] = ["A drop-off records the box's tare weight."];
-        if (maxGrossWeightKg is null)
-            errors["maxGrossWeightKg"] = ["A drop-off records the box's max gross weight."];
         if (fullEmpty == Full)
         {
             if (cargoWeightKg is null)

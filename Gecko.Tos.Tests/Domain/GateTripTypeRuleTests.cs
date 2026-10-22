@@ -18,11 +18,11 @@ public sealed class GateTripTypeRuleTests
     }
 
     [Fact]
-    public void A_drop_off_needs_tare_and_max_gross_a_full_one_its_cargo_weight_and_seal_and_a_full_export_its_permit()
+    public void A_drop_off_needs_no_weights_of_the_box_a_full_one_its_cargo_weight_and_seal_and_a_full_export_its_permit()
     {
-        Assert.Equal(["tareWeightKg", "maxGrossWeightKg"],
-            GateRules.MissingForTrip(GateRules.DropOffContainer, GateRules.Empty, isExport: true, null, null, null, null, 0).Keys);
-        Assert.Equal(["tareWeightKg", "maxGrossWeightKg", "cargoWeightKg", "seals"],
+        // Owner 2026-10-22: tare and max gross weight are optional at gate-in.
+        Assert.Empty(GateRules.MissingForTrip(GateRules.DropOffContainer, GateRules.Empty, isExport: true, null, null, null, null, 0));
+        Assert.Equal(["cargoWeightKg", "seals"],
             GateRules.MissingForTrip(GateRules.DropOffContainer, GateRules.Full, isExport: false, null, null, null, null, 0).Keys);
         Assert.Equal(["cargoWeightKg", "customsPermitNo"],
             GateRules.MissingForTrip(GateRules.DropOffContainer, GateRules.Full, isExport: true, 2200m, 30480m, null, " ", 1).Keys);
